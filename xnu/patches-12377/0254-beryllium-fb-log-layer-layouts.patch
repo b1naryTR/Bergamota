@@ -1,0 +1,52 @@
+Log every change of the layer layout CoreAnimation swaps (diagnostic).
+Apps show only black on beryllium (2026-10-29) while the home and lock screens draw, with the stock CPU renderer too.
+present() copies a swap's layers opaquely in order, so if CoreAnimation detaches a full-screen opaque app to a second
+IOMFB layer, that layer's transparent or missing pixels would cover the first. swap() now logs the layout (layer mask,
+each layer's surface id, size, format, source and destination rectangles) whenever it differs from the previous swap's,
+at most 200 lines per boot: "SWEET FB: 0254 swap N layout mask 0xM | L0 surf ... | L1 ...". A layer whose surface the
+kernel cannot find logs 0x0.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1372,6 +1372,40 @@
+ 			sweet_hold(held[i], true);
+ 		}
+ 	}
++	/*
++	 * 0254: each change of the layer layout CoreAnimation swaps (which layers, their surfaces, where they go), up to 200
++	 * per boot. Apps showed only black while the home screen drew (2026-10-29), and present() copies the layers opaquely in
++	 * order, so a second (detached) layer would cover the first. A layer whose surface is not found logs 0x0.
++	 */
++	{
++		static uint64_t lastSig;
++		static uint32_t logged;
++		uint64_t sig = mask;
++		char line[512];
++		size_t n = 0;
++		line[0] = 0;
++		for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
++			if (!(mask & (1u << i))) {
++				continue;
++			}
++			const uint8_t *a = rec + 0x64 + 16 * i, *b = rec + 0xc4 + 16 * i;
++			uint32_t f[11] = { held[i] ? held[i]->width : 0, held[i] ? held[i]->height : 0, held[i] ? held[i]->pixelFormat : 0,
++			    get32(a, 0), get32(a, 4), get32(a, 8), get32(a, 12), get32(b, 0), get32(b, 4), get32(b, 8), get32(b, 12) };
++			for (int k = 0; k < 11; k++) {
++				sig = sig * 1000003u + f[k];
++			}
++			if (n < sizeof(line)) {
++				n += (size_t)snprintf(line + n, sizeof(line) - n, " | L%u surf %u %ux%u fmt 0x%x a %d,%d %ux%u b %d,%d %dx%d", i,
++				    get32(rec, 0x54 + 4 * i), f[0], f[1], f[2], (int32_t)f[3], (int32_t)f[4], f[5], f[6], (int32_t)f[7],
++				    (int32_t)f[8], (int32_t)f[9], (int32_t)f[10]);
++			}
++		}
++		if (sig != lastSig && logged < 200) {
++			logged++;
++			lastSig = sig;
++			IOLog("SWEET FB: 0254 swap %u layout mask 0x%x%s\n", get32(rec, 0x50), mask, line);
++		}
++	}
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
+ 	fPendFence = sweet_gpu_fence_snapshot();
