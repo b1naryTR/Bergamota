@@ -1,0 +1,94 @@
+Publish a disk0 registry entry with the storage size, for MobileGestalt (Settings showed a capacity of 0 KB).
+MobileGestalt's NANDSize() (libMobileGestalt+0xac00) is IOServiceGetMatchingService(IOBSDNameMatching("disk0")) and the
+entry's "Size" (kIOMediaSizeKey); it feeds TotalDiskCapacity (Settings > General > About > Capacity, iPhone Storage).
+The UFS root is a plain BSD device (ufsroot0), so there was no disk0 ("IOServiceGetMatchingService() for disk0
+failed!") and the capacity read 0. The free space is fine (MobileGestalt and FileProvider take it from statfs).
+ufs_gpt_find_on_lun() keeps the LUN's size (GPT alternate LBA + 1) when it finds the root partition, and once the
+root device exists SweetPlatformExpert.cpp publishes SweetStorageInfo { BSD Name disk0, Size, Whole, Preferred Block
+Size }. Not an IOMedia, so nothing matches it as a disk to open or mount.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -68,6 +68,9 @@
+ static void sweet_ufs_syncer_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
++extern void sweet_storage_info_publish(uint64_t disk_bytes);    /* SweetPlatformExpert.cpp (1141) */
++/* the root partition's LUN size in 4 KiB blocks, from its GPT header's alternate LBA (1141) */
++static uint64_t ufs_lun_blocks;
+ extern void sweet_reboot_init(void);
+ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
+@@ -895,8 +898,9 @@
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+ 		return ENXIO;
+ 	}
+-	uint64_t entry_lba;
++	uint64_t entry_lba, alt_lba;
+ 	uint32_t nent, esz;
++	memcpy(&alt_lba, b + 32, 8);    /* the backup header sits in the LUN's last block */
+ 	memcpy(&entry_lba, b + 72, 8);
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
+@@ -930,6 +934,7 @@
+ 		}
+ 		*first = f;
+ 		*nblocks = l - f + 1;
++		ufs_lun_blocks = alt_lba + 1;
+ 		return 0;
+ 	}
+ 	return ENOENT;
+@@ -1144,6 +1149,7 @@
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	sweet_storage_info_publish(ufs_lun_blocks * UFS_BLOCK);
+ 	sweet_log_start();
+ 	sweet_ufs_syncer_start();
+ 	sweet_ufs_selftest_start();
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -30,6 +30,41 @@
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * 1141: MobileGestalt's NANDSize() (TotalDiskCapacity: Settings > General > About > Capacity, iPhone Storage) is
++ * IOServiceGetMatchingService(IOBSDNameMatching("disk0")) and that entry's "Size" (kIOMediaSizeKey); without one it
++ * logs "IOServiceGetMatchingService() for disk0 failed!" and the phone showed a capacity of 0 KB. The UFS root is a
++ * plain BSD device, so publish an entry with just those keys, sized like the LUN that holds userdata. It is not an
++ * IOMedia: nothing matches it as a disk to open or mount.
++ */
++class SweetStorageInfo : public IOService {
++	OSDeclareDefaultStructors(SweetStorageInfo);
++};
++OSDefineMetaClassAndStructors(SweetStorageInfo, IOService);
++
++extern "C" void
++sweet_storage_info_publish(uint64_t disk_bytes)
++{
++	IOService *parent = IOService::getPlatform();
++	if (parent == NULL) {
++		parent = IOService::getServiceRoot();
++	}
++	SweetStorageInfo *s = OSTypeAlloc(SweetStorageInfo);
++	if (disk_bytes == 0 || parent == NULL || s == NULL || !s->init()) {
++		OSSafeReleaseNULL(s);
++		return;
++	}
++	s->setProperty("BSD Name", "disk0");
++	s->setProperty("Size", (unsigned long long)disk_bytes, 64);
++	s->setProperty("Whole", true);
++	s->setProperty("Preferred Block Size", 4096ULL, 64);
++	if (s->attach(parent)) {
++		s->registerService();
++		IOLog("SWEET UFS: disk0 registry entry for MobileGestalt, Size %llu bytes\n", (unsigned long long)disk_bytes);
++	}
++	s->release();
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
