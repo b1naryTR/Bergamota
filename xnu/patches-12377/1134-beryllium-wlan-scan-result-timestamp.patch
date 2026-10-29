@@ -1,0 +1,113 @@
+Scan results carry the time each network was last heard (IO80211's TIMESTAMP), so wifid's auto-join keeps them.
+iOS 26 IO80211 reads type 11/103 results as 2272 bytes and copies the u64 at 0x8d0 into the result's TIMESTAMP;
+CoreWiFi's -[CWFScanResult age] is (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - TIMESTAMP) / 1e6 ms. We left it 0,
+so every network was as old as the uptime ("age=423015ms (0)") and auto-join dropped all of them in
+_CWFFilteredScanResults ("Filtering based on maxAge") -> "auto-join failed with no network found" after every
+reboot (boot 1132), while a manual join from Settings worked. The BSS cache now stamps each entry with
+mach_continuous_time in ns whenever a beacon or probe response is heard; the current network reports "now".
+
+diff --git a/bsd/dev/sweet_wlan.h b/bsd/dev/sweet_wlan.h
+--- a/bsd/dev/sweet_wlan.h
++++ b/bsd/dev/sweet_wlan.h
+@@ -22,6 +22,7 @@
+ 	uint8_t  ssid[32];              /* raw bytes */
+ 	uint16_t ie_len;
+ 	uint8_t  ie[SWEET_WLAN_IE_MAX]; /* the frame's information elements, from the SSID element on */
++	uint64_t heard_ns;              /* when last heard: mach_continuous_time in ns (userspace CLOCK_MONOTONIC_RAW) */
+ };
+ 
+ /* beryllium_wlan.c: 0 = scan queued (or already running), ENXIO = the service is not up (yet) */
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -4392,6 +4392,7 @@
+ 		uint8_t raw_ssid[32];
+ 		uint16_t beacon_int, cap, ie_len;
+ 		unsigned seen;          /* scan.count when last heard */
++		uint64_t heard_ns;      /* and when (scan_now_ns) */
+ 	} bss[SCAN_MAX_BSS];
+ } scan;
+ /* the BSS cache's IEs (SCAN_MAX_BSS x SWEET_WLAN_IE_MAX) and the lock between the service thread and ioctls */
+@@ -4615,6 +4616,19 @@
+ }
+ 
+ /*
++ * The clock of a scan result's TIMESTAMP: CoreWiFi (iOS 26) computes a result's age as
++ * clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - TIMESTAMP, i.e. mach_continuous_time in ns. With TIMESTAMP 0 every
++ * network looked as old as the uptime and wifid's auto-join dropped them all ("Filtering based on maxAge").
++ */
++static uint64_t
++scan_now_ns(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_continuous_time(), &ns);
++	return ns;
++}
++
++/*
+  * Boot 53: a passive scan misses a beacon now and then, and a join right after such a scan found no BSS. The cache
+  * keeps a network until three scans in a row did not hear it (scan_lock held; IEs move with their entry).
+  */
+@@ -4730,6 +4744,7 @@
+ 		if (memcmp(scan.bss[k].bssid, bssid, 6) == 0) {
+ 			scan.bss[k].rssi = (int8_t)MAX(-128, MIN(127, rssi));   /* the latest signal */
+ 			scan.bss[k].seen = scan.count;
++			scan.bss[k].heard_ns = scan_now_ns();
+ 			lck_mtx_unlock(&scan_lock);
+ 			return;
+ 		}
+@@ -4740,6 +4755,7 @@
+ 	}
+ 	unsigned k = scan.nbss++;
+ 	scan.bss[k].seen = scan.count;
++	scan.bss[k].heard_ns = scan_now_ns();
+ 	memcpy(scan.bss[k].bssid, bssid, 6);
+ 	scan.bss[k].mhz = mhz;
+ 	scan.bss[k].rssi = (int8_t)MAX(-128, MIN(127, rssi));
+@@ -6982,6 +6998,7 @@
+ 	}
+ 	if (err == 0) {
+ 		out->rssi = sta.rssi;
++		out->heard_ns = scan_now_ns();  /* associated: the AP is heard now, whatever the last scan said */
+ 	}
+ 	return err;
+ }
+@@ -7077,6 +7094,7 @@
+ 		memcpy(out->ssid, scan.bss[i].raw_ssid, scan.bss[i].ssid_len);
+ 		out->ie_len = scan.bss[i].ie_len;
+ 		memcpy(out->ie, scan_ie + i * SWEET_WLAN_IE_MAX, scan.bss[i].ie_len);
++		out->heard_ns = scan.bss[i].heard_ns;
+ 		err = 0;
+ 	}
+ 	lck_mtx_unlock(&scan_lock);
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -260,9 +260,14 @@
+ 	uint16_t flags;                 /* 136 */
+ 	uint16_t ie_len;                /* 138 */
+ 	uint8_t  ie[2048];              /* 140 */
++	uint8_t  pad2[68];              /* 2188 */
++	uint64_t timestamp;             /* 2256: when last heard, ns of CLOCK_MONOTONIC_RAW (IO80211 key TIMESTAMP) */
++	uint8_t  pad3[8];               /* 2264 */
+ } __attribute__((packed));
+ static_assert(__builtin_offsetof(struct s8_scan_result, ssid_len) == 96, "scan result layout");
+ static_assert(__builtin_offsetof(struct s8_scan_result, ie_len) == 138, "scan result layout");
++static_assert(__builtin_offsetof(struct s8_scan_result, timestamp) == 0x8d0, "scan result layout");
++static_assert(sizeof(struct s8_scan_result) == 2272, "scan result layout");
+ 
+ /* sweet80211=2: one synthetic open network per scan, to exercise wifid's scan path and Settings */
+ static int
+@@ -351,6 +356,12 @@
+ 	}
+ 	r->ie_len = MIN(b->ie_len, (uint16_t)sizeof(r->ie));
+ 	memcpy(r->ie, b->ie, r->ie_len);
++	/*
++	 * iOS 26: IO80211 copies the u64 at 0x8d0 into the result's TIMESTAMP and CoreWiFi's -[CWFScanResult age] is
++	 * (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - TIMESTAMP) / 1e6 ms. Left 0, every network was as old as the
++	 * uptime and auto-join filtered them all out on maxAge (boot 1132).
++	 */
++	r->timestamp = b->heard_ns;
+ }
+ 
+ /* sweet80211=3: network s8.scan_next of the WLAN service's last scan, or the current one (CURRENT_NETWORK) */
