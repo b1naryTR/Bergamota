@@ -1,0 +1,74 @@
+Backlight service: publish the marketing table and calibration CoreBrightness needs (backboardd crash, slider).
+With sweetfb_blsvc=1 on iOS 26 (boot 1137s) backboardd SIGSEGVed three times and launchd rebooted ("rebooting due to
+critical process crashes: backboardd"), as on iOS 18. Symbolized: -[CBDisplayContaineriOS start] -> findBacklight ->
+handleDisplayArrival: -> setupInternalModules -> -[CBDisplayModuleiOS initWithBacklight:queue:display:] -> Display.m
+init (CoreBrightness+0x164c1c) -> table interpolation +0x169810, NULL float table read at +0x169924. The table is
+-[CBBacklightNode copyMarketingTable] = "backlight-marketing-table" (CFData of SInt32 IOFixed, loaded by
+loadIOFixedArray: / value / 65536); on failure Display.m only logs "Failed to load marketing table from the device".
+-[CBBacklightNode getBacklightCalibration:] reads "backlight-calibration-parameters" (IOFixed integers; the
+milliAmps2NitsScaleFactor plain). Both now come with the service: 64 entries from the WLED floor to sweetfb_blnits
+(500), linear in current; 20 / 5 / 25 mA, 500 / 125 / 2 nits, 25 nits per mA. The service stays behind
+sweetfb_blsvc=1 until a boot shows CoreBrightness running with it.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -841,8 +841,57 @@
+ 				}
+ 				OSSafeReleaseNULL(dp);
+ 				OSSafeReleaseNULL(br);
++				/*
++				 * 1138: what CoreBrightness's Display.m reads before it builds the display module (the iOS 18 crash, again
++				 * on iOS 26: backboardd SIGSEGV at CoreBrightness+0x169924 three times, then launchd rebooted).
++				 * -[CBBacklightNode copyMarketingTable] loads "backlight-marketing-table", CFData of SInt32 IOFixed nits,
++				 * and Display.m interpolates in it without checking that it loaded. -[CBBacklightNode
++				 * getBacklightCalibration:] reads "backlight-calibration-parameters": IOFixed integers (it divides each by
++				 * 65536), milliAmps2NitsScaleFactor plain. Values: the WLED floor (16/4095 of the peak) .. sweetfb_blnits
++				 * (default 500, as brightness-nits is mapped), linear in the LED current; 20 mA at the peak (25 nits/mA),
++				 * 5 mA mid, 25 mA limit.
++				 */
++				int pk = 500;
++				PE_parse_boot_argn("sweetfb_blnits", &pk, sizeof(pk));
++				uint64_t peak = (pk >= 50 && pk <= 2000) ? (uint64_t)pk : 500;
++				int32_t mt[64];
++				for (unsigned i = 0; i < 64; i++) {
++					uint64_t lvl = 16 + (4095 - 16) * (uint64_t)i / 63;
++					mt[i] = (int32_t)(((lvl * peak) << 16) / 4095);
++				}
++				OSData *mtd = OSData::withBytes(mt, sizeof(mt));
++				if (mtd) {
++					fBacklight->setProperty("backlight-marketing-table", mtd);
++					OSSafeReleaseNULL(mtd);
++				}
++				OSDictionary *cal = OSDictionary::withCapacity(10);
++				if (cal) {
++					const struct { const char *key; uint64_t value; } cv[] = {
++						{ "current-for-max-backlight", 20ULL << 16 },
++						{ "current-for-mid-backlight", 5ULL << 16 },
++						{ "hardware-max-current-limit", 25ULL << 16 },
++						{ "lMaxProduct", peak << 16 },
++						{ "lMidProduct", (peak / 4) << 16 },
++						{ "lMinProduct", 2ULL << 16 },
++						{ "lMaxPanel", peak << 16 },
++						{ "lMidPanel", (peak / 4) << 16 },
++						{ "lMinPanel", 2ULL << 16 },
++						{ "milliAmps2NitsScaleFactor", peak / 20 },
++					};
++					for (unsigned i = 0; i < sizeof(cv) / sizeof(cv[0]); i++) {
++						OSNumber *num = OSNumber::withNumber(cv[i].value, 32);
++						if (num) {
++							cal->setObject(cv[i].key, num);
++							num->release();
++						}
++					}
++					fBacklight->setProperty("backlight-calibration-parameters", cal);
++					OSSafeReleaseNULL(cal);
++				}
+ 				fBacklight->registerService();
+-				IOLog("SWEET FB: backlight service published (0243): backlight-control, brightness 0..4095\n");
++				IOLog("SWEET FB: backlight service published (0243/1138): backlight-control, brightness 0..4095, "
++				    "marketing table %llu..%llu nits, calibration\n", (unsigned long long)(((16 * peak) << 16) / 4095 >> 16),
++				    (unsigned long long)peak);
+ 			}
+ 		} else {
+ 			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
