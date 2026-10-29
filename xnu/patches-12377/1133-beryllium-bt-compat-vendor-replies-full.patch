@@ -1,0 +1,27 @@
+Largest Command Complete for every Broadcom vendor command (OGF 0x3f), not only 0xfdf0.
+With 1132, bluetoothd (iOS 26) still aborted at each start, now in _BCM_LowPowerCoreStatsEventParser
+("ByteStream_NumReadBytesAvail(*pBs) >= 4", bcm_vsc.c:1017-1021) after a run of vendor commands iOS 18 never sent
+(0xfe2c, 0xfce9, 0xfe37, 0xfe29, 0xfe3b). bcm_vsc.c's reply parsers only check for enough bytes, so the sub-opcode
+followed by 250 zeros reads as zero statistics; standard commands keep the 16-byte reply.
+
+diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
+--- a/bsd/dev/beryllium_bt_hci.c
++++ b/bsd/dev/beryllium_bt_hci.c
+@@ -158,10 +158,16 @@
+  * for by PerfPowerServices right after the HCI init) with 16 bytes tripped "ByteStream_NumReadBytesAvail(*pB...)" in
+  * bcm_vsc.c:196 and bluetoothd aborted on every start (iOS 26, 2026-10-29); zero statistics are harmless.
+  */
++/*
++ * 1133: every vendor command (OGF 0x3f) gets the largest reply. iOS 26's bluetoothd has more statistics parsers than the
++ * one 1132 met: after 1132 it aborted in _BCM_LowPowerCoreStatsEventParser ("ByteStream_NumReadBytesAvail(*pBs) >= 4",
++ * bcm_vsc.c:1017-1021) at the end of its vendor-command run. bcm_vsc.c's parsers only check that enough bytes are left,
++ * so zeros after the sub-opcode read as zero statistics or zero entries. Standard commands keep 16 bytes.
++ */
+ static unsigned
+ bt_compat_pad(unsigned op)
+ {
+-	return op == 0xfdf0 ? BT_COMPAT_PAD_MAX : BT_COMPAT_PAD;
++	return (op >> 10) == 0x3f ? BT_COMPAT_PAD_MAX : BT_COMPAT_PAD;
+ }
+ 
+ /* First parameter byte of the last few commands sent, by opcode (for rewritten replies). */
