@@ -42,8 +42,9 @@ env:
   # Bump to throw away every cache (host tools + ccache) at once. See docs/CI_CACHE.md.
   CACHE_VERSION: v2
   # ccache: xnu's makedefs honour `CCACHE ?=` (KCC/KC++ = $(CCACHE) $(CC)), so the env var is
-  # enough; it deliberately does not wrap $(CC), which would confuse mig.
-  CCACHE: ccache
+  # enough; it deliberately does not wrap $(CC), which would confuse mig. tools/xnu-ccache.sh is
+  # ccache minus xnu-12377's `-MJ`, which made ccache refuse every 26.x compile (docs/CI_CACHE.md).
+  CCACHE: ${{ github.workspace }}/tools/xnu-ccache.sh
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   # NOT CCACHE_BASEDIR / CCACHE_NOHASHDIR: base_dir rewrote __FILE__ to ../../../../../xnu/... in
   # the kernel (functionally harmless, but not byte-identical to an uncached build). The

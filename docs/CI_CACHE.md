@@ -34,6 +34,23 @@ object is keyed on its full input.
      `__FILE__` to `../../../../../xnu/...` in the kernel. The runner workspace path is
      constant, so absolute paths in the hash cost nothing.
 
+## xnu-12377 (26.x): `-MJ` and `tools/xnu-ccache.sh`
+
+xnu-12377's `makedefs/MakeInc.rule` passes `-MJ $(@:o=o.json)` (one compile_commands.json fragment
+per object) on every compile, and ccache counts any compile with `-MJ` as an unsupported option.
+Run 40828962696 (fork, 2026-10-29): 1180 of 1181 calls uncacheable, a 68 KiB cache saved, so every
+26.x build was cold (Build step 18.2 min of the 20.3 min run). `CCACHE` is therefore
+`tools/xnu-ccache.sh`: it drops `-MJ`, compiles through ccache and writes the fragment itself, hit or
+miss, because `MakeInc.kernel` concatenates the fragments into `compile_commands.json` with `sed`
+(a missing one fails the build). ccache's `ignore_options=-MJ*` is not enough: a hit never runs clang,
+so it leaves no fragment. The fragment is the command as run (minus `-MJ`), not clang's normalised
+one; nothing in the kernel depends on it. Older xnu (no `-MJ`) passes straight through. Checked
+locally: with `-MJ` ccache counts `unsupported_compiler_option`; the real 287-word sweet_a630.c
+command without it gets as far as the preprocessor, so `-MJ` is the only option ccache refuses.
+- Caches are per branch (plus the default branch's), so a fresh `kernel/*` branch per experiment
+  always starts cold. Build kernel experiments on one long-lived branch (the b1naryTR fork uses
+  `kernel/dev`) so each run restores the previous run's ccache.
+
 ## Busting caches
 
 - Bump `CACHE_VERSION` in the workflow `env:` (invalidates both caches).
