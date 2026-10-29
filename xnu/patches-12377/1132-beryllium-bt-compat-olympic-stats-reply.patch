@@ -1,0 +1,55 @@
+Full-size reply for the Broadcom vendor command 0xfdf0 (bluetoothd aborted on every start on iOS 26).
+The HCI compatibility layer answers vendor commands the WCN3990 does not know with a 16-byte success. 0xfdf0 sub-opcode
+0x11 (BD_VSC_OLYMPIC_READ_ENHANCED_PROFILING_STATS, version 2), sent when PerfPowerServices asks bluetoothd for its
+power statistics right after the HCI init, has its statistics parsed from the reply: "ByteStream_NumReadBytesAvail"
+assertion in bcm_vsc.c:196, abort in bluetoothd's RxLoop, on every start (boot 0258wb, 2026-10-29). It now gets the
+largest Command Complete (251 parameter bytes: the sub-opcode, then zeros); all other vendor commands keep 16.
+
+diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
+--- a/bsd/dev/beryllium_bt_hci.c
++++ b/bsd/dev/beryllium_bt_hci.c
+@@ -150,6 +150,19 @@
+  * next missing command shows up even after the packet trace budget is spent.
+  */
+ #define BT_COMPAT_PAD   16u             /* parameter bytes in a rewritten Command Complete */
++#define BT_COMPAT_PAD_MAX 251u          /* the most a Command Complete carries (parameter length 255) */
++
++/*
++ * 1132: vendor replies whose parser reads a whole structure get the largest Command Complete (the sub-opcode byte, then
++ * zeros). 0xfdf0 sub-opcode 0x11 (BD_VSC_OLYMPIC_READ_ENHANCED_PROFILING_STATS, version 2: bluetoothd's power log, asked
++ * for by PerfPowerServices right after the HCI init) with 16 bytes tripped "ByteStream_NumReadBytesAvail(*pB...)" in
++ * bcm_vsc.c:196 and bluetoothd aborted on every start (iOS 26, 2026-10-29); zero statistics are harmless.
++ */
++static unsigned
++bt_compat_pad(unsigned op)
++{
++	return op == 0xfdf0 ? BT_COMPAT_PAD_MAX : BT_COMPAT_PAD;
++}
+ 
+ /* First parameter byte of the last few commands sent, by opcode (for rewritten replies). */
+ static struct { uint16_t op; uint8_t p0; } bt_last_cmd[8];
+@@ -379,19 +392,19 @@
+ 		 * 0x32 instead of 0x01 for LE Meta Enable Features, its completion never ran and
+ 		 * bluetoothd restarted after 15 s ("timedout waiting for controller", reason 3602).
+ 		 */
+-		unsigned i, p0 = op == bt_pend.op ? bt_pend.p0 : bt_cmd_param0(op);
++		unsigned i, p0 = op == bt_pend.op ? bt_pend.p0 : bt_cmd_param0(op), pad = bt_compat_pad(op);
+ 
+-		p[2] = 4 + BT_COMPAT_PAD;
++		p[2] = (uint8_t)(4 + pad);      /* the caller's buffer holds 3 + 255 bytes */
+ 		p[6] = 0;
+ 		p[7] = (uint8_t)p0;
+-		for (i = 1; i < BT_COMPAT_PAD; i++) {
++		for (i = 1; i < pad; i++) {
+ 			p[7 + i] = 0;
+ 		}
+ 		bt.compat_fixed++;
+ 		printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x) status %#04x from the controller, answered as success "
+-		    "with %u parameter bytes (first %#04x) (%u so far)\n", op, op >> 10, op & 0x3ff, st, BT_COMPAT_PAD, p0,
++		    "with %u parameter bytes (first %#04x) (%u so far)\n", op, op >> 10, op & 0x3ff, st, pad, p0,
+ 		    bt.compat_fixed);
+-		return 7 + BT_COMPAT_PAD;
++		return 7 + pad;
+ 	}
+ 	if (bt.err_budget) {
+ 		bt.err_budget--;
