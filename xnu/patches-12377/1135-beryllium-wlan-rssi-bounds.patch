@@ -1,0 +1,36 @@
+Answer RSSI_BOUNDS (get 106): wifid's auto-join minimum RSSI comes from the driver and was 0.
+With 1134 wifid kept the scan results but rejected every candidate: "Join candidate ... is not allowed
+(error=(1 'Below minimum RSSI threshold'))" at rssi -61 and -77 (boot 1134). wifid reads ioctl 106 once at start
+(Apple80211CopyValue 0x6a: RSSI_MIN, RSSI_MAX, RSSI_THRESHOLD; "Device RSSI bounds (%d, %d) with treshold (%d)",
+wifid 0x10006186c) and copies RSSI_THRESHOLD into the device manager's auto-join threshold (wifid 0x1001872e0); the
+stand-in answered EOPNOTSUPP, so the threshold was 0 and every real RSSI was below it. IO80211 reads
+{u32 version; s32 min @4; s32 max @8; s32 threshold @12}. Values: -100 / 0 / -80 (wifid's own bad-RSSI threshold).
+
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -94,6 +94,7 @@
+ #define IOC_ASSOCIATE_RESULT    21
+ #define IOC_DISASSOCIATE        22
+ #define IOC_CURRENT_NETWORK     103
++#define IOC_RSSI_BOUNDS         106
+ #define IOC_SUPPORTED_CHANNELS  27
+ #define IOC_LOCALE              28
+ #define IOC_DRIVER_VERSION      43
+@@ -568,6 +569,16 @@
+ 		return 0;
+ 	case IOC_CURRENT_NETWORK:
+ 		return s8.stage == 3 ? s8_real_result(req, true) : ENXIO;
++	case IOC_RSSI_BOUNDS: {
++		/*
++		 * {version, RSSI_MIN, RSSI_MAX, RSSI_THRESHOLD} dBm, IO80211's 16-byte layout. wifid copies RSSI_THRESHOLD
++		 * into its auto-join minimum (device manager +0x80, __WiFiDeviceManagerGetAutoJoinThreshold) and scores
++		 * networks only when min != max. Unanswered all three were 0 and every network was "Below minimum RSSI
++		 * threshold" (boot 1134). -80 is wifid's own bad-RSSI threshold; its built-in special cases are -70/-65.
++		 */
++		int32_t d[4] = { 1, -100, 0, -80 };
++		return s8_reply(req, d, sizeof(d));
++	}
+ 	case IOC_OP_MODE:
+ 		return s8_reply_u32(req, OPMODE_STA);
+ 	case IOC_PHY_MODE: {
