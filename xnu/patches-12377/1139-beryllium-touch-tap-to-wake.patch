@@ -1,0 +1,155 @@
+Tap to wake: while iOS has the display off, a double tap presses the power key (user request: "I had it on android").
+iOS's display off only darkens the backlight here (0242, 1137): the panel and its TDDI touch controller (NT36672A /
+FT8719) keep scanning, so touches keep arriving. Now, while off (sweet_display_off, set on RequestPowerChange):
+ - touches no longer reach iOS (fingers iOS saw down are released first);
+ - one finger down < 300 ms and moved < 80 px is a tap; a second tap within 400 ms and 150 px of the first presses
+   the power key (50 ms), which wakes the phone like the side button; taps are ignored for 1.5 s after that.
+boot-arg and sysctl kern.sweet_tap2wake: 1 double tap (default), 2 single tap (iOS's own Tap to Wake style), 0 off.
+No proximity sensor yet: a double tap in a pocket wakes the screen.
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -26,6 +26,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++#include <sys/sysctl.h>
+ 
+ extern void sweet_amp_bind_little(const char *who);    /* bsd/dev/sweet_cpufreq.c (0257) */
+ 
+@@ -34,6 +35,7 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);   /* SweetHID.cpp: key 0 = power (side button) */
+ extern void sweet_input_boost(void);    /* bsd/dev/sweet_cpufreq.c: GPU + CPU input boost (patch 0217) */
+ void sweet_touch_init(void);
+ 
+@@ -562,9 +564,99 @@
+ 	return (sum & 0xffffu) == touch_be16(buf + len - 2);
+ }
+ 
++/*
++ * 1139: tap to wake. iOS turning the display off only darkens the backlight (0242/1137): the panel, and with it its
++ * TDDI touch controller, keeps running. While it is off touches no longer reach iOS, and a double tap (boot-arg and
++ * sysctl kern.sweet_tap2wake: 1 double tap, default; 2 single tap; 0 off) presses the power key once, which wakes the
++ * phone as the side button does. A tap: one finger, down < 300 ms, moved < 80 px; the second within 400 ms and
++ * 150 px of the first. After a wake taps are ignored for 1.5 s so a late one cannot switch the display off again.
++ */
++volatile int sweet_display_off;         /* set by SweetFramebuffer.cpp on iOS's RequestPowerChange */
++static int t2w_mode = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweet_tap2wake, CTLFLAG_RW | CTLFLAG_LOCKED, &t2w_mode, 0,
++    "tap to wake: 0 off, 1 double tap, 2 single tap");
++static struct {
++	uint64_t down_ms, up_ms, quiet_until;
++	int x, y;
++	unsigned taps;
++	bool down, spoilt;
++} t2w;
++
++static uint64_t
++touch_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++static int
++touch_dist(int a, int b)
++{
++	return a > b ? a - b : b - a;
++}
++
++static void
++touch_t2w(uint32_t mask, const int *x, const int *y)
++{
++	uint64_t now = touch_ms();
++	if (t2w_mode <= 0 || t2w_mode > 2 || now < t2w.quiet_until) {
++		t2w.down = mask != 0;
++		t2w.taps = 0;
++		return;
++	}
++	if (mask != 0) {
++		unsigned id = (unsigned)__builtin_ctz(mask);
++		bool one = (mask & (mask - 1)) == 0;
++		if (!t2w.down) {
++			if (t2w.taps && (now - t2w.up_ms > 400 || touch_dist(x[id], t2w.x) > 150 ||
++			    touch_dist(y[id], t2w.y) > 150)) {
++				t2w.taps = 0;   /* too late or too far for a second tap: this one starts over */
++			}
++			t2w.down = true;
++			t2w.spoilt = !one;
++			t2w.down_ms = now;
++			t2w.x = x[id];
++			t2w.y = y[id];
++		} else if (!one || touch_dist(x[id], t2w.x) > 80 || touch_dist(y[id], t2w.y) > 80) {
++			t2w.spoilt = true;      /* a second finger or a drag */
++		}
++		return;
++	}
++	if (!t2w.down) {
++		return;
++	}
++	t2w.down = false;
++	if (t2w.spoilt || now - t2w.down_ms > 300) {
++		t2w.taps = 0;
++		return;
++	}
++	t2w.up_ms = now;
++	if (++t2w.taps < (t2w_mode == 2 ? 1u : 2u)) {
++		return;
++	}
++	t2w.taps = 0;
++	t2w.quiet_until = now + 1500;
++	printf("SWEET TOUCH: %s while the display is off: power key\n", t2w_mode == 2 ? "tap" : "double tap");
++	sweet_hid_key(0, 1);
++	delay(50 * 1000);       /* a short press */
++	sweet_hid_key(0, 0);
++}
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
++	if (sweet_display_off) {
++		/* 1139: release what iOS saw, then only watch for the wake tap */
++		for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++			if (st.active & (1u << id)) {
++				sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++			}
++		}
++		st.active = 0;
++		touch_t2w(mask, x, y);
++		return;
++	}
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+@@ -1222,6 +1314,7 @@
+ 		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
+ 	}
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweettap2wake", &t2w_mode, sizeof(t2w_mode));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	/*
+ 	 * A fast swipe up from the bottom edge (home gesture) was lost: with a
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -60,6 +60,7 @@
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */
++extern "C" volatile int sweet_display_off;      /* bsd/dev/sweet_touch.c: tap to wake while off (1139) */
+ #include "../../../bsd/dev/sweet_board.h"
+ #include "../../../bsd/dev/sweet_spmi.h"
+ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
+@@ -3785,6 +3786,7 @@
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
++				sweet_display_off = off ? 1 : 0;
+ 				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */
+ 				fFB->fFadeStep = 0;
+ 				fFB->fBlackDone = false;
