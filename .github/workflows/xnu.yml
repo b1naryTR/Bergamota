@@ -113,6 +113,13 @@ jobs:
           needle = '                warning "Skipping patch ${PATCH} (already upstream, previously applied, or malformed): ${APPLY_CHECK}"\n'
           assert needle in s, 'build.sh patches() layout changed; update the fatal-patch hook'
           s = s.replace(needle, needle + '                case "$(basename "${PATCH}")" in [0-9]*|sweet-*) error "our patch does not apply: ${PATCH}"; exit 1 ;; esac\n')
+          # Faster builds (docs/CI_CACHE.md): shallow clones (dxb only runs `git describe --always` on one of them),
+          # and a time on every phase line so build.log shows where a run's minutes go.
+          assert s.count('git clone --branch') == 7, 'build.sh clones changed; update the shallow-clone edit'
+          s = s.replace('git clone --branch', 'git clone --depth 1 --branch')
+          old = 'echo -e "$COL_MAGENTA ⇒ $COL_RESET""$1"'
+          assert s.count(old) == 1, 'build.sh running() changed; update the timestamp edit'
+          s = s.replace(old, 'echo -e "$COL_MAGENTA ⇒ $COL_RESET[$(date +%H:%M:%S)] ""$1"')
           open(p, 'w').write(s)
           PY
           ls "$PDIR"
@@ -191,6 +198,7 @@ jobs:
           ccache -p | grep -E 'base_dir|cache_dir|max_size|sloppiness|compiler_check|hash_dir|compression ' || true
 
       - name: Build
+        id: build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
@@ -200,7 +208,9 @@ jobs:
           set +e
           bash build.sh > build.log 2>&1
           rc=$?
-          grep -aE "error:|our patch does not apply|Staged|Applying patch|Skipping patch" build.log | grep -v "warning" | head -300
+          grep -aE "error:|our patch does not apply|Staged|Skipping patch" build.log | grep -v "warning" | head -300
+          echo "--- phases (dxb's running lines, timed by the Fetch build script edit)"
+          grep -a "⇒" build.log | grep -av "Applying patch" | sed 's/\x1b\[[0-9;]*m//g'
           tail -40 build.log
           exit $rc
 
@@ -208,6 +218,12 @@ jobs:
         if: always()
         run: |
           mkdir -p out
+          if [ "${{ steps.build.outcome }}" = success ]; then
+            # nothing to find in a successful build's log, and scanning hundreds of MB took ~1 min
+            : > out/errors.txt; : > out/link-errors.txt
+            gzip -1 -c dxb/build.log > out/build.log.gz || true
+            exit 0
+          fi
           grep -aoE "[A-Za-z0-9_./+-]+\.(c|cpp|h|hpp|s|exports|iig)(:[0-9]+){1,2}: (fatal )?error: .*" dxb/build.log \
             | sed 's|.*/dxb/||' | sort | uniq -c | sort -rn > out/errors.txt || true
           grep -aE "^ld: |Undefined symbols|ld: symbol|error: linker" -A3 dxb/build.log | head -200 > out/link-errors.txt || true

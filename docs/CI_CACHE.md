@@ -51,6 +51,12 @@ command without it gets as far as the preprocessor, so `-MJ` is the only option 
   always starts cold. Build kernel experiments on one long-lived branch (the b1naryTR fork uses
   `kernel/dev`) so each run restores the previous run's ccache.
 
+## Where a warm 26.x run's minutes go (2026-10-29)
+
+Warm run 40843214529 (11 min, 1178/1180 hits), from the build tree's file times: setup, checkout, `brew install`, cache restore ~1.7 min; up to the xnu source landing ~2 min (dxb cloned xnu and the other Apple repos with full history); source staged and patched by 5.8 min; headers 6.5-6.8; the whole compile 6.9-7.9 (ccache); link + CTF to 8.4; then the error summary (~1.2 min scanning and gzipping a log of hundreds of MB, even after a success), cache save, packaging, upload. Locally, applying our 270 patches takes ~1 s (sequential `git apply --check` + `git apply`) and each patch stage script 1-3 s, so neither is the bottleneck.
+
+Changes: dxb's seven `git clone --branch` become `--depth 1` (dxb only runs `git describe --always` on bootstrap_cmds); dxb's `running` lines carry the time (`⇒ [HH:MM:SS] ...`) and the Build step prints them, so every run's log shows its phases; the error summary only scans the log when the build failed (a success writes empty error files and `gzip -1`s the log).
+
 ## Busting caches
 
 - Bump `CACHE_VERSION` in the workflow `env:` (invalidates both caches).
