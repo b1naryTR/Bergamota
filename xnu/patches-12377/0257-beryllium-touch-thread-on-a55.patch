@@ -1,0 +1,64 @@
+Run the touch thread on an A55 (sweet_amp_bind_little in the cpufreq driver).
+The NT36672A is read over bit-banged I2C: ~6 ms of CPU per frame, a frame every ~8 ms while a finger is down, at kernel
+priority 81. With 0256 every unbound thread runs on the A75s, so while the screen was touched the touch thread
+preempted CoreAnimation's render thread (pri 54) on the same four cores (user: "when I touch it UI really stutters, it
+only runs fine when scrolling slowly", 2026-10-29). After its start-up delay the touch thread binds itself to the
+highest-numbered A55, which runs nothing else while only the A75s are recommended (thread_select still runs bound
+threads on a CPU that is not recommended).
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -520,6 +520,31 @@
+ 	    "all CPUs recommended");
+ }
+ 
++/*
++ * 0257: bind the calling kernel thread to the highest-numbered A55, which runs nothing else while only the A75s are
++ * recommended (a CPU that is not recommended still runs the threads bound to it: thread_select). For the touch
++ * thread: it reads the NT36672A over bit-banged I2C (~6 ms of CPU per frame, a frame every ~8 ms while a finger is
++ * down) at kernel priority 81, so on an A75 it preempted CoreAnimation's render thread (pri 54) whenever the screen
++ * was touched ("when I touch it UI really stutters", 2026-10-29). The binding takes effect at the caller's next block.
++ */
++extern processor_t thread_bind(processor_t processor);   /* osfmk/kern/sched_prim.h, MACH_KERNEL_PRIVATE */
++void sweet_amp_bind_little(const char *who);
++void
++sweet_amp_bind_little(const char *who)
++{
++	if (cf_amp_little == 0) {
++		printf("SWEET AMP: %s stays unbound (no A55 mask)\n", who);
++		return;
++	}
++	int cpu = 63 - __builtin_clzll(cf_amp_little);
++	processor_t p = cpu_to_processor(cpu);
++	if (p == NULL) {
++		return;
++	}
++	(void)thread_bind(p);
++	printf("SWEET AMP: %s bound to CPU %d (A55)\n", who, cpu);
++}
++
+ /* Core-class steering of the scheduler's idle-CPU choice (osfmk/kern/sched_prim.c). */
+ static void
+ cf_amp_setup(void)
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -27,6 +27,8 @@
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
+ 
++extern void sweet_amp_bind_little(const char *who);    /* bsd/dev/sweet_cpufreq.c (0257) */
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+@@ -1069,6 +1071,8 @@
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
++	/* 0257: the bit-banged reads spin a CPU while a finger is down: keep them off the A75s (sweet_cpufreq.c) */
++	sweet_amp_bind_little("touch thread");
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/%s\n", tb->name);
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
