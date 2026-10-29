@@ -197,6 +197,25 @@ jobs:
           ccache -z
           ccache -p | grep -E 'base_dir|cache_dir|max_size|sloppiness|compiler_check|hash_dir|compression ' || true
 
+      # The KDK: dxb downloads and installs a multi-GB dmg (~1.8 min) unless its KDKROOT directory exists. The SWEET
+      # kernel reads only Kernel.framework's headers, KernelSupport's headers (-I) and usr/local/lib/kernel/platform (-L)
+      # from it, so that subset is cached and restored at the same path: the compile commands stay the same (ccache).
+      - name: Restore KDK subset cache
+        id: kdkcache
+        if: startsWith(env.MACOS_VERSION, '26.') && (inputs.use_kdk || 'true') == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: kdk-subset.tgz
+          key: kdk-subset-${{ env.CACHE_VERSION }}-${{ env.MACOS_VERSION }}-${{ env.DXB_SHA }}
+
+      - name: Install the cached KDK subset
+        if: steps.kdkcache.outputs.cache-hit == 'true'
+        run: |
+          K=$(grep -A4 "'${MACOS_VERSION}')" dxb/build.sh | sed -n "s/.*KDKROOT='\([^']*\)'.*/\1/p" | head -1)
+          [ -n "$K" ] || { echo "no KDKROOT for ${MACOS_VERSION} in build.sh"; exit 1; }
+          sudo mkdir -p "$K" && sudo tar xzf kdk-subset.tgz -C "$K"
+          ls "$K" "$K/System/Library"
+
       - name: Build
         id: build
         working-directory: dxb
@@ -294,6 +313,25 @@ jobs:
           name: xnu-buildtree
           path: buildtree.tgz
           retention-days: 7
+
+      - name: Snapshot the KDK subset
+        if: success() && steps.kdkcache.outcome == 'success' && steps.kdkcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: |
+          K=$(ls -d /Library/Developer/KDKs/KDK_${MACOS_VERSION}_*.kdk | head -1)
+          paths=""
+          for p in System/Library/Frameworks/Kernel.framework System/Library/KernelSupport usr/local/lib/kernel/platform; do
+            [ -e "$K/$p" ] && paths="$paths $p"
+          done
+          tar czf kdk-subset.tgz -C "$K" --exclude='System/Library/KernelSupport/lib*.a' $paths || rm -f kdk-subset.tgz
+          ls -la kdk-subset.tgz 2>/dev/null; du -sh "$K" $(for p in $paths; do echo "$K/$p"; done) 2>/dev/null
+
+      - name: Save KDK subset cache
+        if: success() && steps.kdkcache.outcome == 'success' && steps.kdkcache.outputs.cache-hit != 'true' && hashFiles('kdk-subset.tgz') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: kdk-subset.tgz
+          key: kdk-subset-${{ env.CACHE_VERSION }}-${{ env.MACOS_VERSION }}-${{ env.DXB_SHA }}
 
       - name: Inspect closed KDK support libs
         if: always()
