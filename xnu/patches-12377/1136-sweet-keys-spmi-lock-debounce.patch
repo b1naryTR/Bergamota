@@ -1,0 +1,170 @@
+Keys: share sweet_spmi.c's arbiter lock, drop impossible values, debounce two polls (phantom presses).
+User report (boot 1135): the phone presses power by itself (wakes, or locks while in use) and sometimes volume.
+The kernel log of all boots so far (SWEET KEYS key=K down=1 pon=.. gpio=..): of 518 power, 245 volume-down and
+380 volume-up presses, 226 / 123 / ~283 carried register values PON/GPIO RT_STS cannot hold (PON 0x1d/0x1f/0xc3,
+GPIO 0x50/0x80/0x3c/0xc4/0x70 ...: charger, fuel gauge and WLED register contents), beside 758 runs of failed
+reads, many DROPPED (status 0x9). sweet_keys.c issued its observer commands without the lock sweet_spmi.c holds
+for the battery, RTC, reboot and WLED-fade transactions (the fade runs exactly at screen wake and lock): commands on
+different APIDs of the one EE observer still interfere, as Linux's single pmic_arb lock assumes. Now:
+ - keys_read holds sp_lock (sweet_spmi_bus_lock/unlock) for the whole transaction;
+ - a PON read with bits above 0-2, or a GPIO read with bits above 0, is ignored (logged every 100);
+ - a key changes state only on the second poll in a row that shows the change (20-40 ms).
+
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -19,6 +19,12 @@
+ int sweet_spmi_prepare_write(unsigned sid, unsigned addr);
+ /* Reset time: no more sleeping locks or mappings in this module. */
+ void sweet_spmi_atomic(void);
++/*
++ * sweet_keys.c's own observer reads: hold the lock this module holds around each PMIC arbiter transaction, so the
++ * two never have commands in flight at once. 1 = taken (pass it back to unlock), 0 = not (no SPMI). Thread context.
++ */
++int sweet_spmi_bus_lock(void);
++void sweet_spmi_bus_unlock(int taken);
+ /* Poco F1 wall clock from the PM8998 RTC (patch 0245). Thread context. get: Unix seconds, 0 none. */
+ uint64_t sweet_rtc_get(void);
+ void sweet_rtc_set(uint64_t unix_secs);
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -2,7 +2,9 @@
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+  * Reads go through the observer and issue one-byte read commands.
+  * No interrupt clear, peripheral enable or charger config.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs, but the keys
++ * still take sp_lock for their reads (sweet_spmi_bus_lock): disjoint APIDs were
++ * not enough, key reads returned battery register values (patch 1136).
+  *
+  * The one write path (sweet_spmi_write, Poco F1 only) exists for the
+  * backlight fade (SweetFramebuffer.cpp, sweetfb_blfade), the reboot reason
+@@ -92,6 +94,27 @@
+ static int sweet_spmi_init_locked(void);
+ 
+ /*
++ * Up to 1135 sweet_keys.c issued its observer commands without sp_lock. Its logged key presses carried values the
++ * PON/GPIO status registers cannot hold (PON 0x1d/0x1f/0xc3, GPIO 0x50/0x80/0x3c/0xc4: charger, fuel gauge and WLED
++ * contents) beside DROPPED (0x9) statuses: commands on different APIDs of one EE's observer still interfere, as the
++ * single pmic_arb lock in Linux's spmi-pmic-arb.c assumes. Those reads match the phantom power/volume presses.
++ */
++int
++sweet_spmi_bus_lock(void)
++{
++	if (sweet_spmi_init() != 0) {
++		return 0;
++	}
++	return sp_take() ? 1 : 0;
++}
++
++void
++sweet_spmi_bus_unlock(int taken)
++{
++	sp_put(taken != 0);
++}
++
++/*
+  * The battery driver and the framebuffer (WLED fade) both start this from
+  * their own threads: serialize.
+  */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,6 +15,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -68,6 +69,9 @@
+ 	if (apid == KEYS_NO_APID) {
+ 		return false;
+ 	}
++	/* one transaction at a time on the arbiter: sweet_spmi.c's lock (patch 1136, see sweet_spmi_bus_lock) */
++	int taken = sweet_spmi_bus_lock();
++	bool ok = false;
+ 	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+@@ -76,15 +80,16 @@
+ 	for (unsigned i = 0; i < 1000; ++i) {
+ 		keys_last_status = keys_rd(keys_obs, off + 0x08u);
+ 		if (keys_last_status & 1u) {
+-			if (keys_last_status & 0x0eu) {
+-				return false;
++			if (!(keys_last_status & 0x0eu)) {
++				*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
++				ok = true;
+ 			}
+-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
+-			return true;
++			break;
+ 		}
+ 		delay(1);
+ 	}
+-	return false;
++	sweet_spmi_bus_unlock(taken);
++	return ok;
+ }
+ 
+ static void
+@@ -100,13 +105,27 @@
+ keys_thread(void *arg, wait_result_t result)
+ {
+ 	int state[3] = {0, 0, 0};
+-	unsigned errors = 0;
++	unsigned differ[3] = {0, 0, 0};
++	unsigned errors = 0, implausible = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		/*
++		 * PON RT_STS holds KPDPWR, RESIN and CBLPWR (bits 0-2; the S1 bark bits only while a key is held), the
++		 * GPIO's RT_STS only the pin level (bit 0): any other bit means the read returned something else.
++		 */
++		bool pbad = pok && (pon & ~0x07u), gbad = gok && (gpio & ~0x01u);
++		if (pbad || gbad) {
++			if ((implausible++ % 100u) == 0) {
++				printf("SWEET KEYS: implausible read pon=%#x gpio=%#x ignored (%u so far)\n",
++				    pon, gpio, implausible);
++			}
++			pok = pok && !pbad;
++			gok = gok && !gbad;
++		}
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+@@ -117,12 +136,22 @@
+ 			errors = 0;
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+-				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x\n",
+-				    k, state[k], pon, gpio);
+-				sweet_hid_key(k, state[k]);
++			if (!(k == 1 ? gok : pok)) {
++				continue;               /* no usable sample: keep the count */
++			}
++			if (now[k] == state[k]) {
++				differ[k] = 0;
++				continue;
++			}
++			/* debounce: a change counts on the second poll in a row (20-40 ms), never on one sample */
++			if (++differ[k] < 2) {
++				continue;
+ 			}
++			differ[k] = 0;
++			state[k] = now[k];
++			printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x\n",
++			    k, state[k], pon, gpio);
++			sweet_hid_key(k, state[k]);
+ 		}
+ 		keys_wait();
+ 	}
