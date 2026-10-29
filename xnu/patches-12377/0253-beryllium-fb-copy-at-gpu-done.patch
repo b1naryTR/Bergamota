@@ -1,0 +1,195 @@
+Copy mode: copy a frame as soon as its GPU work is done instead of at the next vsync tick.
+The vsync tick copied a pending frame only if the GPU work submitted before its swap had completed (0229); otherwise the
+frame waited for the next tick, and by then CoreAnimation had mostly swapped the next frame, which replaced it. A home
+swipe on beryllium (boot 40, kern.sweet_fb_trace) lost 35 of 125 frames that way while the GPU was ~80 % idle: backboardd
+submitted a frame every ~22 ms (median), the panel got ~70 % of them. Now such a tick arms a timer (copy mode only; direct
+mode has its own swap timer) that checks the gate every 250 us and copies the frame the moment it opens. present() draws
+into the back buffer and flips at the next latch exactly as at a tick, so there is no tearing. The 250-us checks are not
+counted in gpu_holds; a 50 ms wait still ends the hold as before. New in kern.sweet_fb: copyasap=, gate_copies= (frames
+copied this way). Writable sysctl kern.sweet_fb_copyasap (default 1; 0 = the old behaviour, for comparing in one boot);
+boot-arg sweetfb_copyasap sets the initial value.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,7 @@
+ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;
++extern "C" int sweet_fb_copyasap;                                       /* bsd/dev/sweet_fb.c: kern.sweet_fb_copyasap (patch 0253) */
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
+ extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
+ extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+@@ -263,6 +264,7 @@
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static void swapFired(OSObject *owner, IOTimerEventSource *sender);
++	static void gateFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -404,6 +406,7 @@
+ 		uint64_t cleanAbs, cleans, cleanSkips;
+ 		uint64_t swapWaits, swapWaitAbs, swapWaitTimeouts;      /* SwapWait calls that had to wait, their time, those that gave up */
+ 		uint64_t gpuHolds, gpuHoldTimeouts;                     /* 0229: pending swaps held for the GPU, held past 50 ms */
++		uint64_t gateCopies;                                    /* 0253: copied by gateFired as soon as their GPU work was done */
+ 		uint64_t replaceWaits, replaceTimeouts;                 /* 0220: frames that waited for the previous one's latch / gave up */
+ 		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
+ 		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
+@@ -420,6 +423,12 @@
+ 	 */
+ 	bool          fDirect, fEarly;
+ 	IOTimerEventSource *fSwapTimer;
++	/*
++	 * 0253 (copy mode, kern.sweet_fb_copyasap): fGateTimer polls the GPU gate after a vsync tick found the pending frame
++	 * still being drawn, and gateFired copies it as soon as the gate opens. fGatePoll: armed (under fLock).
++	 */
++	IOTimerEventSource *fGateTimer;
++	bool          fGatePoll;
+ 	uint8_t       fEarlyRec[SWEET_FB_SWAP_REC_SIZE];
+ 	void          quietConsole(void);
+ 	uint32_t      fZcCleanMode;     /* sweetfb_zcclean: 0 never, 1 always (0127 behaviour), 2 auto (patch 0212) */
+@@ -669,6 +678,12 @@
+ 		fStLogSecs = secs;
+ 	}
+ 	{
++		int asap = 1;
++		if (PE_parse_boot_argn("sweetfb_copyasap", &asap, sizeof(asap))) {
++			__atomic_store_n(&sweet_fb_copyasap, asap != 0, __ATOMIC_RELAXED);      /* sysctl kern.sweet_fb_copyasap (patch 0253) */
++		}
++	}
++	{
+ 		int hud = 0;
+ 		if (PE_parse_boot_argn("sweetfb_hud", &hud, sizeof(hud))) {
+ 			__atomic_store_n(&sweet_fb_hud, hud != 0, __ATOMIC_RELAXED);    /* sysctl kern.sweet_fb_hud (patch 0213) */
+@@ -857,6 +872,13 @@
+ 			IOLog("SWEET FB: no swap timer: direct frames wait for the vsync tick\n");
+ 		}
+ 	}
++	if (!fEarly) {
++		fGateTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::gateFired);
++		if (fGateTimer == NULL || fWorkLoop->addEventSource(fGateTimer) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(fGateTimer);
++			IOLog("SWEET FB: no gate timer (0253): a frame the GPU had not finished at its tick waits for the next one\n");
++		}
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -1002,7 +1024,14 @@
+ 		sender->setTimeoutUS(nextUS);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
++	bool due = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool flush = due && fb->gpuGateOpen(mach_absolute_time());
++	/* 0253: still being drawn: gateFired copies it once the GPU is done instead of the next tick */
++	bool poll = due && !flush && fb->fGateTimer != NULL && !fb->fGatePoll &&
++	    __atomic_load_n(&sweet_fb_copyasap, __ATOMIC_RELAXED) != 0;
++	if (poll) {
++		fb->fGatePoll = true;
++	}
+ 	uint8_t *rec = NULL;
+ 	SweetSurface *taken[4] = {};
+ 	if (flush) {
+@@ -1016,6 +1045,9 @@
+ 	}
+ 	bool dirty = fb->fDirty;        /* still unshown: not yet worth lighting the panel */
+ 	IOLockUnlock(fb->fLock);
++	if (poll) {
++		fb->fGateTimer->setTimeoutUS(250);
++	}
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+@@ -1073,6 +1105,52 @@
+ 	return false;
+ }
+ 
++/*
++ * 0253: copy mode. A pending frame whose GPU work had not completed at its vsync tick waited for the next tick, and by
++ * then CoreAnimation had mostly swapped the next frame, which replaced it: 35 of 125 frames of a home swipe were never
++ * shown (beryllium boot 40, kern.sweet_fb_trace) while the GPU was ~80 % idle. vsyncFired arms fGateTimer instead; this
++ * checks the gate every 250 us (not counted in gpu_holds) and copies the frame as soon as it opens. present() draws into
++ * the back buffer and flips at the next latch, as at a tick. Same work loop as vsyncFired, so the two never run at once.
++ * kern.sweet_fb_copyasap=0 (boot-arg sweetfb_copyasap=0): the old behaviour.
++ */
++void
++AppleCLCD::gateFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	SweetSurface *taken[4] = {};
++	uint8_t *rec = NULL;
++	uint64_t cap;
++
++	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &cap);
++	IOLockLock(fb->fLock);
++	if (fb->fPowerOff || !fb->fDirty || __atomic_load_n(&sweet_fb_copyasap, __ATOMIC_RELAXED) == 0) {
++		fb->fGatePoll = false;          /* shown or replaced meanwhile, or switched off */
++		IOLockUnlock(fb->fLock);
++		return;
++	}
++	if (!sweet_gpu_fence_passed(fb->fPendFence) && mach_absolute_time() - fb->fPendAbs <= cap) {
++		IOLockUnlock(fb->fLock);
++		sender->setTimeoutUS(250);
++		return;
++	}
++	(void)fb->gpuGateOpen(mach_absolute_time());   /* open; counts a 50 ms timeout as the tick would */
++	rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec != NULL) {
++		memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		fb->fDirty = false;
++		memcpy(taken, fb->fPendHold, sizeof(taken));
++		bzero(fb->fPendHold, sizeof(fb->fPendHold));
++		fb->fSt.gateCopies++;
++	}
++	fb->fGatePoll = false;
++	IOLockUnlock(fb->fLock);
++	if (rec != NULL) {
++		fb->present(rec);
++		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	}
++	sweet_hold_release(taken);      /* copied: CA may render into them again */
++}
++
+ void
+ AppleCLCD::swapFired(OSObject *owner, IOTimerEventSource *)
+ {
+@@ -1186,7 +1264,7 @@
+ 	    "latch_waits=%llu latch_wait_us=%u.%02u latch_timeouts=%llu vsync_s=%u.%02u "
+ 	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu "
+ 	    "swapsync=%d swap_waits=%llu swap_wait_us=%u.%02u swap_wait_timeouts=%llu replace_waits=%llu replace_timeouts=%llu "
+-	    "gpu_holds=%llu gpu_hold_timeouts=%llu empty_swaps=%llu empty_kept=%llu "
++	    "gpu_holds=%llu gpu_hold_timeouts=%llu copyasap=%d gate_copies=%llu empty_swaps=%llu empty_kept=%llu "
+ 	    "scancopy=%d scan_copies=%llu scan_copy_us=%u.%02u scan_copy_us_max=%llu scan_gpu=%d scan_gpu_copies=%llu scan_gpu_fallbacks=%llu "
+ 	    "scan_gpu_submit_fails=%llu scan_gpu_late=%llu scan_gpu_wait_us_max=%llu\n",
+ 	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
+@@ -1197,7 +1275,8 @@
+ 	    c.latchWaits, SW_F2(lwAvg), c.latchTimeouts, SW_F2(PER_S(dTicks)),
+ 	    used, total, pallocs, pfails,
+ 	    fSwapSync ? 1 : 0, c.swapWaits, SW_F2(swAvg), c.swapWaitTimeouts, c.replaceWaits, c.replaceTimeouts,
+-	    c.gpuHolds, c.gpuHoldTimeouts, c.emptySwaps, c.emptyKept,
++	    c.gpuHolds, c.gpuHoldTimeouts, fGateTimer != NULL && __atomic_load_n(&sweet_fb_copyasap, __ATOMIC_RELAXED) != 0 ? 1 : 0,
++	    c.gateCopies, c.emptySwaps, c.emptyKept,
+ 	    fScanCopy && !fScanFailed ? 1 : 0, c.scanCopies, SW_F2(scAvg), sweet_abs_us(c.scanCopyMaxAbs),
+ 	    fScanGpu && !fScanGpuOff ? (fScanGpuRest ? 2 : 1) : 0, c.scanGpuCopies, c.scanGpuFallbacks,
+ 	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -64,6 +64,15 @@
+     "Poco F1 on-screen performance HUD (0 off, 1 on); needs the copy scan-out path");
+ 
+ /*
++ * sysctl kern.sweet_fb_copyasap (patch 0253): copy mode only. 1 (default): a frame whose GPU work had not finished at its
++ * vsync tick is copied as soon as it has (SweetFramebuffer.cpp gateFired); 0: at the next tick, as before, which dropped
++ * it whenever CoreAnimation swapped another frame first. Boot-arg sweetfb_copyasap sets the initial value.
++ */
++int sweet_fb_copyasap = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_copyasap, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_copyasap, 0,
++    "Poco F1 copy mode: copy a frame once its GPU work is done (1) or at the next vsync tick (0)");
++
++/*
+  * sysctl kern.sweet_fb_shot (patch 0224): a screenshot of what the panel scans now, for testing over SSH
+  * (tools/sweetnet/sweetshot). Root only. 16-byte header, little endian: 'SHOT' (0x544f4853), width, height,
+  * bytes per row (width * 4); then BGRA rows. kern.sweet_fb_shot_scale (2..8, default 3) keeps every n-th pixel
