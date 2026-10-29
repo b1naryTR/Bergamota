@@ -1,0 +1,127 @@
+Schedule on the A75 cluster only (boot-arg sweetbigonly, default 1; sysctl kern.sweet_bigonly).
+XNU sees one SMP cluster here (hw.nperflevels 1, the Clutch SMP scheduler); 0191's steering picks an A75 for user
+threads only among idle CPUs, and all CPUs share one run queue, so CoreAnimation's render thread (backboardd
+com.apple.coreanimation.display.primary, pri 54) kept landing on the in-order A55s at their 902 MHz cap. Measured
+2026-10-29 on kernel 0255 with continuous home-page swipes (tools: sweetfg + swipe-trace.sh): all CPUs 29-31 fps,
+median frame 25-29 ms; A75s only (kern.sched_update_recommended_cores=0xf0) 51-52 fps, median 16.4 ms, 78 % of frames
+at 60 Hz, 3 % over 40 ms. Once all CPUs are up the cpufreq thread asks the scheduler, as CLPC's system request, to
+recommend only the A75 cluster; kern.sweet_bigonly=0 recommends every CPU again, sweetbigonly=0 keeps them all.
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -62,10 +62,16 @@
+  *                                      sweetgpuinputms= in sweet_a630.c.
+  *   sweetamp=0|1                       idle-core steering in the scheduler (default 1)
+  *   sweetamp_prio=<n>                  base_pri threshold (default 31)
++ *   sweetbigonly=0|1                   A75 cluster only (0256, default 1; needs sweetamp): see below
+  * Core-class steering (independent of the cpufreq mode): once all CPUs are up,
+  * osfmk/kern/sched_prim.c is told which CPUs are A75 (MPIDR Aff1 >= 4) and which A55;
+  * choose_processor() then gives user threads with base_pri >= sweetamp_prio an idle A75
+  * first and all other threads (low QoS, kernel threads) an idle A55 first.
++ * A75 only (0256): the scheduler then recommends only the A75 cluster (CLPC's system request), so no thread that is
++ * not bound runs on an A55. The steering above picks among idle CPUs only, and all CPUs share one run queue, so
++ * CoreAnimation's render thread kept landing on A55s (in order, 902 MHz cap): continuous home swipes ran at 29-31 fps
++ * with all cores and at 51-52 fps (median frame 16.4 ms, 78 % of frames at 60 Hz) with the A75s only (2026-10-29).
++ * sysctl kern.sweet_bigonly (0/1) switches it at run time.
+  * The closest LUT entry to the percentage is used (100 = highest index).
+  * Starts once every selected CPU is up (after iokit/Kernel/arm/SweetCPU.cpp's
+  * SMP bring-up). All logs start with "SWEET CPUFREQ:".
+@@ -95,6 +101,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/processor.h>
+ #include <machine/machine_routines.h>
+ #include <arm/cpu_topology.h>
+ #include <pexpert/pexpert.h>
+@@ -174,6 +181,9 @@
+ static int cf_amp_pri = 31;             /* BASEPRI_DEFAULT */
+ static uint64_t cf_amp_big;
+ static bool cf_amp_on;
++static uint64_t cf_amp_little;
++static int cf_bigonly = 1;              /* sweetbigonly (0256) */
++static bool cf_bigonly_on;
+ /* Touch boost (patch 0217). The hook runs on the touch thread; the governor thread reads these words. */
+ static uint64_t cf_in_hold_abs;         /* hold after the last touch event; 0 = touch boost off (sweetinputboost=0) */
+ static uint64_t cf_in_gap_abs;          /* the hook does nothing within this long of its last accepted event */
+@@ -500,6 +510,16 @@
+ 	printf("%s\n", line);
+ }
+ 
++/* A75 only (0256): the A75 cluster alone is recommended to the scheduler, or every CPU again. */
++static void
++cf_bigonly_apply(bool on)
++{
++	sched_perfcontrol_update_recommended_cores_reason(on ? cf_amp_big : cf_amp_big | cf_amp_little, REASON_CLPC_SYSTEM, 0);
++	cf_bigonly_on = on;
++	printf("SWEET AMP: %s\n", on ? "A75 cluster only (sweetbigonly; kern.sweet_bigonly=0 gives the A55s back)" :
++	    "all CPUs recommended");
++}
++
+ /* Core-class steering of the scheduler's idle-CPU choice (osfmk/kern/sched_prim.c). */
+ static void
+ cf_amp_setup(void)
+@@ -520,9 +540,13 @@
+ 	}
+ 	sweet_amp_enable(big, little, cf_amp_pri);
+ 	cf_amp_big = big;
++	cf_amp_little = little;
+ 	cf_amp_on = true;
+ 	printf("SWEET AMP: idle-core steering on: A75 mask 0x%llx, A55 mask 0x%llx, base_pri >= %d takes an A75 first\n",
+ 	    big, little, cf_amp_pri);
++	if (cf_bigonly) {
++		cf_bigonly_apply(true);
++	}
+ }
+ 
+ static void
+@@ -643,6 +667,7 @@
+ 	(void)PE_parse_boot_argn("sweetcpufreq", arg, sizeof(arg));
+ 	(void)PE_parse_boot_argn("sweetamp", &cf_amp, sizeof(cf_amp));
+ 	(void)PE_parse_boot_argn("sweetamp_prio", &cf_amp_pri, sizeof(cf_amp_pri));
++	(void)PE_parse_boot_argn("sweetbigonly", &cf_bigonly, sizeof(cf_bigonly));
+ 	if (!strcmp(arg, "off") || !strcmp(arg, "0")) {
+ 		cf_mode = MODE_OFF;
+ 		cf_dom[0].state = cf_dom[1].state = CF_OFF;
+@@ -702,11 +727,11 @@
+ 	const char *modes[] = { "off", "gov", "fixed" };
+ 
+ 	n = cf_cat(buf, sizeof(buf), n, "sweet_cpufreq v1 mode=%s period_ms=%u amp=%s amp_big=0x%llx amp_pri=%d "
+-	    "input=%s input_khz=%u input_ms=%u input_boosts=%u input_boosted=%u\n",
++	    "input=%s input_khz=%u input_ms=%u input_boosts=%u input_boosted=%u bigonly=%d\n",
+ 	    modes[cf_mode], cf_mode == MODE_GOV ? GOV_PERIOD_MS : FIXED_PERIOD_MS,
+ 	    cf_amp_on ? "on" : "off", cf_amp_big, cf_amp_pri,
+ 	    cf_in_hold_abs ? "on" : "off", cf_in_khz, cf_in_ms, cf_in_events,
+-	    (unsigned)(cf_in_hold_abs && mach_absolute_time() < cf_in_until));
++	    (unsigned)(cf_in_hold_abs && mach_absolute_time() < cf_in_until), cf_bigonly_on ? 1 : 0);
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		const struct cf_domain *d = &cf_dom[i];
+ 		const char *st = d->state == CF_OFF ? "off" : d->state == CF_PENDING ? "pending" :
+@@ -735,6 +760,26 @@
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cf_sysctl, "A",
+     "Poco F1 cpufreq governor state per cluster (see bsd/dev/sweet_cpufreq.c)");
+ 
++/* kern.sweet_bigonly: 1 = the A75 cluster only, 0 = every CPU (0256; root) */
++static int
++cf_sysctl_bigonly SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = cf_bigonly_on ? 1 : 0, changed = 0;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (error == 0 && changed) {
++		if (!cf_amp_on) {
++			return ENOTSUP;
++		}
++		cf_bigonly_apply(v != 0);
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bigonly,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cf_sysctl_bigonly, "I",
++    "Schedule on the A75 cluster only (bsd/dev/sweet_cpufreq.c, 0256)");
++
+ /*
+  * Current clock of the A55 and A75 clusters in MHz (0 = cluster not under our control), read live from
+  * PERF_STATE like cur_khz above; for the framebuffer's on-screen HUD (patch 0213).
