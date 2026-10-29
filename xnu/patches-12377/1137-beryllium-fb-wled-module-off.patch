@@ -1,0 +1,149 @@
+Display off switches the WLED module off (MOD_EN), not only its brightness to 0; black frame when it cannot.
+User report (boot 1136): when the screen times out the last frame stays visible, "with the backlight off". 0242's
+blSet(false) wrote 0 to the two WLED4 sink brightness registers and left WLED_CTRL MOD_EN (0xd846 bit 7) set.
+qcom-wled never does that: WLED4's floor is 0.4 % (wled4_set_brightness), and a brightness of 0 is
+wled_module_enable(0). Now:
+ - sweet_spmi.c: sweet_spmi_wled_module(on), MOD_EN bit 7 only (read-modify-write, read back); 0xd846 is accepted
+   by the write whitelist only during that function's own write. Write channels 6 -> 8 (6 in use with
+   sweetcharger=2).
+ - SweetFramebuffer: display off = brightness 0, then the module off; display on = brightness back, then the module
+   on (qcom-wled's order), retried like the brightness. If the module could not be switched off (or with
+   sweetfb_blmod=0) the panel gets the black frame of the old fallback; display on redraws the latest frame first.
+
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -25,6 +25,8 @@
+  */
+ int sweet_spmi_bus_lock(void);
+ void sweet_spmi_bus_unlock(int taken);
++/* Poco F1: the PMI8998 WLED module on or off (WLED_CTRL MOD_EN, bit 7 only), read back. 0 ok. Thread context. */
++int sweet_spmi_wled_module(int on);
+ /* Poco F1 wall clock from the PM8998 RTC (patch 0245). Thread context. get: Unix seconds, 0 none. */
+ uint64_t sweet_rtc_get(void);
+ void sweet_rtc_set(uint64_t unix_secs);
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -35,7 +35,7 @@
+ static bool sp_attempted, sp_ready;
+ static volatile uint32_t sp_init_lock;
+ /* Write channels mapped on demand (one 4 KiB page of the APID's 64 KiB window). */
+-#define SP_WCH_MAX 6
++#define SP_WCH_MAX 8   /* PON spare, RTC alarm, WLED sink + ctrl, charger CHGR + USBIN: 6 in use (1137) */
+ static struct { uint16_t apid; vm_offset_t va; } sp_wch[SP_WCH_MAX];
+ static unsigned sp_nwch;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+@@ -226,7 +226,8 @@
+  *   0x47        WLED3_SINK_REG_SYNC (one byte)
+  *   0x57 0x67   WLED4_SINK_REG_BRIGHT(0/1), 16-bit little endian (1 or 2 bytes)
+  *   0x58 0x68   their high bytes (one byte)
+- * Nothing in the control module (0xd8: MOD_EN, OVP, boost) is writable.
++ * In the control module (0xd8) only MOD_EN bit 7, through sweet_spmi_wled_module()
++ * (1137: the backlight off at display off); OVP, boost and the rest are not writable.
+  * SID 0: PM8998 PON_SOFT_RB_SPARE (0x88f, one byte) only, the reboot reason
+  * of qcom-pon.c (written by sweet_reboot.c, read-modify-write).
+  * SID 2: PMI8998 SMB2 charger, single bytes, only after sweet_charger.c
+@@ -247,6 +248,8 @@
+ 	sp_charger_writes = true;
+ }
+ 
++static volatile bool sp_mod_en_rmw;     /* sweet_spmi_wled_module()'s own write of 0xd846 is under way */
++
+ static bool
+ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ {
+@@ -278,6 +281,8 @@
+ 		return false;
+ 	}
+ 	switch (addr) {
++	case 0xd846u:
++		return len == 1 && sp_mod_en_rmw;
+ 	case 0xd947u:
+ 	case 0xd958u:
+ 	case 0xd968u:
+@@ -290,6 +295,30 @@
+ 	}
+ }
+ 
++/*
++ * 1137: WLED_CTRL MOD_EN (0xd846) bit 7, read-modify-write and read back. qcom-wled switches the module off for a
++ * brightness of 0 (wled_module_enable): WLED4 is not meant to run below 0.4 %, and with only the sinks at 0 the
++ * panel still showed the last frame, dimly, while the display was off (user report, boot 1136).
++ */
++int
++sweet_spmi_wled_module(int on)
++{
++	uint8_t mod = 0, got = 0;
++	if (sweet_spmi_read(3, 0xd846u, &mod) != 0) {
++		return -1;
++	}
++	uint8_t want = on ? (uint8_t)(mod | 0x80u) : (uint8_t)(mod & 0x7fu);
++	if (want != mod) {
++		sp_mod_en_rmw = true;
++		int rc = sweet_spmi_write(3, 0xd846u, &want, 1);
++		sp_mod_en_rmw = false;
++		if (rc != 0) {
++			return -1;
++		}
++	}
++	return sweet_spmi_read(3, 0xd846u, &got) == 0 && (got & 0x80u) == (want & 0x80u) ? 0 : -1;
++}
++
+ /* Mapped read/write channel registers of an APID, or 0. Called with sp_lock held. */
+ static vm_offset_t
+ sp_wch_map(uint16_t apid)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -499,6 +499,8 @@
+ 	bool          blStep(int dir);
+ 	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
+ 	bool          fBlOffFailed;     /* 0242: this power-off could not darken the WLED: black frame instead, for this off only */
++	/* 1137: at display off the WLED module goes off too (MOD_EN); a black frame whenever it could not (sweetfb_blmod) */
++	bool          fBlModCtl, fBlModOff;
+ 	/* 0243: brightness iOS asked for through AppleARMBacklight (0..4095), and the one written; applied on the vsync timer */
+ 	uint32_t      fBlReq, fBlReqApplied;
+ 	AppleARMBacklight *fBacklight;
+@@ -816,6 +818,9 @@
+ 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
+ 		if (blfade) {
+ 			blInit();
++			int blmod = 1;  /* 1137: sweetfb_blmod=0 leaves MOD_EN alone: brightness 0 and a black frame at display off */
++			PE_parse_boot_argn("sweetfb_blmod", &blmod, sizeof(blmod));
++			fBlModCtl = blmod != 0;
+ 			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
+ 			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
+ 			if (blsvc && (fBacklight = OSTypeAlloc(AppleARMBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
+@@ -1017,7 +1022,8 @@
+ 		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
+ 			fb->fBlOffFailed = true;
+ 		}
+-		if ((!fb->fBlOK || fb->fBlOffFailed) && !fb->fBlackDone) {
++		/* 1137: also when the WLED module is still on: at a brightness of 0 the last frame stayed dimly visible */
++		if ((!fb->fBlOK || fb->fBlOffFailed || !fb->fBlModOff) && !fb->fBlackDone) {
+ 			fb->fBlackDone = true;
+ 			fb->blackout();
+ 		}
+@@ -2752,10 +2758,19 @@
+ 			uint16_t got = 0xffff;
+ 			ok = sweet_wled_read16(n, &got) == 0 && got == want[n];
+ 		}
++		if (ok && on && fBlModOff) {
++			ok = sweet_spmi_wled_module(1) == 0;    /* 1137: brightness first, then the module (qcom-wled's order) */
++			if (ok) {
++				fBlModOff = false;
++			}
++		}
+ 		if (ok) {
++			if (!on && fBlModCtl) {
++				fBlModOff = sweet_spmi_wled_module(0) == 0;
++			}
+ 			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
+-			IOLog("SWEET FB: backlight %s (0x%04x/0x%04x)%s\n", on ? "on" : "off", want[0], want[1],
+-			    attempt ? " after a retry" : "");
++			IOLog("SWEET FB: backlight %s (0x%04x/0x%04x)%s%s\n", on ? "on" : "off", want[0], want[1],
++			    attempt ? " after a retry" : "", on ? "" : (fBlModOff ? ", WLED module off" : ", WLED module on: black frame"));
+ 			return true;
+ 		}
+ 		IODelay(200);
