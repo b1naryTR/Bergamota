@@ -1,0 +1,103 @@
+Bluetooth beside the Wi-Fi service: sweetbt=1 now also works with sweetwlan=5.
+Until now the BT stage (sweetwlan=2) and the WLAN service (sweetwlan=5) were alternatives of the one WLAN thread, so a
+boot had Wi-Fi or Bluetooth. With sweetwlan=5 sweetbt=1 the BT stage (UART clocks and pins, the WCN3990 rails, power
+pulse, firmware, transport loop) runs in a thread of its own on the second A55 (0258); the service thread waits until
+the BT bring-up is over (transport running or given up, at most 30 s) before it powers the modem, because the
+bring-up read-modify-writes GCC clock votes. The transport loop touches only the UART; the shared rails stay voted on,
+as under Linux with hci_qca beside ath10k_snoc.
+
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -9361,6 +9361,24 @@
+ 	{ "ldoa7", 1800 }, { "ldoa17", 1304 }, { "ldoa25", 3300 },
+ };
+ 
++/*
++ * 1131: Bluetooth beside the Wi-Fi service (sweetwlan=5 + sweetbt=1). The BT stage below (UART clocks and pins, the WCN3990
++ * rails, power pulse, firmware, then the transport loop that never returns) runs in a thread of its own (wl_bt_thread),
++ * bound to the second A55 from the top: the touch thread has the first, and the loop polls the UART every 300 us while
++ * bluetoothd is connected. The service thread waits until the BT bring-up is over (transport running or given up, at
++ * most 30 s) before it powers the modem: the bring-up read-modify-writes GCC clock votes (wl_clocks_on), so the two never
++ * run at the same time; the transport loop itself touches only the UART. The chip's BT and WLAN halves share the rails
++ * (voted on here, never off), as under Linux (hci_qca beside ath10k_snoc).
++ */
++static volatile int wl_bt_state;        /* 0 bring-up, 1 transport running, 2 bring-up over without a transport */
++
++static void
++wl_bt_signal(int state)
++{
++	wl_bt_state = state;
++	thread_wakeup((event_t)&wl_bt_state);
++}
++
+ static void
+ wl_bt(void)
+ {
+@@ -9430,6 +9448,7 @@
+ 				if (wl.bt_hci) {
+ 					/* sweetbt=1: keep the chip, the UART clocks and the pins; the loop never returns */
+ 					if (fwok && wl_xport_start()) {
++						wl_bt_signal(1);        /* 1131: the Wi-Fi service may power the modem now */
+ 						wl_xport_run();
+ 					}
+ 					printf("SWEET BT: transport not started (see above): normal shutdown of the stage\n");
+@@ -9471,6 +9490,37 @@
+ 	printf("SWEET WLAN: bluetooth stage done\n");
+ }
+ 
++extern void sweet_amp_bind_little_nth(const char *who, unsigned nth);   /* bsd/dev/sweet_cpufreq.c (0258) */
++
++static void
++wl_bt_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	sweet_amp_bind_little_nth("Bluetooth transport", 1);
++	wl_bt();                /* returns only when no transport was started (or it stopped) */
++	wl_bt_signal(2);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* 1131: starts the BT stage in its own thread and waits (at most 30 s) until its bring-up is over */
++static void
++wl_bt_beside_service(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(wl_bt_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET BT: kernel_thread_start failed: Wi-Fi without Bluetooth\n");
++		return;
++	}
++	thread_deallocate(thread);
++	for (unsigned t = 0; t < 300 && wl_bt_state == 0; t++) {
++		wl_sleep(100);
++	}
++	printf("SWEET BT: beside the Wi-Fi service: %s\n", wl_bt_state == 1 ? "transport running" :
++	    wl_bt_state == 2 ? "no transport (see above)" : "bring-up still running after 30 s, starting Wi-Fi anyway");
++}
++
+ /* ---------------------------------------------------------------- thread */
+ 
+ static void
+@@ -9490,6 +9540,9 @@
+ 	} else if (wl.stage == 3) {
+ 		wl_inventory();
+ 	} else if (wl.stage == 4 || wl.stage == 5) {
++		if (wl.stage == 5 && wl.bt_hci) {
++			wl_bt_beside_service();     /* 1131 */
++		}
+ 		wl_mss();
+ 	}
+ out:
+@@ -9525,8 +9578,8 @@
+ 	(void)PE_parse_boot_argn("sweetbtsk", &wl.bt_sk, sizeof(wl.bt_sk));             /* 1: also register com.apple.uart.sk.bluetooth */
+ 	(void)PE_parse_boot_argn("sweetbtlog", &wl.bt_log, sizeof(wl.bt_log));
+ 	(void)PE_parse_boot_argn("sweetbtaddr", &wl.bt_setaddr, sizeof(wl.bt_setaddr));
+-	if (wl.bt_hci && stage != 2) {
+-		printf("SWEET BT: sweetbt=1 needs sweetwlan=2 (the BT stage): ignored\n");
++	if (wl.bt_hci && stage != 2 && stage != 5) {
++		printf("SWEET BT: sweetbt=1 needs sweetwlan=2 (the BT stage) or 5 (beside the Wi-Fi service, 1131): ignored\n");
+ 		wl.bt_hci = 0;
+ 	}
+ 	wl.bt_nvmdelay = 10;            /* ms after the NVM; Linux: 0 (10 ms only between patch and NVM) */

@@ -1,0 +1,46 @@
+Bind a kernel thread to the nth A55 from the top (sweet_amp_bind_little_nth; 0257's sweet_amp_bind_little = nth 0).
+Two polling kernel threads should not share one A55: the touch thread has the highest-numbered one, the Bluetooth
+transport (1131), which polls its UART every 300 us while bluetoothd is connected, takes the next.
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -529,14 +529,24 @@
+  */
+ extern processor_t thread_bind(processor_t processor);   /* osfmk/kern/sched_prim.h, MACH_KERNEL_PRIVATE */
+ void sweet_amp_bind_little(const char *who);
++void sweet_amp_bind_little_nth(const char *who, unsigned nth);
++/*
++ * 0258: the nth A55 from the top (0 = the highest-numbered: the touch thread's), so two polling threads do not share one
++ * CPU (the Bluetooth transport polls its UART every 300 us while bluetoothd is connected). Falls back to the lowest A55.
++ */
+ void
+-sweet_amp_bind_little(const char *who)
++sweet_amp_bind_little_nth(const char *who, unsigned nth)
+ {
+ 	if (cf_amp_little == 0) {
+ 		printf("SWEET AMP: %s stays unbound (no A55 mask)\n", who);
+ 		return;
+ 	}
+-	int cpu = 63 - __builtin_clzll(cf_amp_little);
++	uint64_t m = cf_amp_little;
++	int cpu = 63 - __builtin_clzll(m);
++	for (unsigned i = 0; i < nth && (m & ~(1ULL << cpu)) != 0; i++) {
++		m &= ~(1ULL << cpu);
++		cpu = 63 - __builtin_clzll(m);
++	}
+ 	processor_t p = cpu_to_processor(cpu);
+ 	if (p == NULL) {
+ 		return;
+@@ -544,6 +554,11 @@
+ 	(void)thread_bind(p);
+ 	printf("SWEET AMP: %s bound to CPU %d (A55)\n", who, cpu);
+ }
++void
++sweet_amp_bind_little(const char *who)
++{
++	sweet_amp_bind_little_nth(who, 0);
++}
+ 
+ /* Core-class steering of the scheduler's idle-CPU choice (osfmk/kern/sched_prim.c). */
+ static void
