@@ -1,0 +1,42 @@
+Answer the APFS item queries FileProvider makes with "none" on HFS+, so it can look up items (On My iPhone, Safari
+downloads). FileProvider's fpfs_fgetfileattrs_detailed() (FileProvider+0x165f4) first calls
+fpfs_fget_parent_syncroot(), ffsctl(fd, _IOR('J', 74, uint64_t)) (0x40084a4a), and fails the whole lookup when that
+errors. HFS returned ENOTTY, so LocalStorageFileProvider logged "can't obtain VFSItem for .../File Provider Storage
+[25: Inappropriate ioctl for device]" for its own root, DocumentManagerCore.Downloads got "Unable to fetch root node for
+preferred domain: Local Storage" / "Couldn't find a downloads location", and Safari downloads stayed at 100%.
+The same lookup then loads fpfs_eviction_properties(), i.e. fpfs_get_purgeable_flags(): ffsctl(_IOR('J', 71,
+uint64_t)) (0x40084a47) when purgeable operations are enabled, also fatal on error. fpfs_fget_syncroot() is
+ffsctl(_IOR('J', 72, uint32_t)) (0x40044a48). HFS has no sync roots and no purgeable files: 0 for all three, which is
+what APFS reports for an ordinary folder or file outside replicated FileProvider domains.
+
+diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwrite.c
+--- a/bsd/sweet_hfs/core/hfs_readwrite.c
++++ b/bsd/sweet_hfs/core/hfs_readwrite.c
+@@ -3149,6 +3149,27 @@
+ 	case FSIOC_CAS_BSDFLAGS:
+ 		return hfs_cas_bsdflags(hfsmp, vp, ap);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * APFS queries FileProvider sends for every item it looks up (fpfs_fgetfileattrs_detailed()), failing the lookup
++	 * on ENOTTY: On My iPhone had no root item ("can't obtain VFSItem ... [25: Inappropriate ioctl for device]"),
++	 * DocumentManager found no Downloads folder and Safari downloads stopped at 100%. HFS has no sync roots and no
++	 * purgeable files, so the answers are all "none": the parent sync root id (fpfs_fget_parent_syncroot()), whether
++	 * this directory is a sync root (fpfs_fget_syncroot()) and the purgeable flags (fpfs_get_purgeable_flags()).
++	 */
++#define SWEET_APFSIOC_GET_PURGEABLE_FLAGS  _IOR('J', 71, uint64_t)
++#define SWEET_APFSIOC_GET_SYNC_ROOT_FLAG   _IOR('J', 72, uint32_t)
++#define SWEET_APFSIOC_GET_PARENT_SYNC_ROOT _IOR('J', 74, uint64_t)
++	case SWEET_APFSIOC_GET_PURGEABLE_FLAGS:
++	case SWEET_APFSIOC_GET_PARENT_SYNC_ROOT:
++		*(uint64_t *)ap->a_data = 0;
++		return 0;
++
++	case SWEET_APFSIOC_GET_SYNC_ROOT_FLAG:
++		*(uint32_t *)ap->a_data = 0;
++		return 0;
++#endif
++
+ 	default:
+ 		return (ENOTTY);
+ 	}
