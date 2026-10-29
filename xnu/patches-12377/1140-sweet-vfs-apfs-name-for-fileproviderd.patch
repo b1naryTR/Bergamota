@@ -1,0 +1,64 @@
+Name the HFS+ root "apfs" to fileproviderd only, so FileProvider serves On My iPhone (Files, Safari downloads).
+FPVolumeFPFSSupported() (FileProvider.framework+0xa470c) rejects any f_fstypename but "apfs" (strcasecmp, "[INFO]
+Non-eligible device %s [%d]: non-apfs"); -[FPDVolume initWithStatFS:knownRole:volumeManager:] (FileProviderDaemon
++0x122828) calls it first, so no volume was created and the LocalStorage domain had none: fileproviderd asserted
+"FPDDomain must have a volume attached" (FPDDomain.m:218) on 2026-10-28, and since then starts no domain for
+com.apple.FileProvider.LocalStorage. Files > On My iPhone stays empty and Safari downloads hang at 100 % (WebKit waits
+for the placeholder it asked fileproviderd for). The other checks there are read-only, non-local, quarantined, and,
+only for role 3 (cmp w22, #3), a feature flag and APFSVolumeGetVEKState; the home volume is role 1.
+vfs_getfstypenameref_locked() (statfs/fstatfs/getfsstat, getattrlist ATTR_VOL_FSTYPENAME) now returns "apfs" for the
+MNT_ROOTFS hfs mount when the calling process is fileproviderd; everyone else, and the kernel's own comparisons
+against mnt_vfsstat.f_fstypename, still see hfs. boot-arg sweetapfs=0 turns it off.
+
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -11444,6 +11444,37 @@
+ 	return flags_ext;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 1140: the root is HFS+ (no APFS driver), but FileProvider only serves volumes it takes for APFS:
++ * FPVolumeFPFSSupported() (FileProvider.framework) rejects every f_fstypename but "apfs" ("Non-eligible device ...:
++ * non-apfs"). fileproviderd then never attached a volume to the On My iPhone domain ("FPDDomain must have a volume
++ * attached", FileProviderDaemon assert, 2026-10-28), Files showed nothing there and Safari downloads stayed at 100 %
++ * waiting for their placeholder. For fileproviderd only, the HFS+ root is named "apfs" (statfs, getfsstat and
++ * getattrlist all come through here); everything else still sees hfs. For its home volume (role 1) the name is the
++ * only APFS check: the encryption (APFSVolumeGetVEKState) and feature checks run for role 3 only. sweetapfs=0: off.
++ */
++static int sweet_apfs_name = -1;
++
++static bool
++sweet_fstypename_apfs(mount_t mp)
++{
++	char comm[MAXCOMLEN + 1];
++
++	if (sweet_apfs_name < 0) {
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetapfs", &v, sizeof(v));
++		sweet_apfs_name = v;
++	}
++	if (!sweet_apfs_name || !(mp->mnt_flag & MNT_ROOTFS) || strcmp(mp->mnt_vfsstat.f_fstypename, "hfs") != 0) {
++		return false;
++	}
++	comm[0] = '\0';
++	proc_selfname(comm, sizeof(comm));
++	return strcmp(comm, "fileproviderd") == 0;
++}
++#endif
++
+ char *
+ vfs_getfstypenameref_locked(mount_t mp, size_t *lenp)
+ {
+@@ -11451,6 +11482,10 @@
+ 
+ 	if (mp->mnt_kern_flag & MNTK_TYPENAME_OVERRIDE) {
+ 		name = mp->fstypename_override;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	} else if (sweet_fstypename_apfs(mp)) {
++		name = __DECONST(char *, "apfs");
++#endif
+ 	} else {
+ 		name = mp->mnt_vfsstat.f_fstypename;
+ 	}
