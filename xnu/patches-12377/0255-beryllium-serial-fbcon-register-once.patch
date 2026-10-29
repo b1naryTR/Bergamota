@@ -1,0 +1,25 @@
+Register the framebuffer serial console once.
+serial_init() runs again as long as it found no serial device (it returns without setting uart_initted), and the
+second register_serial_functions() of the sweet-fbcon table made gPESF a cycle (next = itself). uart_getc() then never
+returned: with boot-arg serial=3 the serial keyboard thread (serial_keyboard_poll, MAXPRI_KERNEL) spun in it from boot,
+one CPU (an A55 mostly) at 100 % system time, the A55 cluster held at its top clock by the governor (2026-10-29: kernel
+stackshot via sweetstackshot/kstack.py, uart_getc+0x20 <- _serial_getc <- serial_keyboard_poll).
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -872,6 +872,15 @@
+ 	uint32_t const *val;
+ 	unsigned int size;
+ 
++	/*
++	 * Once only (0255). serial_init() runs again as long as it found no serial device (it then returns without setting
++	 * uart_initted), and registering this table a second time made gPESF a cycle (next = itself): uart_getc() never
++	 * returned. With boot-arg serial=3 the serial keyboard thread (serial_keyboard_poll, MAXPRI_KERNEL) sat in it from
++	 * boot on, one CPU at 100 % system time (2026-10-29, kernel stackshot: uart_getc+0x20). fbcon_base is set only here.
++	 */
++	if (fbcon_base != NULL) {
++		return;
++	}
+ 	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
+ 	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
+ 		return;
