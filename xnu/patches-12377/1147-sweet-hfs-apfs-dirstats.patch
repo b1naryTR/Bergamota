@@ -1,0 +1,38 @@
+Answer FileProvider's APFS directory-statistics commands on HFS+ the way APFS answers for an item without them, so
+new files in On My iPhone can be tracked (Safari downloads). With 1145 the lookup of Safari's .download placeholder
+still failed with ENOTTY; 1146's tracer named it: LocalStorageFileProvider ffsctl cmd=0x80084a02 =
+_IOW('J', 2, uint64_t), FileProvider's fpfs_pkg_enable_dirstat(). fpfs_track_document() (fchflags UF_TRACKED, then
+this) fails on any error except EINVAL, APFS's answer for a file. FileProvider's package check (+0x17eb8) enables
+them on a package directory (EINVAL fatal there, other errors skip the package handling), then fpfs_pkg_promote()
+(xattr, Finder info) and fpfs_pkg_dirstat(); the document id lookup (+0xe7d5c) reads a directory's statistics with
+ffsctl(_IOWR('J', 32, 40 bytes)) (0xc0284a20, fpfs_get_dirstat()) and accepts ENOTSUP. FileProviderDaemon's volume
+code turns any error of either into a logged NSError, as with ENOTTY before. So: 'J' 2 is a no-op success on a
+directory and EINVAL on anything else, 'J' 32 is ENOTSUP.
+
+diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwrite.c
+--- a/bsd/sweet_hfs/core/hfs_readwrite.c
++++ b/bsd/sweet_hfs/core/hfs_readwrite.c
+@@ -3186,6 +3186,23 @@
+ 	case SWEET_APFSIOC_GET_PRISTINE_INFO:
+ 		bzero(ap->a_data, 2 * sizeof(uint64_t));
+ 		return 0;
++
++	/*
++	 * Directory statistics. fpfs_track_document() (every item FileProvider tracks) first enables them,
++	 * ffsctl(_IOW('J', 2, uint64_t)) (fpfs_pkg_enable_dirstat()), and fails on any error but EINVAL, which is what
++	 * APFS answers for a file; FileProvider's package check (+0x17eb8) enables them on a package directory and then
++	 * promotes it. The document id lookup after it (+0xe7d5c) reads a directory's statistics, ffsctl(_IOWR('J', 32,
++	 * 40 bytes)) (dirstat), and accepts ENOTSUP. HFS keeps none: enabling is a no-op on a directory and EINVAL on
++	 * anything else, reading them is ENOTSUP. Before, the ENOTTY failed the lookup of every new file in On My iPhone
++	 * ("can't obtain VFSItem ... [25: ...]" for Safari's .download placeholder).
++	 */
++#define SWEET_APFSIOC_ENABLE_DIRSTATS      _IOW('J', 2, uint64_t)
++#define SWEET_APFSIOC_DIRSTAT              _IOWR('J', 32, uint8_t[40])
++	case SWEET_APFSIOC_ENABLE_DIRSTATS:
++		return vnode_isdir(vp) ? 0 : EINVAL;
++
++	case SWEET_APFSIOC_DIRSTAT:
++		return ENOTSUP;
+ #endif
+ 
+ 	default:
