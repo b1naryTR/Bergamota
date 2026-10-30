@@ -1,0 +1,39 @@
+Answer the APFS queries FileProvider makes for regular files with "none" on HFS+, as 1142 did for folders: with 1142
+the On My iPhone root resolved and DocumentManager found Downloads, but Safari's .download placeholder still failed
+to arrive there. A failed-syscall trace (sweetsyserr=LocalStorageFileProvider,fileproviderd) showed an ffsctl
+ENOTTY in LocalStorageFileProvider, which logged "can't obtain VFSItem for .../File Provider Storage/Downloads/
+X.download [25: Inappropriate ioctl for device]"; fileproviderd: "move-writer: resolving item at URL ... failed"
+(Cocoa 256), DocumentManager's FPMoveOperation reverted and Safari waited at 100%. FileProviderDaemon+0x1c373c reads
+the item's purgeable info, ffsctl(fd, _IOR('J', 109, 48 bytes)) (0x40304a6d), and fails the item on any error;
+fpfs_get_purgeable_info() reads the same (flags at 0, a value at 0x20). The pristine info, _IOR('J', 123, 16 bytes)
+(0x40104a7b), is read by fpfs_t_fget_is_pristine()/fpfs_t_fget_pristine_time() and fpfs_get_purgeable_flags().
+Nothing on HFS is purgeable or pristine: both are answered with zeros.
+
+diff --git a/bsd/sweet_hfs/core/hfs_readwrite.c b/bsd/sweet_hfs/core/hfs_readwrite.c
+--- a/bsd/sweet_hfs/core/hfs_readwrite.c
++++ b/bsd/sweet_hfs/core/hfs_readwrite.c
+@@ -3168,6 +3168,24 @@
+ 	case SWEET_APFSIOC_GET_SYNC_ROOT_FLAG:
+ 		*(uint32_t *)ap->a_data = 0;
+ 		return 0;
++
++	/*
++	 * The same lookup for a regular file: FileProviderDaemon (+0x1c373c) reads the per-item purgeable info (48
++	 * bytes: flags at 0, a time in ns at 0x10, counts at 0x18 and 0x20, also fpfs_get_purgeable_info()) and fails
++	 * the item on an error, so every file in On My iPhone was "can't obtain VFSItem ... [25: Inappropriate ioctl
++	 * for device]" and Safari's .download placeholder could not be moved into Downloads (FPMoveOperation, Cocoa 256).
++	 * The pristine info (16 bytes, fpfs_t_fget_is_pristine(), fpfs_get_purgeable_flags()) is asked for the same
++	 * files. Nothing on HFS is purgeable or pristine: all zero.
++	 */
++#define SWEET_APFSIOC_GET_PURGEABLE_INFO   _IOR('J', 109, uint64_t[6])
++#define SWEET_APFSIOC_GET_PRISTINE_INFO    _IOR('J', 123, uint64_t[2])
++	case SWEET_APFSIOC_GET_PURGEABLE_INFO:
++		bzero(ap->a_data, 6 * sizeof(uint64_t));
++		return 0;
++
++	case SWEET_APFSIOC_GET_PRISTINE_INFO:
++		bzero(ap->a_data, 2 * sizeof(uint64_t));
++		return 0;
+ #endif
+ 
+ 	default:
