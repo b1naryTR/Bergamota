@@ -1,0 +1,51 @@
+Let HFS+ grow an unjournaled volume (HFSIOC_RESIZE_VOLUME, hfs_extendfs()). The iOS 18/26 root images are unjournaled
+24 GiB volumes (newfs_hfs -s) on the 115799 MiB userdata partition; on 2026-10-30 the phone was down to 330 MB free.
+hfs_extendfs() returned EPERM without a journal, and a journal cannot be added afterwards: HFS_ENABLE_JOURNALING
+refused with "volume has a btree w/non-contiguous nodes" (an unjournaled volume grows its B-trees in extents that
+split nodes). The resize path needs the journal for one thing only, clearing the old alternate volume header, which
+now gets a plain buf_bwrite() when there is no journal; hfs_extend_journal() already returns early (jvp is NULL).
+tools/sweetnet/sweetgrowfs then grows / to the partition minus its last GiB (sweet_ufs.c's log ring and self-test
+area). A crash during the resize (a few seconds) can leave work for fsck_hfs, as any unjournaled metadata update.
+
+diff --git a/bsd/sweet_hfs/core/hfs_resize.c b/bsd/sweet_hfs/core/hfs_resize.c
+--- a/bsd/sweet_hfs/core/hfs_resize.c
++++ b/bsd/sweet_hfs/core/hfs_resize.c
+@@ -85,9 +85,17 @@
+ 	 * - HFS Plus file systems only.
+ 	 * - Journaling must be enabled.
+ 	 * - No embedded volumes.
++	 *
++	 * Sweet: unjournaled volumes may grow too. The iOS 18/26 root images are unjournaled 24 GiB volumes on a
++	 * 115799 MiB userdata partition, and a journal cannot be added afterwards (HFS_ENABLE_JOURNALING wants
++	 * contiguous B-tree nodes, which an unjournaled volume does not keep: "volume has a btree w/non-contiguous
++	 * nodes"). The only journal use on this path is clearing the old alternate volume header (below);
++	 * hfs_extend_journal() returns early without one (jvp is NULL, not the device).
+ 	 */
+ 	if ((vcb->vcbSigWord == kHFSSigWord) ||
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+         (hfsmp->jnl == NULL) ||
++#endif
+         (vcb->hfsPlusIOPosOffset != 0)) {
+ 		return (EPERM);
+ 	}
+@@ -416,11 +424,20 @@
+ 		if (buf_meta_bread(hfsmp->hfs_devvp,
+                            HFS_PHYSBLK_ROUNDDOWN(prev_fs_alt_sector, hfsmp->hfs_log_per_phys),
+                            hfsmp->hfs_physical_block_size, NOCRED, &bp) == 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			if (hfsmp->jnl == NULL) {	/* unjournaled (see the check above): a plain write */
++				bzero((char *)buf_dataptr(bp) + HFS_ALT_OFFSET(hfsmp->hfs_physical_block_size), kMDBSize);
++				(void) buf_bwrite(bp);
++			} else {
++#endif
+ 			journal_modify_block_start(hfsmp->jnl, bp);
+             
+ 			bzero((char *)buf_dataptr(bp) + HFS_ALT_OFFSET(hfsmp->hfs_physical_block_size), kMDBSize);
+             
+ 			journal_modify_block_end(hfsmp->jnl, bp, NULL, NULL);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			}
++#endif
+ 		} else if (bp) {
+ 			buf_brelse(bp);
+ 		}
