@@ -1,0 +1,707 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 50d510d..33a94c0 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -75,6 +75,7 @@ extern void sweet_reboot_init(void);
+ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
+ extern void sweet80211_init(void);
++extern void sweet_venus_init(void);   /* bsd/dev/sweet_venus.c */
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+ extern void sweet_charger_start(void);
+@@ -1164,6 +1165,7 @@ sweet_ufs_init(void)
+ 	sweet_a630_probe();	/* sweetgpu=N, beryllium only, off by default */
+ 	beryllium_wlan_init();      /* boot-arg sweetwlan=N, off by default */
+ 	sweet80211_init();          /* boot-arg sweet80211=N (iOS 26 Wi-Fi stand-in), off by default */
++	sweet_venus_init();         /* Venus video codec: IOKit service at boot, hardware on first use; sweetvenus=0 off */
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+index 67f4d01..2e90484 100644
+--- a/bsd/dev/sweet_venus.c
++++ b/bsd/dev/sweet_venus.c
+@@ -37,6 +37,8 @@
+ #include <sys/proc.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -141,7 +143,7 @@ extern uint32_t sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uin
+ #define HFI_PROP_MAX_SESSIONS           0x1010u
+ #define HFI_ARCH_OX                     0x1u
+ #define HFI_DEBUG_MODE_QUEUE            0x1u
+-#define HFI_DEBUG_LEVELS                0x1eu           /* MEDIUM HIGH ERROR FATAL (not LOW) */
++#define HFI_DEBUG_LEVELS                0x18u           /* ERROR FATAL (0x1e for MEDIUM and HIGH while bringing up) */
+ #define HFI_EVENT_SYS_ERROR             0x1u
+ 
+ /* ---- SCM (qcom_scm.h) ---- */
+@@ -169,7 +171,6 @@ struct vn_qhdr {
+ };
+ 
+ static struct {
+-	volatile uint32_t busy;
+ 	vm_offset_t venus, vcc, gcc;
+ 	struct sweet_smmu_pt *pt;
+ 	struct vn_buf uc, sfr;
+@@ -182,6 +183,8 @@ static struct {
+ 	char where[48];
+ } vn;
+ 
++static LCK_GRP_DECLARE(vn_lck_grp, "sweet_venus");
++static LCK_MTX_DECLARE(vn_mtx, &vn_lck_grp);
+ static uint32_t vn_pktw[PKT_MAX / 4];
+ #define vn_pkt ((uint8_t *)vn_pktw)
+ 
+@@ -1242,7 +1245,8 @@ vn_hfi_up(void)
+ #define VS_DPB_MAX      20u
+ #define VS_INT_MAX      16u
+ #define VS_DONE_Q       32u
+-#define VS_MAX          2u
++#define VS_MAX          4u
++#define VS_NO_BUFFER    0xffffffffu     /* SWEET_VENUS_NO_BUFFER */
+ 
+ enum { VS_CLOSED, VS_INIT, VS_DECODING, VS_DEAD };
+ 
+@@ -1437,7 +1441,13 @@ vn_sess_msg(const uint32_t *w, uint32_t size, uint32_t type)
+ 		}
+ 		if (filled == 0) {
+ 			s->fbd_empty++;
+-			s->out_state[tag] = 0;
++			s->out_state[tag] = 0;          /* back to the firmware at the next vs_take */
++			unsigned nx = (s->done_tail + 1) % VS_DONE_Q;
++			if ((flags & HFI_BUFFERFLAG_EOS) && nx != s->done_head) {
++				/* the end of the stream, for the client: a picture without a buffer */
++				s->done[s->done_tail] = (struct vs_done){ VS_NO_BUFFER, flags, 0, 0, 0, w[6], w[7], 0 };
++				s->done_tail = nx;
++			}
+ 			return true;
+ 		}
+ 		unsigned next = (s->done_tail + 1) % VS_DONE_Q;
+@@ -1940,7 +1950,8 @@ vs_service(struct vn_sess *s)
+ 
+ /* Queue one access unit (or, with len 0, end of stream); the first one waits for the stream's description. */
+ static int
+-vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool eos)
++vs_decode_fill(struct vn_sess *s, int (*fill)(void *ctx, void *dst, uint32_t len), void *ctx, uint32_t len, uint64_t ts,
++    bool eos)
+ {
+ 	if (s->state != VS_INIT && s->state != VS_DECODING) {
+ 		return ENXIO;
+@@ -1973,7 +1984,10 @@ vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool e
+ 		return ETIMEDOUT;
+ 	}
+ 	if (len) {
+-		memcpy((void *)s->in[idx].kva, data, len);
++		e = fill(ctx, (void *)s->in[idx].kva, len);
++		if (e) {
++			return e;
++		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+ 	e = vs_etb(s, idx, len, eos ? HFI_BUFFERFLAG_EOS : 0, ts);
+@@ -1984,19 +1998,39 @@ vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool e
+ 	return vs_service(s);
+ }
+ 
++static int
++vs_fill_memcpy(void *ctx, void *dst, uint32_t len)
++{
++	memcpy(dst, ctx, len);
++	return 0;
++}
++
++static int
++vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool eos)
++{
++	return vs_decode_fill(s, vs_fill_memcpy, __DECONST(void *, data), len, ts, eos);
++}
++
+ /* The next decoded picture, or false. The output buffer stays the caller's until vs_release(). */
+ static bool
+ vs_take(struct vn_sess *s, struct vs_done *d)
+ {
+ 	(void)vs_service(s);
+ 	vs_requeue_dpb(s);
++	for (unsigned i = 0; s->state == VS_DECODING && i < s->nout; i++) {
++		if (s->out_state[i] == 0 && vs_ftb(s, 1, i, &s->out[i], s->opb_size) == 0) {
++			s->out_state[i] = 1;    /* empty pictures (the EOS one) go straight back */
++		}
++	}
+ 	if (s->done_head == s->done_tail) {
+ 		return false;
+ 	}
+ 	*d = s->done[s->done_head];
+ 	s->done_head = (s->done_head + 1) % VS_DONE_Q;
+-	vn_buf_sync(&s->out[d->index], s->opb_size);
+-	vn_frames_total++;
++	if (d->index != VS_NO_BUFFER) {
++		vn_buf_sync(&s->out[d->index], s->opb_size);
++		vn_frames_total++;
++	}
+ 	return true;
+ }
+ 
+@@ -2124,6 +2158,10 @@ vt_drain(struct vn_sess *s)
+ {
+ 	struct vs_done d;
+ 	while (vs_take(s, &d)) {
++		if (d.index == VS_NO_BUFFER) {
++			printf("SWEET VENUS: end of stream (flags %#x)\n", d.flags);
++			continue;
++		}
+ 		char hex[33];
+ 		vt_md5_frame(s, &d, hex);
+ 		printf("SWEET VENUS: frame %u ts %u type %#x %ux%u flags %#x md5 %s\n", vt_frames, d.ts_lo / 33333, d.picture_type,
+@@ -2196,6 +2234,148 @@ vn_test_decode(void)
+ 	return e;
+ }
+ 
++
++/* ------------------------------------------------------------------ */
++/* milestone 3 (patch 1153): entry points for iokit/Kernel/arm/SweetVenus.cpp, all under vn_mtx         */
++/* ------------------------------------------------------------------ */
++
++
++/* keep in sync with iokit/Kernel/arm/SweetVenusABI.h */
++struct sweet_venus_frame {
++	uint32_t index, flags;
++	uint64_t ts;
++	uint32_t width, height, crop_left, crop_top, crop_width, crop_height, ystride, yscan, filled, size;
++};
++
++static void vn_bring_up(void);
++void sweet_venus_lock(void);
++void sweet_venus_unlock(void);
++int sweet_venus_up(void);
++int sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, void **sess);
++int sweet_venus_decode(void *sess, int (*fill)(void *ctx, void *dst, uint32_t len), void *ctx, uint32_t len, uint64_t ts,
++    uint32_t flags);
++int sweet_venus_take(void *sess, struct sweet_venus_frame *f);
++int sweet_venus_release(void *sess, uint32_t index);
++int sweet_venus_output(void *sess, uint32_t index, vm_offset_t *kva, uint32_t *size);
++void sweet_venus_close(void *sess);
++void sweet_venus_init(void);
++extern void SweetVenusPublish(void);            /* iokit/Kernel/arm/SweetVenus.cpp */
++
++void
++sweet_venus_lock(void)
++{
++	lck_mtx_lock(&vn_mtx);
++}
++
++void
++sweet_venus_unlock(void)
++{
++	lck_mtx_unlock(&vn_mtx);
++}
++
++/* Bring-up on first use; 0 once the firmware answers. */
++int
++sweet_venus_up(void)
++{
++	if (vn.step == 0) {
++		vn_bring_up();
++	}
++	return vn.step >= 4 ? 0 : (vn.error ? vn.error : EIO);
++}
++
++int
++sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, void **sess)
++{
++	uint32_t codec;
++	switch (fourcc) {
++	case 0x61766331u:               /* 'avc1' */
++		codec = HFI_CODEC_H264;
++		break;
++	default:
++		return EINVAL;
++	}
++	if (width < 96 || height < 96 || width > 4096 || height > 4096) {
++		return EINVAL;          /* hfi_platform_v4.c: 96..4096 each way */
++	}
++	struct vn_sess *s = NULL;
++	int e = vs_open(&s, codec, width, height);
++	if (!e) {
++		*sess = s;
++	}
++	return e;
++}
++
++int
++sweet_venus_decode(void *sess, int (*fill)(void *ctx, void *dst, uint32_t len), void *ctx, uint32_t len, uint64_t ts,
++    uint32_t flags)
++{
++	struct vn_sess *s = sess;
++	bool eos = (flags & 1u) != 0;
++	return vs_decode_fill(s, fill, ctx, eos ? 0 : len, ts, eos);
++}
++
++int
++sweet_venus_take(void *sess, struct sweet_venus_frame *f)
++{
++	struct vn_sess *s = sess;
++	struct vs_done d;
++	vn_poll(0, NULL, NULL);
++	if (!vs_take(s, &d)) {
++		return s->state == VS_DEAD || s->error_seen ? EIO : EAGAIN;
++	}
++	*f = (struct sweet_venus_frame){ d.index, d.flags, (uint64_t)d.ts_hi << 32 | d.ts_lo, s->width, s->height, s->crop_left,
++		                         s->crop_top, s->crop_width, s->crop_height, s->ystride, s->yscan, d.filled, s->opb_size };
++	return 0;
++}
++
++int
++sweet_venus_release(void *sess, uint32_t index)
++{
++	return index == VS_NO_BUFFER ? 0 : vs_release(sess, index);
++}
++
++int
++sweet_venus_output(void *sess, uint32_t index, vm_offset_t *kva, uint32_t *size)
++{
++	struct vn_sess *s = sess;
++	if (index >= s->nout || !s->out[index].kva) {
++		return EINVAL;
++	}
++	*kva = s->out[index].kva;
++	*size = (uint32_t)s->out[index].size;
++	return 0;
++}
++
++void
++sweet_venus_close(void *sess)
++{
++	vs_close(sess);
++}
++
++/* The IOKit service goes up once IOKit runs; the hardware waits for the first client (sweetvenus=0: nothing). */
++static void
++vn_publish_thread(void *arg, wait_result_t wr)
++{
++#pragma unused(arg, wr)
++	delay(15 * 1000 * 1000);
++	SweetVenusPublish();
++	thread_terminate(current_thread());
++}
++
++void
++sweet_venus_init(void)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetvenus", &on, sizeof(on));
++	if (!on || !sweet_board_beryllium()) {
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(vn_publish_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
+ /* ------------------------------------------------------------------ */
+ /* control                                                             */
+ /* ------------------------------------------------------------------ */
+@@ -2253,9 +2433,7 @@ sweet_venus_ctl_sysctl SYSCTL_HANDLER_ARGS
+ 	if (error || !req->newptr) {
+ 		return error;
+ 	}
+-	if (__atomic_exchange_n(&vn.busy, 1, __ATOMIC_ACQUIRE)) {
+-		return EBUSY;
+-	}
++	lck_mtx_lock(&vn_mtx);
+ 	switch (value) {
+ 	case 1:
+ 		vn_bring_up();
+@@ -2282,7 +2460,7 @@ sweet_venus_ctl_sysctl SYSCTL_HANDLER_ARGS
+ 		error = EINVAL;
+ 		break;
+ 	}
+-	__atomic_store_n(&vn.busy, 0, __ATOMIC_RELEASE);
++	lck_mtx_unlock(&vn_mtx);
+ 	return error;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetVenus.cpp b/iokit/Kernel/arm/SweetVenus.cpp
+new file mode 100644
+index 0000000..4461247
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetVenus.cpp
+@@ -0,0 +1,309 @@
++/*
++ * SweetVenus: IOKit service and user client for the Venus video codec of the Poco F1 (bsd/dev/sweet_venus.c).
++ *
++ * Published at boot by sweet_venus_init()'s thread (beryllium only); the hardware is not touched until the
++ * first client opens a session (the C side then powers Venus and boots its firmware once). The user client
++ * class is AppleAVDUserClient, a name videocodecd's com.apple.security.exception.iokit-user-client-class
++ * list admits (AppleAVD itself does not exist here), so the VideoToolbox decoder plug-in can run there.
++ *
++ * Selectors (SweetVenusABI.h): OPEN a decoder session, DECODE one access unit (Annex-B bytes as the struct
++ * input, inline or out of line), TAKE the next decoded picture (waits up to a timeout), RELEASE a picture's
++ * buffer back to the decoder, CLOSE. Decoded pictures stay in the session's output buffers (linear NV12,
++ * Venus layout); clientMemoryForType(SWEET_VENUS_MEM_OUTPUT + i) maps buffer i read-only into the client.
++ * One mutex in the C side serializes everything; waits release it between polls.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++
++#include "SweetVenusABI.h"
++
++extern "C" {
++/* bsd/dev/sweet_venus.c; every call but lock/unlock with sweet_venus_lock() held */
++void sweet_venus_lock(void);
++void sweet_venus_unlock(void);
++int sweet_venus_up(void);
++int sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, void **sess);
++int sweet_venus_decode(void *sess, int (*fill)(void *ctx, void *dst, uint32_t len), void *ctx, uint32_t len, uint64_t ts,
++    uint32_t flags);
++int sweet_venus_take(void *sess, struct sweet_venus_frame *f);
++int sweet_venus_release(void *sess, uint32_t index);
++int sweet_venus_output(void *sess, uint32_t index, vm_offset_t *kva, uint32_t *size);
++void sweet_venus_close(void *sess);
++void SweetVenusPublish(void);
++}
++
++class SweetVenus : public IOService {
++	OSDeclareDefaultStructors(SweetVenus);
++};
++
++OSDefineMetaClassAndStructors(SweetVenus, IOService);
++
++class SweetVenusUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetVenusUserClient);
++
++	void   *fSess;
++	int32_t fPid;
++	bool    fClosed;
++
++	IOReturn take(IOExternalMethodArguments *args);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetVenusUserClient, IOUserClient);
++
++/* The class name videocodecd's entitlement list admits (com.apple.security.exception.iokit-user-client-class). */
++class AppleAVDUserClient : public SweetVenusUserClient {
++	OSDeclareDefaultStructors(AppleAVDUserClient);
++};
++
++OSDefineMetaClassAndStructors(AppleAVDUserClient, SweetVenusUserClient);
++
++extern "C" void
++SweetVenusPublish(void)
++{
++	SweetVenus *svc = OSTypeAlloc(SweetVenus);
++	if (svc != NULL && svc->init()) {
++		svc->setName(SWEET_VENUS_SERVICE_NAME);
++		svc->setProperty(kIOUserClientClassKey, "AppleAVDUserClient");
++		svc->setProperty("SweetVenusABIVersion", (uint64_t)SWEET_VENUS_ABI_VERSION, 32);
++		IOService *platform = IOService::getPlatform();
++		if (platform != NULL && svc->attach(platform)) {
++			svc->registerService();
++			IOLog("SWEET VENUS: %s published (user client class AppleAVDUserClient)\n", SWEET_VENUS_SERVICE_NAME);
++		} else {
++			IOLog("SWEET VENUS: cannot attach %s to the platform\n", SWEET_VENUS_SERVICE_NAME);
++		}
++	}
++	OSSafeReleaseNULL(svc);
++}
++
++/* ------------------------------------------------------------------ */
++
++bool
++SweetVenusUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fSess = NULL;
++	fClosed = false;
++	fPid = proc_selfpid();
++	return true;
++}
++
++IOReturn
++SweetVenusUserClient::clientClose(void)
++{
++	sweet_venus_lock();
++	if (!fClosed) {
++		fClosed = true;
++		if (fSess != NULL) {
++			sweet_venus_close(fSess);
++			fSess = NULL;
++		}
++	}
++	sweet_venus_unlock();
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetVenusUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOReturn ret = kIOReturnBadArgument;
++	vm_offset_t kva = 0;
++	uint32_t size = 0;
++
++	if (type < SWEET_VENUS_MEM_OUTPUT || type >= SWEET_VENUS_MEM_OUTPUT + SWEET_VENUS_OUTPUTS_MAX) {
++		return kIOReturnBadArgument;
++	}
++	sweet_venus_lock();
++	if (fSess != NULL && sweet_venus_output(fSess, type - SWEET_VENUS_MEM_OUTPUT, &kva, &size) == 0) {
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)kva, size, kIODirectionOut,
++		    kernel_task);
++		if (md != NULL) {
++			*memory = md;           /* the reference goes to the caller */
++			*options = kIOMapReadOnly;
++			ret = kIOReturnSuccess;
++		} else {
++			ret = kIOReturnNoMemory;
++		}
++	}
++	sweet_venus_unlock();
++	return ret;
++}
++
++static IOReturn
++venus_ret(int error)
++{
++	switch (error) {
++	case 0:
++		return kIOReturnSuccess;
++	case EAGAIN:
++		return kIOReturnNotReady;
++	case ETIMEDOUT:
++		return kIOReturnTimeout;
++	case ENOMEM:
++		return kIOReturnNoMemory;
++	case EBUSY:
++		return kIOReturnBusy;
++	case EINVAL:
++	case E2BIG:
++		return kIOReturnBadArgument;
++	case ENXIO:
++		return kIOReturnNotAttached;
++	default:
++		return kIOReturnIOError;
++	}
++}
++
++/* DECODE's fill callbacks: the access unit is the struct input, inline (<= 4 KiB) or a client memory descriptor. */
++struct venus_fill_ctx {
++	const void         *inl;
++	IOMemoryDescriptor *md;
++};
++
++static int
++venus_fill(void *ctx, void *dst, uint32_t len)
++{
++	struct venus_fill_ctx *c = (struct venus_fill_ctx *)ctx;
++	if (c->inl != NULL) {
++		memcpy(dst, c->inl, len);
++		return 0;
++	}
++	return c->md->readBytes(0, dst, len) == len ? 0 : EIO;
++}
++
++IOReturn
++SweetVenusUserClient::take(IOExternalMethodArguments *args)
++{
++	uint64_t timeout_ms = args->scalarInputCount >= 1 ? args->scalarInput[0] : 0;
++	struct sweet_venus_frame f;
++	int e = EAGAIN;
++
++	if (args->scalarOutputCount < SWEET_VENUS_FRAME_SCALARS) {
++		return kIOReturnBadArgument;
++	}
++	timeout_ms = timeout_ms > 2000 ? 2000 : timeout_ms;
++	for (uint64_t waited = 0;; waited++) {
++		sweet_venus_lock();
++		e = fSess != NULL ? sweet_venus_take(fSess, &f) : ENXIO;
++		sweet_venus_unlock();
++		if (e != EAGAIN || waited >= timeout_ms) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (e) {
++		return venus_ret(e);
++	}
++	uint64_t *o = args->scalarOutput;
++	o[0] = f.index;
++	o[1] = f.flags;
++	o[2] = f.ts;
++	o[3] = f.width;
++	o[4] = f.height;
++	o[5] = f.crop_left;
++	o[6] = f.crop_top;
++	o[7] = f.crop_width;
++	o[8] = f.crop_height;
++	o[9] = f.ystride;
++	o[10] = f.yscan;
++	o[11] = f.filled;
++	o[12] = f.size;
++	args->scalarOutputCount = SWEET_VENUS_FRAME_SCALARS;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetVenusUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	IOReturn ret = kIOReturnSuccess;
++	int e;
++
++	if (fClosed) {
++		return kIOReturnNotOpen;
++	}
++	switch (selector) {
++	case SWEET_VENUS_SEL_OPEN:
++		if (args->scalarInputCount < 3) {
++			return kIOReturnBadArgument;
++		}
++		sweet_venus_lock();
++		if (fSess != NULL) {
++			e = EBUSY;
++		} else {
++			e = sweet_venus_up();
++			if (!e) {
++				e = sweet_venus_open((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
++				    (uint32_t)args->scalarInput[2], &fSess);
++			}
++		}
++		sweet_venus_unlock();
++		ret = venus_ret(e);
++		break;
++	case SWEET_VENUS_SEL_DECODE: {
++		/* scalars: timestamp, flags; struct input: the access unit (none with SWEET_VENUS_FLAG_EOS) */
++		if (args->scalarInputCount < 2 || args->structureOutputDescriptor != NULL) {
++			return kIOReturnBadArgument;
++		}
++		struct venus_fill_ctx c = { args->structureInput, args->structureInputDescriptor };
++		uint32_t len = c.md != NULL ? (uint32_t)c.md->getLength() : args->structureInputSize;
++		if (c.md != NULL && c.md->prepare() != kIOReturnSuccess) {
++			return kIOReturnVMError;
++		}
++		sweet_venus_lock();
++		e = fSess != NULL ? sweet_venus_decode(fSess, venus_fill, &c, len, args->scalarInput[0],
++		    (uint32_t)args->scalarInput[1]) : ENXIO;
++		sweet_venus_unlock();
++		if (c.md != NULL) {
++			c.md->complete();
++		}
++		ret = venus_ret(e);
++		break;
++	}
++	case SWEET_VENUS_SEL_TAKE:
++		ret = take(args);
++		break;
++	case SWEET_VENUS_SEL_RELEASE:
++		if (args->scalarInputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		sweet_venus_lock();
++		e = fSess != NULL ? sweet_venus_release(fSess, (uint32_t)args->scalarInput[0]) : ENXIO;
++		sweet_venus_unlock();
++		ret = venus_ret(e);
++		break;
++	case SWEET_VENUS_SEL_CLOSE:
++		sweet_venus_lock();
++		if (fSess != NULL) {
++			sweet_venus_close(fSess);
++			fSess = NULL;
++		}
++		sweet_venus_unlock();
++		break;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	return ret;
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetVenusABI.h b/iokit/Kernel/arm/SweetVenusABI.h
+new file mode 100644
+index 0000000..65b59c7
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetVenusABI.h
+@@ -0,0 +1,46 @@
++/*
++ * SweetVenus user-client ABI (iokit/Kernel/arm/SweetVenus.cpp, bsd/dev/sweet_venus.c), shared with the
++ * VideoToolbox decoder plug-in (apps/venus-vt). Version 1.
++ *
++ *   OPEN     scalars in: codec FourCC ('avc1'), coded width, height. Powers Venus on first use.
++ *   DECODE   scalars in: timestamp (returned with the picture), flags (SWEET_VENUS_FLAG_EOS: end of stream,
++ *            no data); struct input: one access unit in Annex-B form (start codes), inline or out of line.
++ *   TAKE     scalar in: timeout in ms (at most 2000). 13 scalars out, in sweet_venus_frame order below;
++ *            kIOReturnNotReady when nothing was decoded in time. index SWEET_VENUS_NO_BUFFER: an empty
++ *            picture (the end-of-stream marker, flags has SWEET_VENUS_FLAG_EOS).
++ *   RELEASE  scalar in: output index; the buffer goes back to the decoder.
++ *   CLOSE    ends the session (clientClose does too).
++ *
++ * clientMemoryForType(SWEET_VENUS_MEM_OUTPUT + index): output buffer index, read-only, NV12 in Venus's layout:
++ * luma rows of ystride bytes, yscan rows, then interleaved CbCr rows of ystride bytes.
++ */
++#ifndef SWEET_VENUS_ABI_H
++#define SWEET_VENUS_ABI_H
++
++#include <stdint.h>
++
++#define SWEET_VENUS_SERVICE_NAME        "SweetVenus"
++#define SWEET_VENUS_ABI_VERSION         1
++
++enum {
++	SWEET_VENUS_SEL_OPEN = 0,
++	SWEET_VENUS_SEL_DECODE = 1,
++	SWEET_VENUS_SEL_TAKE = 2,
++	SWEET_VENUS_SEL_RELEASE = 3,
++	SWEET_VENUS_SEL_CLOSE = 4,
++};
++
++#define SWEET_VENUS_FLAG_EOS            0x1u
++#define SWEET_VENUS_MEM_OUTPUT          0x100u
++#define SWEET_VENUS_OUTPUTS_MAX         32u
++#define SWEET_VENUS_FRAME_SCALARS       13u
++#define SWEET_VENUS_NO_BUFFER           0xffffffffu
++
++/* TAKE's scalar outputs, in this order (o[0] index ... o[12] size); ts is o[2] */
++struct sweet_venus_frame {
++	uint32_t index, flags;
++	uint64_t ts;
++	uint32_t width, height, crop_left, crop_top, crop_width, crop_height, ystride, yscan, filled, size;
++};
++
++#endif /* SWEET_VENUS_ABI_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 31cb0ef..3420454 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
++iokit/Kernel/arm/SweetVenus.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetNetwork.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
