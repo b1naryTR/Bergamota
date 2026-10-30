@@ -1,0 +1,286 @@
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+index 4e1cf44..006ace7 100644
+--- a/bsd/dev/sweet_venus.c
++++ b/bsd/dev/sweet_venus.c
+@@ -1231,9 +1231,16 @@ vn_hfi_up(void)
+ #define HFI_BUF_SCRATCH_2       8u
+ #define HFI_FMT_NV12            0x2u
+ #define HFI_FMT_NV12_UBWC       0x8002u
++#define HFI_FMT_P010            0x4003u         /* 10-bit, MSB-aligned 16-bit samples */
++#define HFI_FMT_TP10_UBWC       0xc002u
++#define VIDC_BITDEPTH_10        0x20002u
+ #define HFI_DOMAIN_DECODER      2u
+ #define HFI_CODEC_H264          0x2u
+ #define HFI_CODEC_VP9           0x4000u
++#define HFI_CODEC_MPEG1         0x8u
++#define HFI_CODEC_MPEG2         0x10u
++#define HFI_CODEC_VP8           0x1000u
++#define HFI_CODEC_HEVC          0x2000u
+ #define HFI_EVENT_SESSION_ERROR         0x2u
+ #define HFI_EVENT_SEQ_CHANGED           0x1000003u
+ #define HFI_EVENT_SEQ_SUFFICIENT        0x1000001u
+@@ -1262,6 +1269,8 @@ struct vn_sess {
+ 	uint32_t crop_left, crop_top, crop_width, crop_height;
+ 	uint32_t fw_min_cnt, seq_kind, seq_events;
+ 	uint32_t opb_size, dpb_size, ystride, yscan, uvscan, in_size, nin;
++	uint32_t bit_depth, pic_struct;     /* from SEQUENCE_CHANGED: VIDC_BITDEPTH_10 or 8-bit; 1 = progressive only */
++	uint32_t opb_fmt;                   /* HFI_FMT_NV12 or HFI_FMT_P010 */
+ 	uint32_t wait_type, wait_error;
+ 	bool wait_done, bufreq_valid, eos_seen, error_seen;
+ 	uint32_t bufreq[12][8];
+@@ -1314,6 +1323,25 @@ vs_nv12_ubwc_size(uint32_t w, uint32_t h)
+ 	return vs_align(y_meta + y + uv_meta + uv + extra, 0x1000);
+ }
+ 
++/* get_framesize_raw_p010 */
++static uint32_t
++vs_p010_size(uint32_t w, uint32_t h)
++{
++	uint32_t stride = vs_align(w * 2, 128);
++	return vs_align(stride * vs_align(h, 32) + stride * vs_align((h + 1) / 2, 16), 0x1000);
++}
++
++/* get_framesize_raw_yuv420_tp10_ubwc */
++static uint32_t
++vs_tp10_ubwc_size(uint32_t w, uint32_t h)
++{
++	uint32_t stride = vs_align(w * 4 / 3, 256);
++	uint32_t y = vs_align(stride * vs_align(h, 16), 0x1000), uv = vs_align(stride * vs_align((h + 1) / 2, 16), 0x1000);
++	uint32_t y_meta = vs_align(vs_align((w + 47) / 48, 64) * vs_align((h + 3) / 4, 16), 0x1000);
++	uint32_t uv_meta = vs_align(vs_align(((w + 1) / 2 + 23) / 24, 64) * vs_align(((h + 1) / 2 + 3) / 4, 16), 0x1000);
++	return vs_align(y + uv + y_meta + uv_meta + MAX(0x4000u + 0x2000u, stride * 48), 0x1000);
++}
++
+ static struct vn_sess *
+ vs_by_id(uint32_t sid)
+ {
+@@ -1344,10 +1372,20 @@ vs_seq_changed(struct vn_sess *s, const uint32_t *w, uint32_t size)
+ 			o += 3;
+ 			break;
+ 		case HFI_PROP_PROFILE_LEVEL_CURRENT:    /* profile, level */
++			o += 2;
++			break;
+ 		case HFI_PROP_VDEC_PIXEL_BITDEPTH:      /* buffer_type, bit_depth */
++			if (o + 2 <= end) {
++				s->bit_depth = w[o + 1];
++			}
+ 			o += 2;
+ 			break;
+-		case HFI_PROP_VDEC_PIC_STRUCT:
++		case HFI_PROP_VDEC_PIC_STRUCT:          /* progressive_only */
++			if (o + 1 <= end) {
++				s->pic_struct = w[o];
++			}
++			o += 1;
++			break;
+ 		case HFI_PROP_VDEC_COLOUR_SPACE:
+ 		case HFI_PROP_VDEC_ENTROPY:
+ 		case 0x100300bu:                        /* ENABLE_SUFFICIENT_SEQCHANGE_EVENT */
+@@ -1385,9 +1423,10 @@ vs_seq_changed(struct vn_sess *s, const uint32_t *w, uint32_t size)
+ 		s->crop_width = s->width;
+ 		s->crop_height = s->height;
+ 	}
+-	printf("SWEET VENUS: session %#x: sequence %s: %ux%u, crop %u,%u %ux%u, min buffers %u\n", s->sid,
++	printf("SWEET VENUS: session %#x: sequence %s: %ux%u, crop %u,%u %ux%u, min buffers %u, %s, %s\n", s->sid,
+ 	    s->seq_kind == HFI_EVENT_SEQ_SUFFICIENT ? "fits" : "needs more", s->width, s->height, s->crop_left, s->crop_top,
+-	    s->crop_width, s->crop_height, s->fw_min_cnt);
++	    s->crop_width, s->crop_height, s->fw_min_cnt, s->bit_depth == VIDC_BITDEPTH_10 ? "10-bit" : "8-bit",
++	    s->pic_struct == 1 ? "progressive" : "interlaced");
+ }
+ 
+ /* Session messages; false when the message is not one. */
+@@ -1583,25 +1622,32 @@ vs_bufreq(struct vn_sess *s, uint32_t type)
+ 	return NULL;
+ }
+ 
+-/* vdec_output_conf for a 4xx core: split mode, NV12 to the client on OUTPUT2, UBWC DPB on OUTPUT */
++/*
++ * vdec_output_conf for a 4xx core: split mode, the client's pictures on OUTPUT2 (NV12, or P010 for 10-bit HEVC and
++ * VP9), UBWC DPB on OUTPUT (NV12_UBWC or TP10_UBWC); hfi_platform_v4.c's format table. Work mode 1 for MPEG-1/2,
++ * interlaced streams and up to 720p (venus_helper_get_work_mode).
++ */
+ static int
+ vs_output_conf(struct vn_sess *s)
+ {
+ 	uint32_t w = s->width, h = s->height, mbs = ((w + 15) / 16) * ((h + 15) / 16);
+-	int e = vs_prop(s, HFI_PROP_WORK_MODE, mbs <= 3600 ? 1 : 2, 0, 0, 1);
+-	e = e ? e : vs_prop(s, HFI_PROP_UNCOMPRESSED_FORMAT, HFI_BUF_OUTPUT2, HFI_FMT_NV12, 0, 2);
++	bool ten = s->bit_depth == VIDC_BITDEPTH_10;
++	bool mode1 = mbs <= 3600 || s->codec == HFI_CODEC_MPEG2 || s->codec == HFI_CODEC_MPEG1 || s->pic_struct != 1;
++	s->opb_fmt = ten ? HFI_FMT_P010 : HFI_FMT_NV12;
++	int e = vs_prop(s, HFI_PROP_WORK_MODE, mode1 ? 1 : 2, 0, 0, 1);
++	e = e ? e : vs_prop(s, HFI_PROP_UNCOMPRESSED_FORMAT, HFI_BUF_OUTPUT2, s->opb_fmt, 0, 2);
+ 	e = e ? e : vs_prop(s, HFI_PROP_VDEC_MULTI_STREAM, HFI_BUF_OUTPUT, 0, 0, 2);
+ 	e = e ? e : vs_prop(s, HFI_PROP_VDEC_MULTI_STREAM, HFI_BUF_OUTPUT2, 1, 0, 2);
+-	e = e ? e : vs_prop(s, HFI_PROP_UNCOMPRESSED_FORMAT, HFI_BUF_OUTPUT, HFI_FMT_NV12_UBWC, 0, 2);
++	e = e ? e : vs_prop(s, HFI_PROP_UNCOMPRESSED_FORMAT, HFI_BUF_OUTPUT, ten ? HFI_FMT_TP10_UBWC : HFI_FMT_NV12_UBWC, 0, 2);
+ 	e = e ? e : vs_prop(s, HFI_PROP_FRAME_SIZE, HFI_BUF_OUTPUT2, w, h, 3);
+ 	if (e) {
+ 		return e;
+ 	}
+-	s->ystride = vs_align(w, 128);
++	s->ystride = vs_align(ten ? w * 2 : w, 128);
+ 	s->yscan = vs_align(h, 32);
+ 	s->uvscan = vs_align((h + 1) / 2, 16);
+-	s->opb_size = vs_nv12_size(w, h);
+-	s->dpb_size = vs_nv12_ubwc_size(w, h);
++	s->opb_size = ten ? vs_p010_size(w, h) : vs_nv12_size(w, h);
++	s->dpb_size = ten ? vs_tp10_ubwc_size(w, h) : vs_nv12_ubwc_size(w, h);
+ 	e = vs_get_bufreq(s);
+ 	if (e) {
+ 		return e;
+@@ -1823,6 +1869,7 @@ vs_open(struct vn_sess **out, uint32_t codec, uint32_t width, uint32_t height, b
+ 	s->width = width;
+ 	s->height = height;
+ 	s->nin = VS_IN_BUFS;
++	s->pic_struct = 1;
+ 	s->state = VS_INIT;
+ 	vn_sessions_total++;
+ 	const uint32_t init[5] = { 20, HFI_CMD_SYS_SESSION_INIT, s->sid, HFI_DOMAIN_DECODER, codec };
+@@ -2166,13 +2213,14 @@ vt_md5_frame(struct vn_sess *s, const struct vs_done *d, char hex[33])
+ 	unsigned char md[MD5_DIGEST_LENGTH];
+ 	const uint8_t *base = (const uint8_t *)s->out[d->index].kva;
+ 	uint32_t w = s->crop_width, h = s->crop_height;
++	uint32_t bps = s->opb_fmt == HFI_FMT_P010 ? 2 : 1;
+ 	MD5Init(&ctx);
+ 	for (uint32_t y = 0; y < h; y++) {
+-		MD5Update(&ctx, base + (s->crop_top + y) * s->ystride + s->crop_left, w);
++		MD5Update(&ctx, base + (s->crop_top + y) * s->ystride + s->crop_left * bps, w * bps);
+ 	}
+ 	const uint8_t *uv = base + s->ystride * s->yscan;
+ 	for (uint32_t y = 0; y < (h + 1) / 2; y++) {
+-		MD5Update(&ctx, uv + (s->crop_top / 2 + y) * s->ystride + s->crop_left, w);
++		MD5Update(&ctx, uv + (s->crop_top / 2 + y) * s->ystride + s->crop_left * bps, w * bps);
+ 	}
+ 	MD5Final(md, &ctx);
+ 	for (unsigned i = 0; i < MD5_DIGEST_LENGTH; i++) {
+@@ -2234,7 +2282,8 @@ vn_test_decode(bool vp9)
+ 		printf("SWEET VENUS: test: %s, %lld bytes, %u access units\n", path, (long long)size, nau);
+ 		uint64_t t0 = mach_absolute_time();
+ 		vt_frames = 0;
+-		e = vs_open(&s, vp9 ? HFI_CODEC_VP9 : HFI_CODEC_H264, 1280, 720, false);
++		uint32_t ivf_codec = size >= 12 && data[8] == 'V' && data[9] == 'P' && data[10] == '8' ? HFI_CODEC_VP8 : HFI_CODEC_VP9;
++		e = vs_open(&s, vp9 ? ivf_codec : HFI_CODEC_H264, 1280, 720, false);
+ 		for (unsigned i = 0; !e && i < nau; i++) {
+ 			e = vs_decode(s, data + off[i], alen[i], (uint64_t)i * 33333, false);
+ 			vn_poll(0, NULL, NULL);
+@@ -2279,6 +2328,7 @@ struct sweet_venus_frame {
+ 	uint32_t index, flags;
+ 	uint64_t ts;
+ 	uint32_t width, height, crop_left, crop_top, crop_width, crop_height, ystride, yscan, filled, size;
++	uint32_t format;                /* ABI 2: SWEET_VENUS_FORMAT_NV12 (2) or SWEET_VENUS_FORMAT_P010 (0x4003) */
+ };
+ 
+ static void vn_bring_up(void);
+@@ -2328,6 +2378,19 @@ sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, uint32_t flag
+ 	case 0x76703039u:               /* 'vp09' */
+ 		codec = HFI_CODEC_VP9;
+ 		break;
++	case 0x68766331u:               /* 'hvc1' */
++	case 0x68657631u:               /* 'hev1' */
++		codec = HFI_CODEC_HEVC;
++		break;
++	case 0x76703038u:               /* 'vp08' */
++		codec = HFI_CODEC_VP8;
++		break;
++	case 0x6d703276u:               /* 'mp2v' */
++		codec = HFI_CODEC_MPEG2;
++		break;
++	case 0x6d703176u:               /* 'mp1v' */
++		codec = HFI_CODEC_MPEG1;
++		break;
+ 	default:
+ 		return EINVAL;
+ 	}
+@@ -2361,7 +2424,8 @@ sweet_venus_take(void *sess, struct sweet_venus_frame *f)
+ 		return s->state == VS_DEAD || s->error_seen ? EIO : EAGAIN;
+ 	}
+ 	*f = (struct sweet_venus_frame){ d.index, d.flags, (uint64_t)d.ts_hi << 32 | d.ts_lo, s->width, s->height, s->crop_left,
+-		                         s->crop_top, s->crop_width, s->crop_height, s->ystride, s->yscan, d.filled, s->opb_size };
++		                         s->crop_top, s->crop_width, s->crop_height, s->ystride, s->yscan, d.filled, s->opb_size,
++		                         s->opb_fmt };
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetVenus.cpp b/iokit/Kernel/arm/SweetVenus.cpp
+index 27511b8..0b38d99 100644
+--- a/iokit/Kernel/arm/SweetVenus.cpp
++++ b/iokit/Kernel/arm/SweetVenus.cpp
+@@ -207,7 +207,8 @@ SweetVenusUserClient::take(IOExternalMethodArguments *args)
+ 	struct sweet_venus_frame f;
+ 	int e = EAGAIN;
+ 
+-	if (args->scalarOutputCount < SWEET_VENUS_FRAME_SCALARS) {
++	uint32_t n_out = args->scalarOutputCount;
++	if (n_out < SWEET_VENUS_FRAME_SCALARS) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	timeout_ms = timeout_ms > 2000 ? 2000 : timeout_ms;
+@@ -238,6 +239,10 @@ SweetVenusUserClient::take(IOExternalMethodArguments *args)
+ 	o[11] = f.filled;
+ 	o[12] = f.size;
+ 	args->scalarOutputCount = SWEET_VENUS_FRAME_SCALARS;
++	if (n_out >= SWEET_VENUS_FRAME_SCALARS_V2) {
++		o[13] = f.format;
++		args->scalarOutputCount = SWEET_VENUS_FRAME_SCALARS_V2;
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetVenusABI.h b/iokit/Kernel/arm/SweetVenusABI.h
+index 9e7c2a4..578befc 100644
+--- a/iokit/Kernel/arm/SweetVenusABI.h
++++ b/iokit/Kernel/arm/SweetVenusABI.h
+@@ -1,19 +1,20 @@
+ /*
+  * SweetVenus user-client ABI (iokit/Kernel/arm/SweetVenus.cpp, bsd/dev/sweet_venus.c), shared with the
+- * VideoToolbox decoder plug-in (video/venus-vt in the Bergamota repo). Version 1.
++ * VideoToolbox decoder plug-in (video/venus-vt in the Bergamota repo). Version 2.
+  *
+- *   OPEN     scalars in: codec FourCC ('avc1'), coded width, height[, flags (SWEET_VENUS_OPEN_DECODE_ORDER: pictures
++ *   OPEN     scalars in: codec FourCC ('avc1', 'hvc1'/'hev1', 'vp08', 'vp09', 'mp2v', 'mp1v'), coded width, height[, flags (SWEET_VENUS_OPEN_DECODE_ORDER: pictures
+  *            come back unreordered, as soon as they are decoded; xnu 1154+)]. Powers Venus on first use.
+  *   DECODE   scalars in: timestamp (returned with the picture), flags (SWEET_VENUS_FLAG_EOS: end of stream,
+  *            no data); struct input: one access unit in Annex-B form (start codes), inline or out of line.
+- *   TAKE     scalar in: timeout in ms (at most 2000). 13 scalars out, in sweet_venus_frame order below;
++ *   TAKE     scalar in: timeout in ms (at most 2000). 13 scalars out (14 from ABI 2 when the caller asks for 14: the
++ *            picture's format, SWEET_VENUS_FORMAT_NV12 or _P010), in sweet_venus_frame order below;
+  *            kIOReturnNotReady when nothing was decoded in time. index SWEET_VENUS_NO_BUFFER: an empty
+  *            picture (the end-of-stream marker, flags has SWEET_VENUS_FLAG_EOS).
+  *   RELEASE  scalar in: output index; the buffer goes back to the decoder.
+  *   CLOSE    ends the session (clientClose does too).
+  *
+- * clientMemoryForType(SWEET_VENUS_MEM_OUTPUT + index): output buffer index, read-only, NV12 in Venus's layout:
+- * luma rows of ystride bytes, yscan rows, then interleaved CbCr rows of ystride bytes.
++ * clientMemoryForType(SWEET_VENUS_MEM_OUTPUT + index): output buffer index, read-only, NV12 (or P010) in Venus's
++ * layout: luma rows of ystride bytes, yscan rows, then interleaved CbCr rows of ystride bytes.
+  */
+ #ifndef SWEET_VENUS_ABI_H
+ #define SWEET_VENUS_ABI_H
+@@ -21,7 +22,7 @@
+ #include <stdint.h>
+ 
+ #define SWEET_VENUS_SERVICE_NAME        "SweetVenus"
+-#define SWEET_VENUS_ABI_VERSION         1
++#define SWEET_VENUS_ABI_VERSION         2
+ 
+ enum {
+ 	SWEET_VENUS_SEL_OPEN = 0,
+@@ -36,6 +37,9 @@ enum {
+ #define SWEET_VENUS_MEM_OUTPUT          0x100u
+ #define SWEET_VENUS_OUTPUTS_MAX         32u
+ #define SWEET_VENUS_FRAME_SCALARS       13u
++#define SWEET_VENUS_FRAME_SCALARS_V2    14u
++#define SWEET_VENUS_FORMAT_NV12         0x2u            /* 8-bit; luma and CbCr rows of ystride bytes */
++#define SWEET_VENUS_FORMAT_P010         0x4003u         /* 10-bit in the top bits of 16-bit samples (CoreVideo x420) */
+ #define SWEET_VENUS_NO_BUFFER           0xffffffffu
+ 
+ /* TAKE's scalar outputs, in this order (o[0] index ... o[12] size); ts is o[2] */
+@@ -43,6 +47,7 @@ struct sweet_venus_frame {
+ 	uint32_t index, flags;
+ 	uint64_t ts;
+ 	uint32_t width, height, crop_left, crop_top, crop_width, crop_height, ystride, yscan, filled, size;
++	uint32_t format;                /* ABI 2 */
+ };
+ 
+ #endif /* SWEET_VENUS_ABI_H */
