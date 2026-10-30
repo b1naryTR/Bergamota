@@ -1,0 +1,48 @@
+Fix 1141: read the LUN size where the root partition is found. 1141 took the GPT header's alternate LBA in
+ufs_gpt_find_on_lun(), the read-only lookup of the other partitions (Wi-Fi/Bluetooth firmware, on any LUN), but at
+boot the root partition is found by ufs_find_partition(), so ufs_lun_blocks was still 0 when sweet_ufs_init() called
+sweet_storage_info_publish(), which returns early on 0: no disk0 entry, no "SWEET UFS: disk0 registry entry" line,
+and Settings kept showing 0 KB. Read it in ufs_find_partition() (LUN 0, the root's) and put
+ufs_gpt_find_on_lun() back as it was before 1141, so a later firmware lookup on another LUN cannot change it.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -585,8 +585,9 @@
+ 		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
+ 		return ENXIO;
+ 	}
+-	uint64_t entry_lba;
++	uint64_t entry_lba, alt_lba;
+ 	uint32_t nent, esz;
++	memcpy(&alt_lba, b + 32, 8);    /* the backup header sits in the LUN's last block */
+ 	memcpy(&entry_lba, b + 72, 8);
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
+@@ -621,6 +622,7 @@
+ 		}
+ 		su.first_block = first;
+ 		su.nblocks = last - first + 1;
++		ufs_lun_blocks = alt_lba + 1;
+ 		return 0;
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+@@ -898,9 +900,8 @@
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+ 		return ENXIO;
+ 	}
+-	uint64_t entry_lba, alt_lba;
++	uint64_t entry_lba;
+ 	uint32_t nent, esz;
+-	memcpy(&alt_lba, b + 32, 8);    /* the backup header sits in the LUN's last block */
+ 	memcpy(&entry_lba, b + 72, 8);
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
+@@ -934,7 +935,6 @@
+ 		}
+ 		*first = f;
+ 		*nblocks = l - f + 1;
+-		ufs_lun_blocks = alt_lba + 1;
+ 		return 0;
+ 	}
+ 	return ENOENT;
