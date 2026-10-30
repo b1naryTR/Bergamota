@@ -1,0 +1,116 @@
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+index 135bee1..4e1cf44 100644
+--- a/bsd/dev/sweet_venus.c
++++ b/bsd/dev/sweet_venus.c
+@@ -1233,6 +1233,7 @@ vn_hfi_up(void)
+ #define HFI_FMT_NV12_UBWC       0x8002u
+ #define HFI_DOMAIN_DECODER      2u
+ #define HFI_CODEC_H264          0x2u
++#define HFI_CODEC_VP9           0x4000u
+ #define HFI_EVENT_SESSION_ERROR         0x2u
+ #define HFI_EVENT_SEQ_CHANGED           0x1000003u
+ #define HFI_EVENT_SEQ_SUFFICIENT        0x1000001u
+@@ -1879,6 +1880,9 @@ vs_capture_setup(struct vn_sess *s)
+ 	}
+ 	const uint32_t *ro = vs_bufreq(s, HFI_BUF_OUTPUT);
+ 	uint32_t ndpb = MAX(ro ? ro[3] : 0, s->fw_min_cnt);
++	if (s->codec == HFI_CODEC_VP9) {
++		ndpb = MAX(ndpb, 11u);  /* vdec_event_change: "overwriting this to 11 for vp9 due to fw bug" */
++	}
+ 	if (ndpb == 0 || ndpb > VS_DPB_MAX) {
+ 		printf("SWEET VENUS: session %#x: %u DPB buffers asked for (max %u)\n", s->sid, ndpb, VS_DPB_MAX);
+ 		ndpb = MIN(MAX(ndpb, 1u), VS_DPB_MAX);
+@@ -2093,6 +2097,29 @@ vs_close(struct vn_sess *s)
+ 
+ #define VT_FILE         "/var/root/venus/test.h264"
+ #define VT_MAX_AU       2048u
++#define VT_FILE_VP9     "/var/root/venus/test.ivf"
++
++/* IVF: a 32-byte header, then frames of {le32 size, le64 pts, data} */
++static unsigned
++vt_split_ivf(const uint8_t *d, uint32_t len, uint32_t *off, uint32_t *alen, unsigned max)
++{
++	unsigned n = 0;
++	if (len < 32 || d[0] != 'D' || d[1] != 'K' || d[2] != 'I' || d[3] != 'F') {
++		return 0;
++	}
++	uint32_t hdr = (uint32_t)d[6] | (uint32_t)d[7] << 8;
++	for (uint32_t o = hdr; o + 12 <= len && n < max;) {
++		uint32_t sz = (uint32_t)d[o] | (uint32_t)d[o + 1] << 8 | (uint32_t)d[o + 2] << 16 | (uint32_t)d[o + 3] << 24;
++		if (sz > len - o - 12) {
++			break;
++		}
++		off[n] = o + 12;
++		alen[n] = sz;
++		n++;
++		o += 12 + sz;
++	}
++	return n;
++}
+ 
+ /* Access units of an Annex-B stream: a new one at an AUD/SPS/PPS/SEI or first slice after a slice. */
+ static unsigned
+@@ -2177,13 +2204,14 @@ vt_drain(struct vn_sess *s)
+ }
+ 
+ static int
+-vn_test_decode(void)
++vn_test_decode(bool vp9)
+ {
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+ 	off_t size = 0;
+-	if (rootvnode == NULLVP || vnode_lookup(VT_FILE, 0, &vp, ctx) != 0 || vp == NULLVP) {
+-		printf("SWEET VENUS: test: no %s\n", VT_FILE);
++	const char *path = vp9 ? VT_FILE_VP9 : VT_FILE;
++	if (rootvnode == NULLVP || vnode_lookup(path, 0, &vp, ctx) != 0 || vp == NULLVP) {
++		printf("SWEET VENUS: test: no %s\n", path);
+ 		return ENOENT;
+ 	}
+ 	if (vnode_size(vp, &size, ctx) != 0 || size <= 0 || size > (16 << 20)) {
+@@ -2201,11 +2229,12 @@ vn_test_decode(void)
+ 	struct vn_sess *s = NULL;
+ 	if (!e && resid == 0) {
+ 		uint32_t *alen = off + VT_MAX_AU;
+-		unsigned nau = vt_split(data, (uint32_t)size, off, alen, VT_MAX_AU);
+-		printf("SWEET VENUS: test: %s, %lld bytes, %u access units\n", VT_FILE, (long long)size, nau);
++		unsigned nau = vp9 ? vt_split_ivf(data, (uint32_t)size, off, alen, VT_MAX_AU) :
++		    vt_split(data, (uint32_t)size, off, alen, VT_MAX_AU);
++		printf("SWEET VENUS: test: %s, %lld bytes, %u access units\n", path, (long long)size, nau);
+ 		uint64_t t0 = mach_absolute_time();
+ 		vt_frames = 0;
+-		e = vs_open(&s, HFI_CODEC_H264, 1280, 720, false);
++		e = vs_open(&s, vp9 ? HFI_CODEC_VP9 : HFI_CODEC_H264, 1280, 720, false);
+ 		for (unsigned i = 0; !e && i < nau; i++) {
+ 			e = vs_decode(s, data + off[i], alen[i], (uint64_t)i * 33333, false);
+ 			vn_poll(0, NULL, NULL);
+@@ -2296,6 +2325,9 @@ sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, uint32_t flag
+ 	case 0x61766331u:               /* 'avc1' */
+ 		codec = HFI_CODEC_H264;
+ 		break;
++	case 0x76703039u:               /* 'vp09' */
++		codec = HFI_CODEC_VP9;
++		break;
+ 	default:
+ 		return EINVAL;
+ 	}
+@@ -2450,7 +2482,8 @@ sweet_venus_ctl_sysctl SYSCTL_HANDLER_ARGS
+ 		}
+ 		break;
+ 	case 4:
+-		error = vn.step >= 4 ? vn_test_decode() : ENXIO;
++	case 5:
++		error = vn.step >= 4 ? vn_test_decode(value == 5) : ENXIO;
+ 		break;
+ 	case 3:
+ 		if (vn.step >= 4) {
+@@ -2470,7 +2503,8 @@ sweet_venus_ctl_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_venus_ctl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_venus_ctl_sysctl,
+-    "I", "Venus: 1 bring-up (power, firmware, HFI), 2 poll the queues, 3 ping, 4 decode /var/root/venus/test.h264");
++    "I", "Venus: 1 bring-up (power, firmware, HFI), 2 poll the queues, 3 ping, 4 decode /var/root/venus/test.h264, "
++    "5 decode /var/root/venus/test.ivf (VP9)");
+ 
+ static int
+ sweet_venus_sysctl SYSCTL_HANDLER_ARGS
