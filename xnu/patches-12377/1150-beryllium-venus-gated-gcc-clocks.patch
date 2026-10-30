@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+index b38c9f0..4966e72 100644
+--- a/bsd/dev/sweet_venus.c
++++ b/bsd/dev/sweet_venus.c
+@@ -83,6 +83,7 @@ extern uint32_t sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uin
+ #define GDSC_UP_COMPLETE        (1u << 16)      /* in CFG_GDSCR = GDSCR + 4 */
+ #define CBCR_RETAIN             (1u << 14 | 1u << 13)   /* RETAIN_MEM, RETAIN_PERIPH */
+ #define CBCR_OFF                (1u << 31)
++#define CBCR_HWCG               (1u << 1)       /* hardware clock gating: CLK_OFF reads 1 while nothing uses it */
+ 
+ /* ---- Venus 4xx (hfi_venus_io.h) ---- */
+ #define CPU_CS          0xd2000u
+@@ -210,6 +211,7 @@ vn_fail(const char *where, int error)
+ /* step 1: power                                                       */
+ /* ------------------------------------------------------------------ */
+ 
++/* clk_branch2 enable; like Linux, a branch in hardware clock-gating mode is not polled (clk_branch_in_hwcg_mode) */
+ static bool
+ vn_branch_on(vm_offset_t base, uint32_t cbcr, const char *name)
+ {
+@@ -221,7 +223,12 @@ vn_branch_on(vm_offset_t base, uint32_t cbcr, const char *name)
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET VENUS: %s did not turn on (cbcr %#x)\n", name, rd(base, cbcr));
++	uint32_t v = rd(base, cbcr);
++	if ((v & 1) && (v & CBCR_HWCG)) {
++		printf("SWEET VENUS: %s enabled, hardware-gated (cbcr %#x)\n", name, v);
++		return true;
++	}
++	printf("SWEET VENUS: %s did not turn on (cbcr %#x)\n", name, v);
+ 	return false;
+ }
+ 
+@@ -269,16 +276,14 @@ vn_power_on(void)
+ 	uint32_t ahb = rd(vn.gcc, 0xb004), axi = rd(vn.gcc, 0xb01c), xo = rd(vn.gcc, 0xb028);
+ 	printf("SWEET VENUS: GCC video ahb %#x axi %#x xo %#x\n", ahb, axi, xo);
+ 	sweet_log_sync();
+-	/* gcc_video_ahb_clk clocks videocc's own registers: never touch videocc with it off */
+-	if ((ahb & CBCR_OFF) && !vn_branch_on(vn.gcc, 0xb004, "gcc_video_ahb_clk")) {
++	/*
++	 * gcc_video_ahb_clk clocks videocc's own registers: never touch videocc with it off (ABL leaves it
++	 * enabled and hardware-gated, 0x80000003). gcc_video_xo_clk is critical in Linux but found off.
++	 */
++	if (!vn_branch_on(vn.gcc, 0xb004, "gcc_video_ahb_clk") || !vn_branch_on(vn.gcc, 0xb028, "gcc_video_xo_clk")) {
+ 		return EIO;
+ 	}
+-	if ((xo & CBCR_OFF) && !vn_branch_on(vn.gcc, 0xb028, "gcc_video_xo_clk")) {
+-		return EIO;
+-	}
+-	if (axi & CBCR_OFF) {
+-		(void)vn_branch_on(vn.gcc, 0xb01c, "gcc_video_axi_clk");   /* BRANCH_VOTED: may report late */
+-	}
++	(void)vn_branch_on(vn.gcc, 0xb01c, "gcc_video_axi_clk");   /* BRANCH_VOTED: may report late */
+ 
+ 	/* Linux venus_runtime_resume votes 20 MB/s on video-mem first; 1 GB/s covers firmware boot and 1080p */
+ 	int e1 = sweet_rpmh_bcm_vote("MM3", 1000000, 1000000, 32);
