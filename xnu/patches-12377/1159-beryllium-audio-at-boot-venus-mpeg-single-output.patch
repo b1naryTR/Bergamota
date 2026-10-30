@@ -1,0 +1,243 @@
+diff --git a/bsd/dev/sweet_audio.c b/bsd/dev/sweet_audio.c
+index 61e3cfa..69d6570 100644
+--- a/bsd/dev/sweet_audio.c
++++ b/bsd/dev/sweet_audio.c
+@@ -263,7 +263,7 @@ static struct {
+ } au;
+ 
+ static unsigned au_idle_s = 15;         /* kern.sweet_audio_idle_s: teardown after this long without START */
+-static unsigned au_clients = 0;         /* kern.sweet_audio_clients: client STARTs allowed (0 while bring-up is new) */
++static unsigned au_clients = 1;         /* kern.sweet_audio_clients: client STARTs allowed (0: the plug-in keeps its own clock) */
+ static unsigned au_amps = 1;            /* kern.sweet_audio_amps: power the amplifiers with the path */
+ static unsigned au_tone_s = 3;          /* kern.sweet_audio_tone_s: ctl 2 plays this long */
+ static int au_program = -1, au_config = -1;     /* kern.sweet_audio_tas_program/config: -1 = the module's choice */
+@@ -535,7 +535,8 @@ au_adsp_load(void)
+ 		if (type != 1 || (flags & (7u << 24)) == (2u << 24) || memsz == 0) {
+ 			continue;
+ 		}
+-		if (filesz > memsz || (uint64_t)off + filesz > (uint64_t)fsize) {
++		if (filesz > memsz || (filesz && (uint64_t)off + filesz > (uint64_t)fsize)) {
++			/* only data counts: beryllium's segment 15 is all zero-fill (filesz 0) with an offset past the file */
+ 			AU_LOG("segment %u outside the file", i);
+ 			goto out;
+ 		}
+@@ -2370,6 +2371,10 @@ au_bring_up(void)
+ 			AU_LOG("amplifiers not loaded (%d); the path can still run", a);
+ 		}
+ 	}
++	if (!e && au.error) {
++		au.error = 0;
++		au.where[0] = 0;
++	}
+ 	sweet_log_sync();
+ 	return e;
+ }
+@@ -2498,6 +2503,22 @@ au_publish_thread(void *arg, wait_result_t wr)
+ #pragma unused(arg, wr)
+ 	delay(15 * 1000 * 1000);
+ 	SweetAudioPublish();
++	/*
++	 * sweetaudioboot (default 1): ADSP, GLINK, APR and the amplifiers' firmware come up 45 s later, in the
++	 * background, so the first START only starts the path (~0.2 s) instead of waiting ~8 s inside audiomxd
++	 */
++	uint32_t boot = 1;
++	(void)PE_parse_boot_argn("sweetaudioboot", &boot, sizeof(boot));
++	if (boot) {
++		delay(45 * 1000 * 1000);
++		lck_mtx_lock(&au_mtx);
++		if (au_map() && au.step < AU_STEP_Q6) {
++			AU_LOG("bring-up at boot (sweetaudioboot=0 turns it off)");
++			(void)au_bring_up();
++			au_thread_start();
++		}
++		lck_mtx_unlock(&au_mtx);
++	}
+ 	(void)thread_terminate(current_thread());
+ }
+ 
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+index 006ace7..4821f7a 100644
+--- a/bsd/dev/sweet_venus.c
++++ b/bsd/dev/sweet_venus.c
+@@ -1246,6 +1246,7 @@ vn_hfi_up(void)
+ #define HFI_EVENT_SEQ_SUFFICIENT        0x1000001u
+ #define HFI_EVENT_RELEASE_BUFFER_REF    0x1000006u
+ #define HFI_BUFFERFLAG_EOS              0x1u
++#define HFI_BUFFERFLAG_READONLY         0x200u  /* still a reference: not ours to refill until RELEASE_BUFFER_REF */
+ #define HFI_FLUSH_ALL                   0x1000004u
+ 
+ #define VS_IN_BUFS      6u
+@@ -1285,6 +1286,9 @@ struct vn_sess {
+ 	unsigned ndpb;
+ 	struct vn_buf out[VS_OUT_BUFS];
+ 	uint8_t out_state[VS_OUT_BUFS];     /* 0 ours, 1 with the firmware, 2 decoded and waiting for the client */
++	bool out_ro[VS_OUT_BUFS];           /* single mode: the firmware still references it (HFI_BUFFERFLAG_READONLY) */
++	bool single;                        /* MPEG-1/2: one linear NV12 output stream, no DPB of our own (mp2d: no OPB) */
++	uint32_t ro_marks, ro_releases;
+ 	unsigned nout;
+ 	struct vs_done done[VS_DONE_Q];
+ 	unsigned done_head, done_tail;
+@@ -1469,7 +1473,7 @@ vn_sess_msg(const uint32_t *w, uint32_t size, uint32_t type)
+ 		if (flags & HFI_BUFFERFLAG_EOS) {
+ 			s->eos_seen = true;
+ 		}
+-		if (stream == 0) {
++		if (stream == 0 && !s->single) {
+ 			s->dpb_returns++;
+ 			if (tag < s->ndpb) {
+ 				s->dpb_fw[tag] = false;
+@@ -1480,6 +1484,10 @@ vn_sess_msg(const uint32_t *w, uint32_t size, uint32_t type)
+ 			printf("SWEET VENUS: session %#x: FBD for unknown output %u\n", s->sid, tag);
+ 			return true;
+ 		}
++		if (s->single && (flags & HFI_BUFFERFLAG_READONLY)) {
++			s->out_ro[tag] = true;          /* shown to the client, refilled only after RELEASE_BUFFER_REF */
++			s->ro_marks++;
++		}
+ 		if (filled == 0) {
+ 			s->fbd_empty++;
+ 			s->out_state[tag] = 0;          /* back to the firmware at the next vs_take */
+@@ -1520,10 +1528,24 @@ vn_sess_msg(const uint32_t *w, uint32_t size, uint32_t type)
+ 		case HFI_EVENT_SEQ_CHANGED:
+ 			vs_seq_changed(s, w, size);
+ 			break;
+-		case HFI_EVENT_RELEASE_BUFFER_REF:
+-			printf("SWEET VENUS: session %#x: buffer %#x released (tag %u)\n", s->sid, size >= 28 ? w[6] : 0,
+-			    size >= 36 ? w[8] : 0);
++		case HFI_EVENT_RELEASE_BUFFER_REF: {
++			/* hfi_msg_event_release_buffer_ref_pkt: packet_buffer, extradata_buffer, output_tag */
++			uint32_t tag = size >= 36 ? w[8] : ~0u, addr = size >= 28 ? w[6] : 0;
++			if (s->single && tag < s->nout && s->out[tag].iova == addr) {
++				s->out_ro[tag] = false;
++				s->ro_releases++;
++			} else if (s->single) {
++				for (unsigned i = 0; i < s->nout; i++) {
++					if (s->out[i].iova == addr) {
++						s->out_ro[i] = false;
++						s->ro_releases++;
++					}
++				}
++			} else {
++				printf("SWEET VENUS: session %#x: buffer %#x released (tag %u)\n", s->sid, addr, tag);
++			}
+ 			break;
++		}
+ 		default:
+ 			printf("SWEET VENUS: session %#x: event %#x data %#x %#x\n", s->sid, w[3], size >= 20 ? w[4] : 0,
+ 			    size >= 24 ? w[5] : 0);
+@@ -1635,6 +1657,29 @@ vs_output_conf(struct vn_sess *s)
+ 	bool mode1 = mbs <= 3600 || s->codec == HFI_CODEC_MPEG2 || s->codec == HFI_CODEC_MPEG1 || s->pic_struct != 1;
+ 	s->opb_fmt = ten ? HFI_FMT_P010 : HFI_FMT_NV12;
+ 	int e = vs_prop(s, HFI_PROP_WORK_MODE, mode1 ? 1 : 2, 0, 0, 1);
++	if (s->single) {
++		/* vdec_output_conf without a DPB format: the raw format on OUTPUT only, no multi-stream, no OUTPUT2 */
++		e = e ? e : vs_prop(s, HFI_PROP_UNCOMPRESSED_FORMAT, HFI_BUF_OUTPUT, s->opb_fmt, 0, 2);
++		if (e) {
++			return e;
++		}
++		s->ystride = vs_align(ten ? w * 2 : w, 128);
++		s->yscan = vs_align(h, 32);
++		s->uvscan = vs_align((h + 1) / 2, 16);
++		s->opb_size = ten ? vs_p010_size(w, h) : vs_nv12_size(w, h);
++		s->dpb_size = 0;
++		e = vs_get_bufreq(s);
++		if (e) {
++			return e;
++		}
++		const uint32_t *ro1 = vs_bufreq(s, HFI_BUF_OUTPUT);
++		if (ro1 && ro1[1] > s->opb_size) {
++			printf("SWEET VENUS: session %#x: firmware wants %u bytes per output buffer, more than %u\n", s->sid,
++			    ro1[1], s->opb_size);
++			s->opb_size = ro1[1];
++		}
++		return vs_prop(s, HFI_PROP_BUFFER_SIZE_ACTUAL, HFI_BUF_OUTPUT, s->opb_size, 0, 2);
++	}
+ 	e = e ? e : vs_prop(s, HFI_PROP_UNCOMPRESSED_FORMAT, HFI_BUF_OUTPUT2, s->opb_fmt, 0, 2);
+ 	e = e ? e : vs_prop(s, HFI_PROP_VDEC_MULTI_STREAM, HFI_BUF_OUTPUT, 0, 0, 2);
+ 	e = e ? e : vs_prop(s, HFI_PROP_VDEC_MULTI_STREAM, HFI_BUF_OUTPUT2, 1, 0, 2);
+@@ -1674,7 +1719,9 @@ vs_num_bufs(struct vn_sess *s)
+ {
+ 	int e = vs_prop(s, HFI_PROP_BUFFER_COUNT_ACTUAL, HFI_BUF_INPUT, s->nin, s->nin, 3);
+ 	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_COUNT_ACTUAL, HFI_BUF_OUTPUT, 32, 32, 3);
+-	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_COUNT_ACTUAL, HFI_BUF_OUTPUT2, 32, 32, 3);
++	if (!s->single) {
++		e = e ? e : vs_prop(s, HFI_PROP_BUFFER_COUNT_ACTUAL, HFI_BUF_OUTPUT2, 32, 32, 3);
++	}
+ 	return e;
+ }
+ 
+@@ -1866,6 +1913,7 @@ vs_open(struct vn_sess **out, uint32_t codec, uint32_t width, uint32_t height, b
+ 	bzero(s, sizeof(*s));
+ 	s->sid = vn_sid_next++;
+ 	s->codec = codec;
++	s->single = codec == HFI_CODEC_MPEG2 || codec == HFI_CODEC_MPEG1;    /* mp2d: "OPB is not supported" */
+ 	s->width = width;
+ 	s->height = height;
+ 	s->nin = VS_IN_BUFS;
+@@ -1926,11 +1974,11 @@ vs_capture_setup(struct vn_sess *s)
+ 		return e;
+ 	}
+ 	const uint32_t *ro = vs_bufreq(s, HFI_BUF_OUTPUT);
+-	uint32_t ndpb = MAX(ro ? ro[3] : 0, s->fw_min_cnt);
++	uint32_t ndpb = s->single ? 0 : MAX(ro ? ro[3] : 0, s->fw_min_cnt);
+ 	if (s->codec == HFI_CODEC_VP9) {
+ 		ndpb = MAX(ndpb, 11u);  /* vdec_event_change: "overwriting this to 11 for vp9 due to fw bug" */
+ 	}
+-	if (ndpb == 0 || ndpb > VS_DPB_MAX) {
++	if (!s->single && (ndpb == 0 || ndpb > VS_DPB_MAX)) {
+ 		printf("SWEET VENUS: session %#x: %u DPB buffers asked for (max %u)\n", s->sid, ndpb, VS_DPB_MAX);
+ 		ndpb = MIN(MAX(ndpb, 1u), VS_DPB_MAX);
+ 	}
+@@ -1953,13 +2001,14 @@ vs_capture_setup(struct vn_sess *s)
+ 	s->state = VS_DECODING;
+ 	vs_requeue_dpb(s);
+ 	for (unsigned i = 0; i < s->nout; i++) {
+-		if (vs_ftb(s, 1, i, &s->out[i], s->opb_size) == 0) {
++		s->out_ro[i] = false;
++		if (vs_ftb(s, s->single ? 0 : 1, i, &s->out[i], s->opb_size) == 0) {
+ 			s->out_state[i] = 1;
+ 		}
+ 	}
+ 	printf("SWEET VENUS: session %#x decoding %ux%u: %u DPB x %u KiB (UBWC), %u output x %u KiB (NV12 stride %u, "
+-	    "%u+%u lines)\n", s->sid, s->width, s->height, s->ndpb, s->dpb_size >> 10, s->nout, s->opb_size >> 10, s->ystride,
+-	    s->yscan, s->uvscan);
++	    "%u+%u lines)%s\n", s->sid, s->width, s->height, s->ndpb, s->dpb_size >> 10, s->nout, s->opb_size >> 10, s->ystride,
++	    s->yscan, s->uvscan, s->single ? ", single output (the pictures are the references)" : "");
+ 	return 0;
+ }
+ 
+@@ -2074,7 +2123,7 @@ vs_take(struct vn_sess *s, struct vs_done *d)
+ 	(void)vs_service(s);
+ 	vs_requeue_dpb(s);
+ 	for (unsigned i = 0; s->state == VS_DECODING && i < s->nout; i++) {
+-		if (s->out_state[i] == 0 && vs_ftb(s, 1, i, &s->out[i], s->opb_size) == 0) {
++		if (s->out_state[i] == 0 && !s->out_ro[i] && vs_ftb(s, s->single ? 0 : 1, i, &s->out[i], s->opb_size) == 0) {
+ 			s->out_state[i] = 1;    /* empty pictures (the EOS one) go straight back */
+ 		}
+ 	}
+@@ -2096,11 +2145,11 @@ vs_release(struct vn_sess *s, uint32_t index)
+ 	if (index >= s->nout || s->out_state[index] != 2) {
+ 		return EINVAL;
+ 	}
+-	if (s->state != VS_DECODING) {
+-		s->out_state[index] = 0;
++	if (s->state != VS_DECODING || s->out_ro[index]) {
++		s->out_state[index] = 0;        /* a reference goes back at the first vs_take after its release event */
+ 		return 0;
+ 	}
+-	int e = vs_ftb(s, 1, index, &s->out[index], s->opb_size);
++	int e = vs_ftb(s, s->single ? 0 : 1, index, &s->out[index], s->opb_size);
+ 	s->out_state[index] = e ? 0 : 1;
+ 	return e;
+ }
+@@ -2133,8 +2182,8 @@ vs_close(struct vn_sess *s)
+ 	for (unsigned i = 0; i < s->nout; i++) {
+ 		vn_buf_free(&s->out[i]);
+ 	}
+-	printf("SWEET VENUS: session %#x closed: etb %u ebd %u ftb %u fbd %u (empty %u, dpb %u), errors %u\n", s->sid, s->etb,
+-	    s->ebd, s->ftb, s->fbd, s->fbd_empty, s->dpb_returns, s->errors);
++	printf("SWEET VENUS: session %#x closed: etb %u ebd %u ftb %u fbd %u (empty %u, dpb %u), errors %u, references %u/%u\n",
++	    s->sid, s->etb, s->ebd, s->ftb, s->fbd, s->fbd_empty, s->dpb_returns, s->errors, s->ro_marks, s->ro_releases);
+ 	s->state = VS_CLOSED;
+ }
+ 
