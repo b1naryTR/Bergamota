@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+index 5dc19bb..67f4d01 100644
+--- a/bsd/dev/sweet_venus.c
++++ b/bsd/dev/sweet_venus.c
+@@ -496,7 +496,7 @@ vn_smmu_report(const char *when)
+ {
+ 	uint64_t far = 0;
+ 	uint32_t fsynr = 0, fsr = sweet_smmu_pt_fault(vn.pt, &far, &fsynr);
+-	if (fsr) {
++	if (fsr & 0xc00001feu) {                /* fault bits; FORMAT [10:9] alone is none (boot 1151: 0x400) */
+ 		printf("SWEET VENUS: SMMU FAULT %s: fsr %#x far %#llx fsynr0 %#x\n", when, fsr, far, fsynr);
+ 	}
+ }
+@@ -1207,7 +1207,6 @@ vn_hfi_up(void)
+ #define HFI_PROP_WORK_MODE              0x1015u
+ #define HFI_PROP_VIDEOCORES_USAGE       0x2002u
+ #define HFI_PROP_BUFFER_COUNT_ACTUAL    0x201001u
+-#define HFI_PROP_BUFFER_ALLOC_MODE      0x201008u
+ #define HFI_PROP_BUFFER_SIZE_ACTUAL     0x20100cu
+ #define HFI_PROP_BUFFER_REQUIREMENTS    0x202001u
+ #define HFI_PROP_VDEC_MULTI_STREAM      0x1003001u
+@@ -1226,7 +1225,6 @@ vn_hfi_up(void)
+ #define HFI_BUF_SCRATCH         6u
+ #define HFI_BUF_SCRATCH_1       7u
+ #define HFI_BUF_SCRATCH_2       8u
+-#define HFI_BUFFER_MODE_DYNAMIC 0x1000003u
+ #define HFI_FMT_NV12            0x2u
+ #define HFI_FMT_NV12_UBWC       0x8002u
+ #define HFI_DOMAIN_DECODER      2u
+@@ -1346,6 +1344,7 @@ vs_seq_changed(struct vn_sess *s, const uint32_t *w, uint32_t size)
+ 		case HFI_PROP_VDEC_PIC_STRUCT:
+ 		case HFI_PROP_VDEC_COLOUR_SPACE:
+ 		case HFI_PROP_VDEC_ENTROPY:
++		case 0x100300bu:                        /* ENABLE_SUFFICIENT_SEQCHANGE_EVENT */
+ 			o += 1;
+ 			break;
+ 		case HFI_PROP_BUFFER_REQUIREMENTS:      /* v4: hold_count is the minimum */
+@@ -1477,7 +1476,8 @@ vn_sess_msg(const uint32_t *w, uint32_t size, uint32_t type)
+ 		default:
+ 			printf("SWEET VENUS: session %#x: event %#x data %#x %#x\n", s->sid, w[3], size >= 20 ? w[4] : 0,
+ 			    size >= 24 ? w[5] : 0);
+-			if (w[3] == HFI_EVENT_SESSION_ERROR) {
++			/* 0x1007/0x1008: a property the firmware does not take; the session goes on */
++			if (w[3] == HFI_EVENT_SESSION_ERROR && size >= 20 && w[4] != 0x1007 && w[4] != 0x1008) {
+ 				s->error_seen = true;
+ 			}
+ 			break;
+@@ -1603,8 +1603,10 @@ vs_output_conf(struct vn_sess *s)
+ 	}
+ 	e = vs_prop(s, HFI_PROP_BUFFER_SIZE_ACTUAL, HFI_BUF_OUTPUT2, s->opb_size, 0, 2);
+ 	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_SIZE_ACTUAL, HFI_BUF_OUTPUT, s->dpb_size, 0, 2);
+-	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_ALLOC_MODE, HFI_BUF_OUTPUT, HFI_BUFFER_MODE_DYNAMIC, 0, 2);
+-	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_ALLOC_MODE, HFI_BUF_OUTPUT2, HFI_BUFFER_MODE_DYNAMIC, 0, 2);
++	/*
++	 * No BUFFER_ALLOC_MODE: a 4xx core runs OUTPUT/OUTPUT2 in dynamic mode by default (helpers.c is_dynamic_bufmode),
++	 * and VIDEO.VE.5.2-00050 answers the property with a session error 0x1008 (unsupported setting; boot 1151).
++	 */
+ 	return e;
+ }
+ 
+@@ -1917,6 +1919,25 @@ vs_seq_seen(void *arg)
+ 	return s->seq_events != 0 || s->error_seen;
+ }
+ 
++/*
++ * The output side is set up as soon as SEQUENCE_CHANGED is in, wherever the driver waits: the firmware parks
++ * after the event ("Waiting for session continue") and returns no input until CONTINUE (boot 1151 queued all six
++ * input buffers before the event arrived, then waited for one of them forever).
++ */
++static int
++vs_service(struct vn_sess *s)
++{
++	if (s->state != VS_INIT || s->seq_events == 0) {
++		return 0;
++	}
++	int e = vs_capture_setup(s);
++	if (e) {
++		printf("SWEET VENUS: session %#x: capture setup failed (%d)\n", s->sid, e);
++		s->state = VS_DEAD;
++	}
++	return e;
++}
++
+ /* Queue one access unit (or, with len 0, end of stream); the first one waits for the stream's description. */
+ static int
+ vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool eos)
+@@ -1927,6 +1948,10 @@ vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool e
+ 	if (len > s->in_size) {
+ 		return E2BIG;
+ 	}
++	int e = vs_service(s);
++	if (e) {
++		return e;
++	}
+ 	unsigned idx = s->nin;
+ 	for (unsigned tries = 0; idx == s->nin && tries < 2000; tries++) {
+ 		for (unsigned i = 0; i < s->nin; i++) {
+@@ -1937,6 +1962,10 @@ vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool e
+ 		}
+ 		if (idx == s->nin) {
+ 			vn_poll(1, NULL, NULL);
++			e = vs_service(s);
++			if (e) {
++				return e;
++			}
+ 		}
+ 	}
+ 	if (idx == s->nin) {
+@@ -1947,26 +1976,19 @@ vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool e
+ 		memcpy((void *)s->in[idx].kva, data, len);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+-	int e = vs_etb(s, idx, len, eos ? HFI_BUFFERFLAG_EOS : 0, ts);
++	e = vs_etb(s, idx, len, eos ? HFI_BUFFERFLAG_EOS : 0, ts);
+ 	if (e || s->state != VS_INIT) {
+ 		return e;
+ 	}
+-	vn_poll(1000, vs_seq_seen, s);
+-	if (s->seq_events == 0) {
+-		return 0;               /* not enough of the stream yet */
+-	}
+-	e = vs_capture_setup(s);
+-	if (e) {
+-		printf("SWEET VENUS: session %#x: capture setup failed (%d)\n", s->sid, e);
+-		s->state = VS_DEAD;
+-	}
+-	return e;
++	vn_poll(100, vs_seq_seen, s);   /* the first pictures: the description usually follows within a few ms */
++	return vs_service(s);
+ }
+ 
+ /* The next decoded picture, or false. The output buffer stays the caller's until vs_release(). */
+ static bool
+ vs_take(struct vn_sess *s, struct vs_done *d)
+ {
++	(void)vs_service(s);
+ 	vs_requeue_dpb(s);
+ 	if (s->done_head == s->done_tail) {
+ 		return false;
