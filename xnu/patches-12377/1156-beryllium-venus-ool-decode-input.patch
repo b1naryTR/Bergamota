@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/SweetVenus.cpp b/iokit/Kernel/arm/SweetVenus.cpp
+index 735cb92..27511b8 100644
+--- a/iokit/Kernel/arm/SweetVenus.cpp
++++ b/iokit/Kernel/arm/SweetVenus.cpp
+@@ -174,9 +174,15 @@ venus_ret(int error)
+ 	}
+ }
+ 
+-/* DECODE's fill callbacks: the access unit is the struct input, inline (<= 4 KiB) or a client memory descriptor. */
++/*
++ * DECODE's fill callback: the access unit is the struct input, a client memory descriptor when it is larger than
++ * 4 KiB, else inline. The descriptor decides: with one, structureInput still points at the (empty) in-band buffer,
++ * and copying the access unit's length from there read past it (patch 1153: the first 24 KiB picture took the
++ * kernel down).
++ */
+ struct venus_fill_ctx {
+ 	const void         *inl;
++	uint32_t            inl_len;
+ 	IOMemoryDescriptor *md;
+ };
+ 
+@@ -184,11 +190,14 @@ static int
+ venus_fill(void *ctx, void *dst, uint32_t len)
+ {
+ 	struct venus_fill_ctx *c = (struct venus_fill_ctx *)ctx;
+-	if (c->inl != NULL) {
+-		memcpy(dst, c->inl, len);
+-		return 0;
++	if (c->md != NULL) {
++		return c->md->readBytes(0, dst, len) == len ? 0 : EIO;
++	}
++	if (c->inl == NULL || len > c->inl_len) {
++		return EINVAL;
+ 	}
+-	return c->md->readBytes(0, dst, len) == len ? 0 : EIO;
++	memcpy(dst, c->inl, len);
++	return 0;
+ }
+ 
+ IOReturn
+@@ -266,7 +275,7 @@ SweetVenusUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		if (args->scalarInputCount < 2 || args->structureOutputDescriptor != NULL) {
+ 			return kIOReturnBadArgument;
+ 		}
+-		struct venus_fill_ctx c = { args->structureInput, args->structureInputDescriptor };
++		struct venus_fill_ctx c = { args->structureInput, args->structureInputSize, args->structureInputDescriptor };
+ 		uint32_t len = c.md != NULL ? (uint32_t)c.md->getLength() : args->structureInputSize;
+ 		if (c.md != NULL && c.md->prepare() != kIOReturnSuccess) {
+ 			return kIOReturnVMError;
