@@ -1,0 +1,1399 @@
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+index 4966e72..5dc19bb 100644
+--- a/bsd/dev/sweet_venus.c
++++ b/bsd/dev/sweet_venus.c
+@@ -43,6 +43,8 @@
+ #include <vm/vm_kern.h>
+ #include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
++#include <mach/mach_time.h>
++#include <libkern/crypto/md5.h>
+ #include "sweet_board.h"
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -52,6 +54,7 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
+ extern void sweet_log_sync(void);               /* sweet_ufs.c */
+ extern vnode_t rootvnode;
+ extern int sweet_rpmh_bcm_vote(const char *res, uint64_t ab_kbps, uint64_t ib_kbps, unsigned buswidth);
++extern int sweet_rpmh_arc_vote(const char *res, bool max);
+ extern int sweet_smmu_probe_sid(unsigned sid, unsigned level);
+ struct sweet_smmu_pt;
+ extern int sweet_smmu_pt_create(const unsigned *sids, unsigned nsid, struct sweet_smmu_pt **out);
+@@ -157,6 +160,7 @@ struct vn_buf {
+ 	vm_offset_t kva;
+ 	vm_size_t size;
+ 	uint32_t iova;
++	bool wc;
+ };
+ 
+ struct vn_qhdr {
+@@ -168,7 +172,6 @@ static struct {
+ 	volatile uint32_t busy;
+ 	vm_offset_t venus, vcc, gcc;
+ 	struct sweet_smmu_pt *pt;
+-	uint32_t iova_next;
+ 	struct vn_buf uc, sfr;
+ 	unsigned step;                  /* last completed bring-up step, 0..4 */
+ 	int error;
+@@ -177,7 +180,7 @@ static struct {
+ 	uint32_t msgs, dbgs, events, last_event, pings;
+ 	char fw_version[96];
+ 	char where[48];
+-} vn = { .iova_next = IOVA_TOP };
++} vn;
+ 
+ static uint32_t vn_pktw[PKT_MAX / 4];
+ #define vn_pkt ((uint8_t *)vn_pktw)
+@@ -341,39 +344,143 @@ vn_power_on(void)
+ /* step 2: DMA memory behind the private SMMU bank                     */
+ /* ------------------------------------------------------------------ */
+ 
+-/* Wired kernel memory, write-combined (normal non-cacheable) for CPU and Venus alike, mapped at an IOVA. */
++/*
++ * IOVA space (patch 1151): 16 KiB granules over [IOVA_FLOOR, IOVA_TOP), handed out top-down (first fit from the
++ * top, as Linux's IOVA allocator does under the 0xdfffffff DMA mask) and given back on free.
++ */
++#define IOVA_PAGES      ((IOVA_TOP - IOVA_FLOOR) / (uint32_t)PAGE_SIZE)
++static uint32_t vn_iova_bits[IOVA_PAGES / 32];
++
++static bool
++vn_iova_used(uint32_t i)
++{
++	return (vn_iova_bits[i / 32] >> (i % 32)) & 1;
++}
++
++static uint32_t
++vn_iova_alloc(uint32_t size, uint32_t align)
++{
++	uint32_t n = size / (uint32_t)PAGE_SIZE, step = MAX(align / (uint32_t)PAGE_SIZE, 1u);
++	if (n == 0 || n > IOVA_PAGES) {
++		return 0;
++	}
++	for (uint32_t start = (IOVA_PAGES - n) / step * step;; start -= step) {
++		uint32_t i = 0;
++		while (i < n && !vn_iova_used(start + i)) {
++			i++;
++		}
++		if (i == n) {
++			for (i = 0; i < n; i++) {
++				vn_iova_bits[(start + i) / 32] |= 1u << ((start + i) % 32);
++			}
++			return IOVA_FLOOR + start * (uint32_t)PAGE_SIZE;
++		}
++		if (start < step) {
++			return 0;
++		}
++	}
++}
++
++static void
++vn_iova_free(uint32_t iova, uint32_t size)
++{
++	uint32_t first = (iova - IOVA_FLOOR) / (uint32_t)PAGE_SIZE;
++	for (uint32_t i = 0; i < size / (uint32_t)PAGE_SIZE; i++) {
++		vn_iova_bits[(first + i) / 32] &= ~(1u << ((first + i) % 32));
++	}
++}
++
++/*
++ * Wired kernel memory mapped at an IOVA. wc: write-combined (normal non-cacheable) for CPU and Venus alike, for
++ * what the CPU writes or never reads; otherwise cacheable, for frames the CPU reads after Venus wrote them
++ * (vn_buf_sync before every read: Venus is not I/O coherent here).
++ */
+ static int
+-vn_buf_alloc(struct vn_buf *b, vm_size_t size, uint32_t align)
++vn_buf_alloc_mode(struct vn_buf *b, vm_size_t size, uint32_t align, bool wc)
+ {
+ 	size = round_page(size);
+-	uint32_t iova = (vn.iova_next - (uint32_t)size) & ~(align - 1);
+-	if (iova < IOVA_FLOOR || iova > vn.iova_next) {
++	if (size > 0x10000000u) {
++		return EINVAL;
++	}
++	uint32_t iova = vn_iova_alloc((uint32_t)size, align);
++	if (iova == 0) {
+ 		return ENOSPC;
+ 	}
+ 	vm_offset_t kva = 0;
+ 	if (kmem_alloc(kernel_map, &kva, size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		vn_iova_free(iova, (uint32_t)size);
+ 		return ENOMEM;
+ 	}
+ 	sweet_dma_sync_va((const void *)kva, size);
+-	for (vm_size_t o = 0; o < size; o += PAGE_SIZE) {
++	int error = 0;
++	vm_size_t o;
++	for (o = 0; o < size && !error; o += PAGE_SIZE) {
+ 		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(kva + o));
+ 		if (!pn) {
+-			return ENOMEM;
++			error = ENOMEM;
++			break;
++		}
++		if (wc) {
++			pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
+ 		}
+-		pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
+-		int error = sweet_smmu_pt_map(vn.pt, iova + (uint32_t)o, ptoa_64(pn), PAGE_SIZE);
+-		if (error) {
+-			return error;
++		error = sweet_smmu_pt_map(vn.pt, iova + (uint32_t)o, ptoa_64(pn), PAGE_SIZE);
++	}
++	if (error) {
++		sweet_smmu_pt_unmap(vn.pt, iova, (uint32_t)size);
++		for (vm_size_t r = 0; wc && r < o; r += PAGE_SIZE) {
++			ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(kva + r));
++			if (pn) {
++				pmap_set_cache_attributes(pn, VM_WIMG_DEFAULT);
++			}
+ 		}
++		kmem_free(kernel_map, kva, size);
++		vn_iova_free(iova, (uint32_t)size);
++		return error;
+ 	}
+ 	sweet_dma_sync_va((const void *)kva, size);
+-	vn.iova_next = iova;
+ 	b->kva = kva;
+ 	b->size = size;
+ 	b->iova = iova;
++	b->wc = wc;
+ 	return 0;
+ }
+ 
++static int
++vn_buf_alloc(struct vn_buf *b, vm_size_t size, uint32_t align)
++{
++	return vn_buf_alloc_mode(b, size, align, true);
++}
++
++/* Unmapped from Venus first (TLB invalidated), so a late DMA faults in the SMMU instead of landing in freed RAM. */
++static void
++vn_buf_free(struct vn_buf *b)
++{
++	if (!b->kva) {
++		return;
++	}
++	sweet_smmu_pt_unmap(vn.pt, b->iova, (uint32_t)b->size);
++	if (b->wc) {
++		for (vm_size_t o = 0; o < b->size; o += PAGE_SIZE) {
++			ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(b->kva + o));
++			if (pn) {
++				pmap_set_cache_attributes(pn, VM_WIMG_DEFAULT);
++			}
++		}
++	}
++	kmem_free(kernel_map, b->kva, b->size);
++	vn_iova_free(b->iova, (uint32_t)b->size);
++	bzero(b, sizeof(*b));
++}
++
++/* Before the CPU reads what Venus wrote into a cacheable buffer. */
++static void
++vn_buf_sync(const struct vn_buf *b, vm_size_t len)
++{
++	if (b->kva && !b->wc) {
++		sweet_dma_sync_va((const void *)b->kva, MIN(len, b->size));
++	}
++}
++
+ static int
+ vn_smmu(void)
+ {
+@@ -419,7 +526,11 @@ scm_smccc(struct scm_regs *r)
+ 	*r = (struct scm_regs) { { x0, x1, x2, x3, x4, x5, x6 } };
+ }
+ 
+-/* As sweet_a630_pas.c: interrupted calls resumed with the original x1..x5 and TZ's token, busy retried. */
++/*
++ * As sweet_a630_pas.c: interrupted calls resumed with the original x1..x5 and TZ's token, busy retried. Linux
++ * (__scm_smc_do_quirk) resumes without a bound; PAS INIT_IMAGE of Venus came back interrupted 65 times in a row
++ * (boot 1150), so the bound here is time (10 s) with a microsecond between resumes for pending interrupts.
++ */
+ static bool
+ scm_call(const char *name, uint32_t fn, uint32_t arginfo, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+     int32_t *status, int32_t *result)
+@@ -431,22 +542,29 @@ scm_call(const char *name, uint32_t fn, uint32_t arginfo, uint64_t a1, uint64_t
+ 	printf("SWEET VENUS: SCM %s fn=%#x info=%#x args=%#llx/%#llx/%#llx/%#llx\n", name, fn, arginfo, a1, a2, a3, a4);
+ 	sweet_log_sync();
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t deadline = 0, resumes = 0;
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &deadline);
++	deadline += mach_absolute_time();
+ 	for (unsigned busy = 0; busy <= 3 && !done; busy++) {
+ 		r = initial;
+-		unsigned resume;
+-		for (resume = 0; resume <= 64; resume++) {
++		for (;;) {
+ 			scm_smccc(&r);
+ 			if ((int32_t)r.a[0] != SCM_INTERRUPTED) {
+ 				break;
+ 			}
++			if (mach_absolute_time() > deadline) {
++				printf("SWEET VENUS: SCM %s still interrupted after %llu resumes (10 s)\n", name, resumes);
++				return false;
++			}
+ 			uint64_t token = r.a[6];
+ 			r = initial;
+ 			r.a[0] = SCM_INTERRUPTED;
+ 			r.a[6] = token;
++			resumes++;
++			delay(1);
+ 		}
+-		if (resume > 64) {
+-			printf("SWEET VENUS: SCM %s interrupted call did not complete\n", name);
+-			return false;
++		if (resumes) {
++			printf("SWEET VENUS: SCM %s resumed %llu times\n", name, resumes);
+ 		}
+ 		if ((int32_t)r.a[0] != SCM_BUSY) {
+ 			done = true;
+@@ -801,12 +919,17 @@ vn_sfr_print(void)
+ 	printf("SWEET VENUS: SFR: \"%s\"\n", s);
+ }
+ 
++static bool vn_sess_msg(const uint32_t *w, uint32_t size, uint32_t type);
++
+ static void
+ vn_handle_msg(void)
+ {
+ 	const uint32_t *w = vn_pktw;
+ 	uint32_t size = w[0], type = w[1];
+ 	vn.msgs++;
++	if (vn_sess_msg(w, size, type)) {
++		return;
++	}
+ 	switch (type) {
+ 	case HFI_MSG_SYS_INIT: {
+ 		uint32_t err = size >= 16 ? w[2] : ~0u, nprop = size >= 16 ? w[3] : 0;
+@@ -896,7 +1019,7 @@ vn_handle_dbg(void)
+ 
+ /* Drain both queues for up to ms milliseconds, or until done() says so. */
+ static void
+-vn_poll(unsigned ms, bool (*done)(void))
++vn_poll(unsigned ms, bool (*done)(void *), void *arg)
+ {
+ 	bool unsynced = false;
+ 	for (unsigned t = 0; t <= ms; t++) {
+@@ -929,14 +1052,16 @@ vn_poll(unsigned ms, bool (*done)(void))
+ 			}
+ 		}
+ 		unsynced |= any;
+-		if (unsynced && (t % 100 == 0 || (done && done()))) {
++		if (unsynced && (t % 100 == 0 || (done && done(arg)))) {
+ 			sweet_log_sync();
+ 			unsynced = false;
+ 		}
+-		if (done && done()) {
++		if (done && done(arg)) {
+ 			return;
+ 		}
+-		delay(1000);
++		if (t < ms) {
++			delay(1000);
++		}
+ 	}
+ 	if (unsynced) {
+ 		sweet_log_sync();
+@@ -944,8 +1069,9 @@ vn_poll(unsigned ms, bool (*done)(void))
+ }
+ 
+ static bool
+-vn_sys_init_seen(void)
++vn_sys_init_seen(void *arg)
+ {
++#pragma unused(arg)
+ 	return vn.sys_init_done && vn.fw_version[0];
+ }
+ 
+@@ -1002,7 +1128,7 @@ vn_hfi_up(void)
+ 	const uint32_t version[4] = { 16, HFI_CMD_SYS_GET_PROPERTY, 1, HFI_PROP_SYS_IMAGE_VERSION };
+ 	const uint32_t debug[6] = { 24, HFI_CMD_SYS_SET_PROPERTY, 1, HFI_PROP_SYS_DEBUG_CONFIG, HFI_DEBUG_LEVELS,
+ 		                    HFI_DEBUG_MODE_QUEUE };
+-	const uint32_t power[5] = { 20, HFI_CMD_SYS_SET_PROPERTY, 1, HFI_PROP_SYS_CODEC_POWER_PLANE, 0 };
++	const uint32_t power[5] = { 20, HFI_CMD_SYS_SET_PROPERTY, 1, HFI_PROP_SYS_CODEC_POWER_PLANE, 1 };
+ 	error = vn_cmd(sys_init);
+ 	if (!error) {
+ 		error = vn_cmd(version);
+@@ -1017,7 +1143,7 @@ vn_hfi_up(void)
+ 		printf("SWEET VENUS: command queue write failed (%d)\n", error);
+ 		return error;
+ 	}
+-	vn_poll(2000, vn_sys_init_seen);
++	vn_poll(2000, vn_sys_init_seen, NULL);
+ 	vn_smmu_report("after SYS_INIT");
+ 	if (!vn.sys_init_done) {
+ 		printf("SWEET VENUS: no SYS_INIT done in 2 s (cmd rd %u wr %u, msg rd %u wr %u)\n", vn_qhdr(Q_CMD)->read_idx,
+@@ -1029,6 +1155,1025 @@ vn_hfi_up(void)
+ 	return vn.hfi_up ? 0 : EIO;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* milestone 2 (patch 1151): decoder sessions                          */
++/* ------------------------------------------------------------------ */
++
++/*
++ * One HFI decoder session per client, the way Linux vdec.c drives a 4xx core: session init, input size,
++ * core 1, output configuration, buffer counts, internal buffers, LOAD_RESOURCES, START; the first input
++ * buffers until SEQUENCE_CHANGED reports the stream; then the output side ("capture setup"): split mode
++ * with linear NV12 frames on OUTPUT2 for the client and UBWC NV12 reference (DPB) buffers on OUTPUT,
++ * kept by the driver (v4 offers linear NV12 only on OUTPUT2: hfi_platform_v4.c), CONTINUE, every DPB and
++ * output buffer queued (dynamic buffer mode). EBD frees an input buffer, FBD on stream 1 is a decoded
++ * picture, on stream 0 a DPB buffer back (queued again).
++ */
++#define VCC_PLL0        0x42cu          /* video_pll0, Fabia: +0 MODE, +4 L, +0xc USER_CTL, +0x2c OPMODE, +0x38 FRAC */
++#define VCC_GDSC_VC0    0x874u
++#define VCC_VC0_CORE    0x890u
++#define VCC_VC0_AXI     0x930u
++#define WR_VC0_PWR_STATUS 0x90u
++#define WR_VC0_PWR_CTRL   0x94u
++
++#define HFI_CMD_SYS_SESSION_INIT        0x10007u
++#define HFI_CMD_SYS_SESSION_END         0x10008u
++#define HFI_CMD_SESSION_SET_PROPERTY    0x11001u
++#define HFI_CMD_SESSION_SET_BUFFERS     0x11002u
++#define HFI_CMD_SESSION_LOAD_RESOURCES  0x211001u
++#define HFI_CMD_SESSION_START           0x211002u
++#define HFI_CMD_SESSION_STOP            0x211003u
++#define HFI_CMD_SESSION_EMPTY_BUFFER    0x211004u
++#define HFI_CMD_SESSION_FILL_BUFFER     0x211005u
++#define HFI_CMD_SESSION_FLUSH           0x211008u
++#define HFI_CMD_SESSION_GET_PROPERTY    0x211009u
++#define HFI_CMD_SESSION_RELEASE_BUFFERS 0x21100bu
++#define HFI_CMD_SESSION_RELEASE_RESOURCES 0x21100cu
++#define HFI_CMD_SESSION_CONTINUE        0x21100du
++#define HFI_MSG_SYS_SESSION_INIT        0x20006u
++#define HFI_MSG_SYS_SESSION_END         0x20007u
++#define HFI_MSG_SESSION_LOAD_RESOURCES  0x221001u
++#define HFI_MSG_SESSION_START           0x221002u
++#define HFI_MSG_SESSION_STOP            0x221003u
++#define HFI_MSG_SESSION_FLUSH           0x221006u
++#define HFI_MSG_SESSION_EMPTY_BUFFER    0x221007u
++#define HFI_MSG_SESSION_FILL_BUFFER     0x221008u
++#define HFI_MSG_SESSION_PROPERTY_INFO   0x221009u
++#define HFI_MSG_SESSION_RELEASE_RESOURCES 0x22100au
++#define HFI_MSG_SESSION_RELEASE_BUFFERS 0x22100cu
++
++#define HFI_PROP_FRAME_SIZE             0x1001u
++#define HFI_PROP_UNCOMPRESSED_FORMAT    0x1003u
++#define HFI_PROP_PROFILE_LEVEL_CURRENT  0x1005u
++#define HFI_PROP_WORK_MODE              0x1015u
++#define HFI_PROP_VIDEOCORES_USAGE       0x2002u
++#define HFI_PROP_BUFFER_COUNT_ACTUAL    0x201001u
++#define HFI_PROP_BUFFER_ALLOC_MODE      0x201008u
++#define HFI_PROP_BUFFER_SIZE_ACTUAL     0x20100cu
++#define HFI_PROP_BUFFER_REQUIREMENTS    0x202001u
++#define HFI_PROP_VDEC_MULTI_STREAM      0x1003001u
++#define HFI_PROP_VDEC_PIXEL_BITDEPTH    0x1003007u
++#define HFI_PROP_VDEC_PIC_STRUCT        0x1003009u
++#define HFI_PROP_VDEC_COLOUR_SPACE      0x100300au
++#define HFI_PROP_VDEC_DPB_COUNTS        0x120300eu
++#define HFI_PROP_VDEC_ENTROPY           0x1204004u
++#define HFI_INDEX_EXTRADATA_INPUT_CROP  0x0700000eu
++
++#define HFI_BUF_INPUT           1u
++#define HFI_BUF_OUTPUT          2u
++#define HFI_BUF_OUTPUT2         3u
++#define HFI_BUF_PERSIST         4u
++#define HFI_BUF_PERSIST_1       5u
++#define HFI_BUF_SCRATCH         6u
++#define HFI_BUF_SCRATCH_1       7u
++#define HFI_BUF_SCRATCH_2       8u
++#define HFI_BUFFER_MODE_DYNAMIC 0x1000003u
++#define HFI_FMT_NV12            0x2u
++#define HFI_FMT_NV12_UBWC       0x8002u
++#define HFI_DOMAIN_DECODER      2u
++#define HFI_CODEC_H264          0x2u
++#define HFI_EVENT_SESSION_ERROR         0x2u
++#define HFI_EVENT_SEQ_CHANGED           0x1000003u
++#define HFI_EVENT_SEQ_SUFFICIENT        0x1000001u
++#define HFI_EVENT_RELEASE_BUFFER_REF    0x1000006u
++#define HFI_BUFFERFLAG_EOS              0x1u
++#define HFI_FLUSH_ALL                   0x1000004u
++
++#define VS_IN_BUFS      6u
++#define VS_IN_SIZE      (2u << 20)
++#define VS_OUT_BUFS     8u
++#define VS_DPB_MAX      20u
++#define VS_INT_MAX      16u
++#define VS_DONE_Q       32u
++#define VS_MAX          2u
++
++enum { VS_CLOSED, VS_INIT, VS_DECODING, VS_DEAD };
++
++struct vs_done {                        /* a decoded picture waiting for the client */
++	uint32_t index, flags, filled, width, height, ts_hi, ts_lo, picture_type;
++};
++
++struct vn_sess {
++	uint32_t sid, codec, state;
++	uint32_t width, height;             /* coded size the output side is set up for */
++	uint32_t crop_left, crop_top, crop_width, crop_height;
++	uint32_t fw_min_cnt, seq_kind, seq_events;
++	uint32_t opb_size, dpb_size, ystride, yscan, uvscan, in_size, nin;
++	uint32_t wait_type, wait_error;
++	bool wait_done, bufreq_valid, eos_seen, error_seen;
++	uint32_t bufreq[12][8];
++	unsigned nbufreq;
++	struct vn_buf in[VS_IN_BUFS];
++	bool in_busy[VS_IN_BUFS];
++	struct vn_buf intb[VS_INT_MAX];
++	uint32_t int_type[VS_INT_MAX], int_size[VS_INT_MAX];
++	unsigned nint;
++	struct vn_buf dpb[VS_DPB_MAX];
++	bool dpb_fw[VS_DPB_MAX];
++	unsigned ndpb;
++	struct vn_buf out[VS_OUT_BUFS];
++	uint8_t out_state[VS_OUT_BUFS];     /* 0 ours, 1 with the firmware, 2 decoded and waiting for the client */
++	unsigned nout;
++	struct vs_done done[VS_DONE_Q];
++	unsigned done_head, done_tail;
++	uint32_t etb, ebd, ftb, fbd, fbd_empty, dpb_returns, errors;
++};
++
++static struct vn_sess vn_sess_tab[VS_MAX];
++static uint32_t vn_sid_next = 0x5e550001u;
++static bool vn_fast, vn_vc0;
++static uint32_t vn_frames_total, vn_sessions_total;
++
++static uint32_t
++vs_align(uint32_t v, uint32_t a)
++{
++	return (v + a - 1) & ~(a - 1);
++}
++
++/* get_framesize_raw_nv12: Venus's linear NV12 (128-byte stride, 32-line luma, 16-line chroma) */
++static uint32_t
++vs_nv12_size(uint32_t w, uint32_t h)
++{
++	uint32_t stride = vs_align(w, 128), y = stride * vs_align(h, 32);
++	uint32_t uv = stride * vs_align((h + 1) / 2, 16) + 0x1000;
++	return vs_align(y + uv + 0x2000, 0x1000);
++}
++
++/* get_framesize_raw_nv12_ubwc */
++static uint32_t
++vs_nv12_ubwc_size(uint32_t w, uint32_t h)
++{
++	uint32_t y_meta = vs_align(vs_align((w + 31) / 32, 64) * vs_align((h + 7) / 8, 16), 0x1000);
++	uint32_t y = vs_align(vs_align(w, 128) * vs_align(h, 32), 0x1000);
++	uint32_t uv_meta = vs_align(vs_align((w / 2 + 15) / 16, 64) * vs_align((h / 2 + 7) / 8, 16), 0x1000);
++	uint32_t uv = vs_align(vs_align(w, 128) * vs_align(h / 2, 32), 0x1000);
++	uint32_t extra = MAX(0x4000u, vs_align(w, 128) * 48);
++	return vs_align(y_meta + y + uv_meta + uv + extra, 0x1000);
++}
++
++static struct vn_sess *
++vs_by_id(uint32_t sid)
++{
++	for (unsigned i = 0; i < VS_MAX; i++) {
++		if (vn_sess_tab[i].state != VS_CLOSED && vn_sess_tab[i].sid == sid) {
++			return &vn_sess_tab[i];
++		}
++	}
++	return NULL;
++}
++
++/* event_seq_changed: a list of (property id, payload) pairs, event_data2 of them */
++static void
++vs_seq_changed(struct vn_sess *s, const uint32_t *w, uint32_t size)
++{
++	uint32_t n = size >= 24 ? w[5] : 0, o = 6, end = size / 4;
++	s->seq_kind = size >= 20 ? w[4] : 0;
++	s->seq_events++;
++	while (n > 0 && o < end) {
++		uint32_t pt = w[o++];
++		n--;
++		switch (pt) {
++		case HFI_PROP_FRAME_SIZE:               /* buffer_type, width, height */
++			if (o + 3 <= end) {
++				s->width = w[o + 1];
++				s->height = w[o + 2];
++			}
++			o += 3;
++			break;
++		case HFI_PROP_PROFILE_LEVEL_CURRENT:    /* profile, level */
++		case HFI_PROP_VDEC_PIXEL_BITDEPTH:      /* buffer_type, bit_depth */
++			o += 2;
++			break;
++		case HFI_PROP_VDEC_PIC_STRUCT:
++		case HFI_PROP_VDEC_COLOUR_SPACE:
++		case HFI_PROP_VDEC_ENTROPY:
++			o += 1;
++			break;
++		case HFI_PROP_BUFFER_REQUIREMENTS:      /* v4: hold_count is the minimum */
++			if (o + 8 <= end) {
++				s->fw_min_cnt = w[o + 3];
++			}
++			o += 8;
++			break;
++		case HFI_INDEX_EXTRADATA_INPUT_CROP:    /* size, version, port, left, top, width, height */
++			if (o + 7 <= end) {
++				s->crop_left = w[o + 3];
++				s->crop_top = w[o + 4];
++				s->crop_width = w[o + 5];
++				s->crop_height = w[o + 6];
++			}
++			o += 7;
++			break;
++		case HFI_PROP_VDEC_DPB_COUNTS:          /* max_dpb, max_ref, max_dec_buffering, max_reorder, fw_min_cnt */
++			if (o + 5 <= end) {
++				s->fw_min_cnt = w[o + 4];
++			}
++			o += 5;
++			break;
++		default:
++			printf("SWEET VENUS: session %#x: unknown sequence property %#x; rest ignored\n", s->sid, pt);
++			n = 0;
++			break;
++		}
++	}
++	if (s->crop_width == 0 || s->crop_height == 0) {
++		s->crop_left = s->crop_top = 0;
++		s->crop_width = s->width;
++		s->crop_height = s->height;
++	}
++	printf("SWEET VENUS: session %#x: sequence %s: %ux%u, crop %u,%u %ux%u, min buffers %u\n", s->sid,
++	    s->seq_kind == HFI_EVENT_SEQ_SUFFICIENT ? "fits" : "needs more", s->width, s->height, s->crop_left, s->crop_top,
++	    s->crop_width, s->crop_height, s->fw_min_cnt);
++}
++
++/* Session messages; false when the message is not one. */
++static bool
++vn_sess_msg(const uint32_t *w, uint32_t size, uint32_t type)
++{
++	bool session = type == HFI_MSG_SYS_SESSION_INIT || type == HFI_MSG_SYS_SESSION_END ||
++	    (type & 0xfff000u) == 0x221000u || (type == HFI_MSG_EVENT_NOTIFY && size >= 16 && w[3] != HFI_EVENT_SYS_ERROR);
++	if (!session || size < 16) {
++		return false;
++	}
++	struct vn_sess *s = vs_by_id(w[2]);
++	if (s == NULL) {
++		printf("SWEET VENUS: message %#x for unknown session %#x\n", type, w[2]);
++		return true;
++	}
++	switch (type) {
++	case HFI_MSG_SESSION_EMPTY_BUFFER:      /* error, offset, filled, input_tag, packet_buffer */
++		s->ebd++;
++		if (size >= 28 && w[6] < VS_IN_BUFS) {
++			s->in_busy[w[6]] = false;
++		}
++		if (w[3]) {
++			s->errors++;
++			printf("SWEET VENUS: session %#x: input %u returned with error %#x\n", s->sid, size >= 28 ? w[6] : ~0u, w[3]);
++		}
++		return true;
++	case HFI_MSG_SESSION_FILL_BUFFER: {     /* hfi_msg_session_fbd_uncompressed_plane0_pkt */
++		if (size < 96) {
++			printf("SWEET VENUS: session %#x: short FBD (%u bytes)\n", s->sid, size);
++			return true;
++		}
++		uint32_t stream = w[3], err = w[5], flags = w[8], filled = w[13], tag = w[21];
++		s->fbd++;
++		if (err) {
++			s->errors++;
++			printf("SWEET VENUS: session %#x: FBD stream %u tag %u error %#x flags %#x\n", s->sid, stream, tag, err,
++			    flags);
++		}
++		if (flags & HFI_BUFFERFLAG_EOS) {
++			s->eos_seen = true;
++		}
++		if (stream == 0) {
++			s->dpb_returns++;
++			if (tag < s->ndpb) {
++				s->dpb_fw[tag] = false;
++			}
++			return true;
++		}
++		if (tag >= s->nout) {
++			printf("SWEET VENUS: session %#x: FBD for unknown output %u\n", s->sid, tag);
++			return true;
++		}
++		if (filled == 0) {
++			s->fbd_empty++;
++			s->out_state[tag] = 0;
++			return true;
++		}
++		unsigned next = (s->done_tail + 1) % VS_DONE_Q;
++		if (next == s->done_head) {
++			printf("SWEET VENUS: session %#x: done queue full; output %u dropped\n", s->sid, tag);
++			s->out_state[tag] = 0;
++			return true;
++		}
++		s->done[s->done_tail] = (struct vs_done){ tag, flags, filled, w[15], w[16], w[6], w[7], w[22] };
++		s->done_tail = next;
++		s->out_state[tag] = 2;
++		return true;
++	}
++	case HFI_MSG_SESSION_PROPERTY_INFO:
++		if (size >= 20 && w[4] == HFI_PROP_BUFFER_REQUIREMENTS) {
++			unsigned n = MIN((size - 20) / 32, 12u);
++			for (unsigned i = 0; i < n; i++) {
++				memcpy(s->bufreq[i], &w[5 + 8 * i], 32);
++			}
++			s->nbufreq = n;
++			s->bufreq_valid = true;
++		}
++		s->wait_type = type;
++		s->wait_error = 0;
++		s->wait_done = true;
++		return true;
++	case HFI_MSG_EVENT_NOTIFY:
++		switch (w[3]) {
++		case HFI_EVENT_SEQ_CHANGED:
++			vs_seq_changed(s, w, size);
++			break;
++		case HFI_EVENT_RELEASE_BUFFER_REF:
++			printf("SWEET VENUS: session %#x: buffer %#x released (tag %u)\n", s->sid, size >= 28 ? w[6] : 0,
++			    size >= 36 ? w[8] : 0);
++			break;
++		default:
++			printf("SWEET VENUS: session %#x: event %#x data %#x %#x\n", s->sid, w[3], size >= 20 ? w[4] : 0,
++			    size >= 24 ? w[5] : 0);
++			if (w[3] == HFI_EVENT_SESSION_ERROR) {
++				s->error_seen = true;
++			}
++			break;
++		}
++		return true;
++	default:                                /* synchronous replies: error_type follows the session id */
++		s->wait_type = type;
++		s->wait_error = w[3];
++		s->wait_done = true;
++		if (w[3]) {
++			printf("SWEET VENUS: session %#x: reply %#x error %#x\n", s->sid, type, w[3]);
++		}
++		return true;
++	}
++}
++
++static bool
++vs_waited(void *arg)
++{
++	return ((struct vn_sess *)arg)->wait_done;
++}
++
++static int
++vs_send_wait(struct vn_sess *s, const uint32_t *pkt, uint32_t reply, unsigned ms)
++{
++	s->wait_done = false;
++	s->wait_type = 0;
++	s->wait_error = 0;
++	int error = vn_cmd(pkt);
++	if (error) {
++		return error;
++	}
++	vn_poll(ms, vs_waited, s);
++	if (!s->wait_done) {
++		printf("SWEET VENUS: session %#x: no reply %#x to %#x in %u ms\n", s->sid, reply, pkt[1], ms);
++		return ETIMEDOUT;
++	}
++	if (s->wait_type != reply) {
++		printf("SWEET VENUS: session %#x: reply %#x to %#x, expected %#x\n", s->sid, s->wait_type, pkt[1], reply);
++		return EIO;
++	}
++	return s->wait_error ? EIO : 0;
++}
++
++static int
++vs_cmd(struct vn_sess *s, uint32_t type, uint32_t reply)
++{
++	const uint32_t p[3] = { 12, type, s->sid };
++	return reply ? vs_send_wait(s, p, reply, 1000) : vn_cmd(p);
++}
++
++/* HFI_CMD_SESSION_SET_PROPERTY with one property of n (1..3) words; set-property has no reply */
++static int
++vs_prop(struct vn_sess *s, uint32_t ptype, uint32_t a, uint32_t b, uint32_t c, unsigned n)
++{
++	const uint32_t p[8] = { 20 + 4 * n, HFI_CMD_SESSION_SET_PROPERTY, s->sid, 1, ptype, a, b, c };
++	int error = vn_cmd(p);
++	if (error) {
++		printf("SWEET VENUS: session %#x: property %#x not sent (%d)\n", s->sid, ptype, error);
++	}
++	return error;
++}
++
++static int
++vs_get_bufreq(struct vn_sess *s)
++{
++	const uint32_t p[5] = { 20, HFI_CMD_SESSION_GET_PROPERTY, s->sid, 1, HFI_PROP_BUFFER_REQUIREMENTS };
++	s->bufreq_valid = false;
++	int error = vs_send_wait(s, p, HFI_MSG_SESSION_PROPERTY_INFO, 1000);
++	if (!error && !s->bufreq_valid) {
++		error = EIO;
++	}
++	for (unsigned i = 0; !error && i < s->nbufreq; i++) {
++		const uint32_t *r = s->bufreq[i];
++		if (r[1]) {
++			printf("SWEET VENUS: session %#x: buffers type %u: size %u hold %u min %u actual %u align %u\n", s->sid, r[0],
++			    r[1], r[3], r[4], r[5], r[7]);
++		}
++	}
++	return error;
++}
++
++static const uint32_t *
++vs_bufreq(struct vn_sess *s, uint32_t type)
++{
++	for (unsigned i = 0; i < s->nbufreq; i++) {
++		if (s->bufreq[i][0] == type) {
++			return s->bufreq[i];
++		}
++	}
++	return NULL;
++}
++
++/* vdec_output_conf for a 4xx core: split mode, NV12 to the client on OUTPUT2, UBWC DPB on OUTPUT */
++static int
++vs_output_conf(struct vn_sess *s)
++{
++	uint32_t w = s->width, h = s->height, mbs = ((w + 15) / 16) * ((h + 15) / 16);
++	int e = vs_prop(s, HFI_PROP_WORK_MODE, mbs <= 3600 ? 1 : 2, 0, 0, 1);
++	e = e ? e : vs_prop(s, HFI_PROP_UNCOMPRESSED_FORMAT, HFI_BUF_OUTPUT2, HFI_FMT_NV12, 0, 2);
++	e = e ? e : vs_prop(s, HFI_PROP_VDEC_MULTI_STREAM, HFI_BUF_OUTPUT, 0, 0, 2);
++	e = e ? e : vs_prop(s, HFI_PROP_VDEC_MULTI_STREAM, HFI_BUF_OUTPUT2, 1, 0, 2);
++	e = e ? e : vs_prop(s, HFI_PROP_UNCOMPRESSED_FORMAT, HFI_BUF_OUTPUT, HFI_FMT_NV12_UBWC, 0, 2);
++	e = e ? e : vs_prop(s, HFI_PROP_FRAME_SIZE, HFI_BUF_OUTPUT2, w, h, 3);
++	if (e) {
++		return e;
++	}
++	s->ystride = vs_align(w, 128);
++	s->yscan = vs_align(h, 32);
++	s->uvscan = vs_align((h + 1) / 2, 16);
++	s->opb_size = vs_nv12_size(w, h);
++	s->dpb_size = vs_nv12_ubwc_size(w, h);
++	e = vs_get_bufreq(s);
++	if (e) {
++		return e;
++	}
++	const uint32_t *ro = vs_bufreq(s, HFI_BUF_OUTPUT), *ro2 = vs_bufreq(s, HFI_BUF_OUTPUT2);
++	if ((ro && ro[1] > s->dpb_size) || (ro2 && ro2[1] > s->opb_size)) {
++		printf("SWEET VENUS: session %#x: firmware wants %u/%u bytes per DPB/output buffer, more than %u/%u\n", s->sid,
++		    ro ? ro[1] : 0, ro2 ? ro2[1] : 0, s->dpb_size, s->opb_size);
++		s->dpb_size = MAX(s->dpb_size, ro ? ro[1] : 0);
++		s->opb_size = MAX(s->opb_size, ro2 ? ro2[1] : 0);
++	}
++	e = vs_prop(s, HFI_PROP_BUFFER_SIZE_ACTUAL, HFI_BUF_OUTPUT2, s->opb_size, 0, 2);
++	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_SIZE_ACTUAL, HFI_BUF_OUTPUT, s->dpb_size, 0, 2);
++	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_ALLOC_MODE, HFI_BUF_OUTPUT, HFI_BUFFER_MODE_DYNAMIC, 0, 2);
++	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_ALLOC_MODE, HFI_BUF_OUTPUT2, HFI_BUFFER_MODE_DYNAMIC, 0, 2);
++	return e;
++}
++
++/* venus_helper_set_num_bufs (4xx packs count_min_host = count_actual) */
++static int
++vs_num_bufs(struct vn_sess *s)
++{
++	int e = vs_prop(s, HFI_PROP_BUFFER_COUNT_ACTUAL, HFI_BUF_INPUT, s->nin, s->nin, 3);
++	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_COUNT_ACTUAL, HFI_BUF_OUTPUT, 32, 32, 3);
++	e = e ? e : vs_prop(s, HFI_PROP_BUFFER_COUNT_ACTUAL, HFI_BUF_OUTPUT2, 32, 32, 3);
++	return e;
++}
++
++/* intbufs_set_buffer for the 4xx internal types; keep_persist: only the scratch ones (intbufs_realloc) */
++static int
++vs_intbufs(struct vn_sess *s, bool keep_persist)
++{
++	static const uint32_t types[] = { HFI_BUF_SCRATCH, HFI_BUF_SCRATCH_1, HFI_BUF_SCRATCH_2, HFI_BUF_PERSIST,
++		                          HFI_BUF_PERSIST_1 };
++	for (unsigned t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
++		if (keep_persist && (types[t] == HFI_BUF_PERSIST || types[t] == HFI_BUF_PERSIST_1)) {
++			continue;
++		}
++		const uint32_t *r = vs_bufreq(s, types[t]);
++		if (r == NULL || r[1] == 0) {
++			continue;
++		}
++		for (uint32_t i = 0; i < MAX(r[5], 1u); i++) {
++			if (s->nint >= VS_INT_MAX) {
++				return ENOSPC;
++			}
++			struct vn_buf *b = &s->intb[s->nint];
++			int e = vn_buf_alloc_mode(b, r[1], (uint32_t)PAGE_SIZE, true);
++			if (e) {
++				return e;
++			}
++			s->int_type[s->nint] = types[t];
++			s->int_size[s->nint] = r[1];
++			s->nint++;
++			const uint32_t p[9] = { 36, HFI_CMD_SESSION_SET_BUFFERS, s->sid, types[t], r[1], 0, r[1], 1, b->iova };
++			e = vn_cmd(p);
++			if (e) {
++				return e;
++			}
++		}
++	}
++	return 0;
++}
++
++/* intbufs_unset_buffers + free; keep_persist leaves the persist buffers with the firmware */
++static void
++vs_intbufs_release(struct vn_sess *s, bool keep_persist)
++{
++	unsigned kept = 0;
++	for (unsigned i = 0; i < s->nint; i++) {
++		bool persist = s->int_type[i] == HFI_BUF_PERSIST || s->int_type[i] == HFI_BUF_PERSIST_1;
++		if (keep_persist && persist) {
++			s->intb[kept] = s->intb[i];
++			s->int_type[kept] = s->int_type[i];
++			s->int_size[kept] = s->int_size[i];
++			kept++;
++			continue;
++		}
++		if (s->state != VS_DEAD) {
++			const uint32_t p[9] = { 36, HFI_CMD_SESSION_RELEASE_BUFFERS, s->sid, s->int_type[i], s->int_size[i], 0, 1, 1,
++				                s->intb[i].iova };
++			(void)vs_send_wait(s, p, HFI_MSG_SESSION_RELEASE_BUFFERS, 500);
++		}
++		vn_buf_free(&s->intb[i]);
++	}
++	for (unsigned i = kept; i < s->nint; i++) {
++		bzero(&s->intb[i], sizeof(s->intb[i]));
++	}
++	s->nint = kept;
++}
++
++static int
++vs_ftb(struct vn_sess *s, uint32_t stream, uint32_t tag, const struct vn_buf *b, uint32_t len)
++{
++	const uint32_t p[11] = { 44, HFI_CMD_SESSION_FILL_BUFFER, s->sid, stream, 0, len, 0, tag, b->iova, 0, 0 };
++	int e = vn_cmd(p);
++	if (!e) {
++		s->ftb++;
++	}
++	return e;
++}
++
++/* DPB buffers back from the firmware go straight back to it */
++static void
++vs_requeue_dpb(struct vn_sess *s)
++{
++	for (unsigned i = 0; s->state == VS_DECODING && i < s->ndpb; i++) {
++		if (!s->dpb_fw[i] && vs_ftb(s, 0, i, &s->dpb[i], s->dpb_size) == 0) {
++			s->dpb_fw[i] = true;
++		}
++	}
++}
++
++/* video PLL0 at 533 MHz (Fabia, L 27 + 0xc2ab/2^16 of 19.2 MHz) under venus_clk_src: the top of Linux's sdm845 table */
++static void
++vn_clock_fast(void)
++{
++	if (vn_fast) {
++		return;
++	}
++	(void)sweet_rpmh_arc_vote("cx.lvl", true);      /* 533 MHz needs CX turbo (venus OPP table) */
++	uint32_t mode = rd(vn.vcc, VCC_PLL0), opmode = rd(vn.vcc, VCC_PLL0 + 0x2c);
++	printf("SWEET VENUS: video_pll0 mode %#x opmode %#x l %#x frac %#x user %#x\n", mode, opmode, rd(vn.vcc, VCC_PLL0 + 4),
++	    rd(vn.vcc, VCC_PLL0 + 0x38), rd(vn.vcc, VCC_PLL0 + 0xc));
++	if (!((opmode & 1) && (mode & 1))) {
++		/* clk_fabia_pll_configure, then alpha_pll_fabia_enable */
++		wr(vn.vcc, VCC_PLL0 + 4, 27);
++		wr(vn.vcc, VCC_PLL0 + 0x38, 0xc2ab);
++		wr(vn.vcc, VCC_PLL0, rd(vn.vcc, VCC_PLL0) | 1u << 23);         /* UPDATE_BYPASS */
++		wr(vn.vcc, VCC_PLL0, rd(vn.vcc, VCC_PLL0) | 1u << 2);          /* RESET_N */
++		wr(vn.vcc, VCC_PLL0, rd(vn.vcc, VCC_PLL0) & ~1u);              /* OUTCTRL off */
++		wr(vn.vcc, VCC_PLL0 + 0x2c, 0);                                 /* STANDBY */
++		wr(vn.vcc, VCC_PLL0, rd(vn.vcc, VCC_PLL0) | 1u << 2);
++		wr(vn.vcc, VCC_PLL0 + 0x2c, 1);                                 /* RUN */
++		unsigned t;
++		for (t = 0; t < 200 && !(rd(vn.vcc, VCC_PLL0) & CBCR_OFF); t++) {      /* bit 31: LOCK_DET */
++			delay(1);
++		}
++		if (!(rd(vn.vcc, VCC_PLL0) & CBCR_OFF)) {
++			printf("SWEET VENUS: video_pll0 did not lock (mode %#x); core clock stays on XO\n", rd(vn.vcc, VCC_PLL0));
++			return;
++		}
++		wr(vn.vcc, VCC_PLL0 + 0xc, rd(vn.vcc, VCC_PLL0 + 0xc) | 7);   /* main, even, odd outputs */
++		wr(vn.vcc, VCC_PLL0, rd(vn.vcc, VCC_PLL0) | 1);                /* OUTCTRL */
++		printf("SWEET VENUS: video_pll0 locked in %u us (mode %#x)\n", t, rd(vn.vcc, VCC_PLL0));
++	}
++	/* venus_clk_src: PLL0 main (source 1), divider 1 (field 1) */
++	uint32_t cfg = (rd(vn.vcc, VCC_VENUS_RCG + 4) & ~(0x71fu | 3u << 12 | 1u << 20)) | 1u << 8 | 1;
++	wr(vn.vcc, VCC_VENUS_RCG + 4, cfg);
++	wr(vn.vcc, VCC_VENUS_RCG, rd(vn.vcc, VCC_VENUS_RCG) | 1);
++	unsigned t;
++	for (t = 0; t < 500 && (rd(vn.vcc, VCC_VENUS_RCG) & 1); t++) {
++		delay(1);
++	}
++	vn_fast = t < 500;
++	printf("SWEET VENUS: venus_clk_src -> video_pll0 533 MHz: cmd %#x cfg %#x (%s)\n", rd(vn.vcc, VCC_VENUS_RCG),
++	    rd(vn.vcc, VCC_VENUS_RCG + 4), vn_fast ? "updated" : "UPDATE STUCK");
++}
++
++/* poweron_coreid(VIDC_CORE_ID_1) for a 4xx core: vcodec0 GDSC (HW_CTRL), wrapper override, clocks, back to hardware */
++static int
++vn_vcodec0_on(void)
++{
++	if (vn_vc0) {
++		return 0;
++	}
++	static const uint32_t cxcs[] = { VCC_VC0_CORE, VCC_VC0_AXI };
++	if (!vn_gdsc_on(VCC_GDSC_VC0, cxcs, 2, "vcodec0_gdsc")) {
++		return EIO;
++	}
++	wr(vn.vcc, VCC_GDSC_VC0, rd(vn.vcc, VCC_GDSC_VC0) | GDSC_HW_CONTROL);
++	delay(1);
++	wr(vn.venus, WRAPPER + WR_VC0_PWR_CTRL, 0);
++	unsigned t;
++	for (t = 0; t < 100 && !(rd(vn.venus, WRAPPER + WR_VC0_PWR_STATUS) & 2); t++) {
++		delay(1);
++	}
++	printf("SWEET VENUS: vcodec0 power status %#x after %u us (control 0)\n", rd(vn.venus, WRAPPER + WR_VC0_PWR_STATUS), t);
++	bool ok = vn_branch_on(vn.vcc, VCC_VC0_CORE, "video_cc_vcodec0_core_clk") &&
++	    vn_branch_on(vn.vcc, VCC_VC0_AXI, "video_cc_vcodec0_axi_clk");
++	wr(vn.venus, WRAPPER + WR_VC0_PWR_CTRL, 1);
++	for (t = 0; t < 100 && (rd(vn.venus, WRAPPER + WR_VC0_PWR_STATUS) & 2); t++) {
++		delay(1);
++	}
++	printf("SWEET VENUS: vcodec0 power status %#x after %u us (control 1, hardware)\n",
++	    rd(vn.venus, WRAPPER + WR_VC0_PWR_STATUS), t);
++	vn_vc0 = ok;
++	return ok ? 0 : EIO;
++}
++
++static void vs_close(struct vn_sess *s);
++
++/* Up to START; the output side waits for the stream (vs_capture_setup). */
++static int
++vs_open(struct vn_sess **out, uint32_t codec, uint32_t width, uint32_t height)
++{
++	struct vn_sess *s = NULL;
++	if (vn.step < 4) {
++		return ENXIO;
++	}
++	for (unsigned i = 0; i < VS_MAX && s == NULL; i++) {
++		if (vn_sess_tab[i].state == VS_CLOSED) {
++			s = &vn_sess_tab[i];
++		}
++	}
++	if (s == NULL) {
++		return EBUSY;
++	}
++	vn_clock_fast();
++	int e = vn_vcodec0_on();
++	if (e) {
++		return e;
++	}
++	bzero(s, sizeof(*s));
++	s->sid = vn_sid_next++;
++	s->codec = codec;
++	s->width = width;
++	s->height = height;
++	s->nin = VS_IN_BUFS;
++	s->state = VS_INIT;
++	vn_sessions_total++;
++	const uint32_t init[5] = { 20, HFI_CMD_SYS_SESSION_INIT, s->sid, HFI_DOMAIN_DECODER, codec };
++	e = vs_send_wait(s, init, HFI_MSG_SYS_SESSION_INIT, 1000);
++	if (e) {
++		s->state = VS_CLOSED;
++		return e;
++	}
++	e = vs_prop(s, HFI_PROP_FRAME_SIZE, HFI_BUF_INPUT, width, height, 3);
++	e = e ? e : vs_prop(s, HFI_PROP_VIDEOCORES_USAGE, 1, 0, 0, 1);
++	e = e ? e : vs_output_conf(s);
++	if (!e) {
++		const uint32_t *ri = vs_bufreq(s, HFI_BUF_INPUT);
++		s->in_size = (uint32_t)round_page(MAX(VS_IN_SIZE, ri ? ri[1] : 0));
++		if (ri && ri[5] > s->nin) {
++			printf("SWEET VENUS: session %#x: firmware wants %u input buffers, we have %u\n", s->sid, ri[5], s->nin);
++		}
++		e = vs_num_bufs(s);
++	}
++	for (unsigned i = 0; !e && i < s->nin; i++) {
++		e = vn_buf_alloc_mode(&s->in[i], s->in_size, (uint32_t)PAGE_SIZE, true);
++	}
++	e = e ? e : vs_intbufs(s, false);
++	e = e ? e : vs_cmd(s, HFI_CMD_SESSION_LOAD_RESOURCES, HFI_MSG_SESSION_LOAD_RESOURCES);
++	e = e ? e : vs_cmd(s, HFI_CMD_SESSION_START, HFI_MSG_SESSION_START);
++	if (e) {
++		printf("SWEET VENUS: session %#x: open failed (%d)\n", s->sid, e);
++		vs_close(s);
++		return e;
++	}
++	printf("SWEET VENUS: session %#x started: codec %#x %ux%u, %u x %u KiB input, %u internal buffers\n", s->sid, codec,
++	    width, height, s->nin, s->in_size >> 10, s->nint);
++	*out = s;
++	return 0;
++}
++
++/* After the first SEQUENCE_CHANGED: Linux vdec_start_capture's reconfigure path. */
++static int
++vs_capture_setup(struct vn_sess *s)
++{
++	int e = vs_output_conf(s);
++	e = e ? e : vs_num_bufs(s);
++	if (e) {
++		return e;
++	}
++	vs_intbufs_release(s, true);
++	e = vs_get_bufreq(s);
++	e = e ? e : vs_intbufs(s, true);
++	if (e) {
++		return e;
++	}
++	const uint32_t *ro = vs_bufreq(s, HFI_BUF_OUTPUT);
++	uint32_t ndpb = MAX(ro ? ro[3] : 0, s->fw_min_cnt);
++	if (ndpb == 0 || ndpb > VS_DPB_MAX) {
++		printf("SWEET VENUS: session %#x: %u DPB buffers asked for (max %u)\n", s->sid, ndpb, VS_DPB_MAX);
++		ndpb = MIN(MAX(ndpb, 1u), VS_DPB_MAX);
++	}
++	for (unsigned i = 0; i < ndpb; i++, s->ndpb++) {
++		e = vn_buf_alloc_mode(&s->dpb[i], s->dpb_size, (uint32_t)PAGE_SIZE, true);
++		if (e) {
++			return e;
++		}
++	}
++	for (unsigned i = 0; i < VS_OUT_BUFS; i++, s->nout++) {
++		e = vn_buf_alloc_mode(&s->out[i], s->opb_size, (uint32_t)PAGE_SIZE, false);
++		if (e) {
++			return e;
++		}
++	}
++	e = vs_cmd(s, HFI_CMD_SESSION_CONTINUE, 0);
++	if (e) {
++		return e;
++	}
++	s->state = VS_DECODING;
++	vs_requeue_dpb(s);
++	for (unsigned i = 0; i < s->nout; i++) {
++		if (vs_ftb(s, 1, i, &s->out[i], s->opb_size) == 0) {
++			s->out_state[i] = 1;
++		}
++	}
++	printf("SWEET VENUS: session %#x decoding %ux%u: %u DPB x %u KiB (UBWC), %u output x %u KiB (NV12 stride %u, "
++	    "%u+%u lines)\n", s->sid, s->width, s->height, s->ndpb, s->dpb_size >> 10, s->nout, s->opb_size >> 10, s->ystride,
++	    s->yscan, s->uvscan);
++	return 0;
++}
++
++static int
++vs_etb(struct vn_sess *s, unsigned idx, uint32_t len, uint32_t flags, uint64_t ts)
++{
++	const uint32_t p[15] = { 60, HFI_CMD_SESSION_EMPTY_BUFFER, s->sid, (uint32_t)(ts >> 32), (uint32_t)ts, flags, 0, 0, 0,
++		                 s->in_size, len, idx, s->in[idx].iova, 0, 0 };
++	s->in_busy[idx] = true;
++	int e = vn_cmd(p);
++	if (e) {
++		s->in_busy[idx] = false;
++	} else {
++		s->etb++;
++	}
++	return e;
++}
++
++static bool
++vs_seq_seen(void *arg)
++{
++	struct vn_sess *s = arg;
++	return s->seq_events != 0 || s->error_seen;
++}
++
++/* Queue one access unit (or, with len 0, end of stream); the first one waits for the stream's description. */
++static int
++vs_decode(struct vn_sess *s, const void *data, uint32_t len, uint64_t ts, bool eos)
++{
++	if (s->state != VS_INIT && s->state != VS_DECODING) {
++		return ENXIO;
++	}
++	if (len > s->in_size) {
++		return E2BIG;
++	}
++	unsigned idx = s->nin;
++	for (unsigned tries = 0; idx == s->nin && tries < 2000; tries++) {
++		for (unsigned i = 0; i < s->nin; i++) {
++			if (!s->in_busy[i]) {
++				idx = i;
++				break;
++			}
++		}
++		if (idx == s->nin) {
++			vn_poll(1, NULL, NULL);
++		}
++	}
++	if (idx == s->nin) {
++		printf("SWEET VENUS: session %#x: no input buffer came back in 2 s\n", s->sid);
++		return ETIMEDOUT;
++	}
++	if (len) {
++		memcpy((void *)s->in[idx].kva, data, len);
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	int e = vs_etb(s, idx, len, eos ? HFI_BUFFERFLAG_EOS : 0, ts);
++	if (e || s->state != VS_INIT) {
++		return e;
++	}
++	vn_poll(1000, vs_seq_seen, s);
++	if (s->seq_events == 0) {
++		return 0;               /* not enough of the stream yet */
++	}
++	e = vs_capture_setup(s);
++	if (e) {
++		printf("SWEET VENUS: session %#x: capture setup failed (%d)\n", s->sid, e);
++		s->state = VS_DEAD;
++	}
++	return e;
++}
++
++/* The next decoded picture, or false. The output buffer stays the caller's until vs_release(). */
++static bool
++vs_take(struct vn_sess *s, struct vs_done *d)
++{
++	vs_requeue_dpb(s);
++	if (s->done_head == s->done_tail) {
++		return false;
++	}
++	*d = s->done[s->done_head];
++	s->done_head = (s->done_head + 1) % VS_DONE_Q;
++	vn_buf_sync(&s->out[d->index], s->opb_size);
++	vn_frames_total++;
++	return true;
++}
++
++static int
++vs_release(struct vn_sess *s, uint32_t index)
++{
++	if (index >= s->nout || s->out_state[index] != 2) {
++		return EINVAL;
++	}
++	if (s->state != VS_DECODING) {
++		s->out_state[index] = 0;
++		return 0;
++	}
++	int e = vs_ftb(s, 1, index, &s->out[index], s->opb_size);
++	s->out_state[index] = e ? 0 : 1;
++	return e;
++}
++
++/* vb2_stop_streaming + session deinit: flush, stop, release resources and buffers, end; then the memory goes. */
++static void
++vs_close(struct vn_sess *s)
++{
++	if (s->state == VS_CLOSED) {
++		return;
++	}
++	if (s->state != VS_DEAD) {
++		const uint32_t flush[4] = { 16, HFI_CMD_SESSION_FLUSH, s->sid, HFI_FLUSH_ALL };
++		(void)vs_send_wait(s, flush, HFI_MSG_SESSION_FLUSH, 1000);
++		(void)vs_cmd(s, HFI_CMD_SESSION_STOP, HFI_MSG_SESSION_STOP);
++		(void)vs_cmd(s, HFI_CMD_SESSION_RELEASE_RESOURCES, HFI_MSG_SESSION_RELEASE_RESOURCES);
++	}
++	vs_intbufs_release(s, false);
++	if (s->state != VS_DEAD) {
++		(void)vs_cmd(s, HFI_CMD_SYS_SESSION_END, HFI_MSG_SYS_SESSION_END);
++	}
++	vn_poll(10, NULL, NULL);
++	vn_smmu_report("session close");
++	for (unsigned i = 0; i < s->nin; i++) {
++		vn_buf_free(&s->in[i]);
++	}
++	for (unsigned i = 0; i < s->ndpb; i++) {
++		vn_buf_free(&s->dpb[i]);
++	}
++	for (unsigned i = 0; i < s->nout; i++) {
++		vn_buf_free(&s->out[i]);
++	}
++	printf("SWEET VENUS: session %#x closed: etb %u ebd %u ftb %u fbd %u (empty %u, dpb %u), errors %u\n", s->sid, s->etb,
++	    s->ebd, s->ftb, s->fbd, s->fbd_empty, s->dpb_returns, s->errors);
++	s->state = VS_CLOSED;
++}
++
++/* ------------------------------------------------------------------ */
++/* test: decode an H.264 Annex-B file, MD5 of every picture            */
++/* ------------------------------------------------------------------ */
++
++#define VT_FILE         "/var/root/venus/test.h264"
++#define VT_MAX_AU       2048u
++
++/* Access units of an Annex-B stream: a new one at an AUD/SPS/PPS/SEI or first slice after a slice. */
++static unsigned
++vt_split(const uint8_t *d, uint32_t len, uint32_t *off, uint32_t *alen, unsigned max)
++{
++	unsigned n = 0;
++	bool have_slice = false, open = false;
++	uint32_t start = 0;
++	for (uint32_t i = 0; i + 3 < len && n < max;) {
++		if (!(d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1)) {
++			i++;
++			continue;
++		}
++		uint32_t nal = (i > 0 && d[i - 1] == 0) ? i - 1 : i;
++		unsigned type = d[i + 3] & 0x1f;
++		bool vcl = type >= 1 && type <= 5;
++		bool first = vcl && i + 4 < len && (d[i + 4] & 0x80);  /* first_mb_in_slice == 0 */
++		bool boundary = have_slice && ((!vcl && (type == 6 || type == 7 || type == 8 || type == 9)) || first);
++		if (open && boundary) {
++			off[n] = start;
++			alen[n] = nal - start;
++			n++;
++			have_slice = false;
++			start = nal;
++		} else if (!open) {
++			open = true;
++			start = nal;
++		}
++		have_slice |= vcl;
++		i += 3;
++	}
++	if (open && n < max) {
++		off[n] = start;
++		alen[n] = len - start;
++		n++;
++	}
++	return n;
++}
++
++static void
++vt_md5_frame(struct vn_sess *s, const struct vs_done *d, char hex[33])
++{
++	MD5_CTX ctx;
++	unsigned char md[MD5_DIGEST_LENGTH];
++	const uint8_t *base = (const uint8_t *)s->out[d->index].kva;
++	uint32_t w = s->crop_width, h = s->crop_height;
++	MD5Init(&ctx);
++	for (uint32_t y = 0; y < h; y++) {
++		MD5Update(&ctx, base + (s->crop_top + y) * s->ystride + s->crop_left, w);
++	}
++	const uint8_t *uv = base + s->ystride * s->yscan;
++	for (uint32_t y = 0; y < (h + 1) / 2; y++) {
++		MD5Update(&ctx, uv + (s->crop_top / 2 + y) * s->ystride + s->crop_left, w);
++	}
++	MD5Final(md, &ctx);
++	for (unsigned i = 0; i < MD5_DIGEST_LENGTH; i++) {
++		static const char hx[] = "0123456789abcdef";
++		hex[2 * i] = hx[md[i] >> 4];
++		hex[2 * i + 1] = hx[md[i] & 15];
++	}
++	hex[32] = 0;
++}
++
++static unsigned vt_frames, vt_ms;
++
++static void
++vt_drain(struct vn_sess *s)
++{
++	struct vs_done d;
++	while (vs_take(s, &d)) {
++		char hex[33];
++		vt_md5_frame(s, &d, hex);
++		printf("SWEET VENUS: frame %u ts %u type %#x %ux%u flags %#x md5 %s\n", vt_frames, d.ts_lo / 33333, d.picture_type,
++		    d.width, d.height, d.flags, hex);
++		vt_frames++;
++		(void)vs_release(s, d.index);
++	}
++}
++
++static int
++vn_test_decode(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	if (rootvnode == NULLVP || vnode_lookup(VT_FILE, 0, &vp, ctx) != 0 || vp == NULLVP) {
++		printf("SWEET VENUS: test: no %s\n", VT_FILE);
++		return ENOENT;
++	}
++	if (vnode_size(vp, &size, ctx) != 0 || size <= 0 || size > (16 << 20)) {
++		vnode_put(vp);
++		return EFBIG;
++	}
++	uint8_t *data = kalloc_data((vm_size_t)size, Z_WAITOK);
++	uint32_t *off = kalloc_data(VT_MAX_AU * 2 * sizeof(uint32_t), Z_WAITOK);
++	int resid = 0, e = ENOMEM;
++	if (data && off) {
++		e = vn_rdwr(UIO_READ, vp, (caddr_t)data, (int)size, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	vnode_put(vp);
++	struct vn_sess *s = NULL;
++	if (!e && resid == 0) {
++		uint32_t *alen = off + VT_MAX_AU;
++		unsigned nau = vt_split(data, (uint32_t)size, off, alen, VT_MAX_AU);
++		printf("SWEET VENUS: test: %s, %lld bytes, %u access units\n", VT_FILE, (long long)size, nau);
++		uint64_t t0 = mach_absolute_time();
++		vt_frames = 0;
++		e = vs_open(&s, HFI_CODEC_H264, 1280, 720);
++		for (unsigned i = 0; !e && i < nau; i++) {
++			e = vs_decode(s, data + off[i], alen[i], (uint64_t)i * 33333, false);
++			vn_poll(0, NULL, NULL);
++			vt_drain(s);
++		}
++		if (!e) {
++			e = vs_decode(s, NULL, 0, 0, true);
++		}
++		for (unsigned t = 0; !e && t < 2000 && !s->eos_seen && !s->error_seen; t++) {
++			vn_poll(1, NULL, NULL);
++			vt_drain(s);
++		}
++		vn_poll(5, NULL, NULL);
++		vt_drain(s);
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		vt_ms = (unsigned)(ns / 1000000);
++		printf("SWEET VENUS: test: %u of %u pictures in %u ms (eos %u, error %d, session error %u)\n", vt_frames, nau,
++		    vt_ms, s ? s->eos_seen : 0, e, s ? s->error_seen : 0);
++		if (s) {
++			vs_close(s);
++		}
++	}
++	if (data) {
++		kfree_data(data, (vm_size_t)size);
++	}
++	if (off) {
++		kfree_data(off, VT_MAX_AU * 2 * sizeof(uint32_t));
++	}
++	sweet_log_sync();
++	return e;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* control                                                             */
+ /* ------------------------------------------------------------------ */
+@@ -1095,15 +2240,18 @@ sweet_venus_ctl_sysctl SYSCTL_HANDLER_ARGS
+ 		break;
+ 	case 2:
+ 		if (vn.step >= 3) {
+-			vn_poll(100, NULL);
++			vn_poll(100, NULL, NULL);
+ 			vn_smmu_report("poll");
+ 		}
+ 		break;
++	case 4:
++		error = vn.step >= 4 ? vn_test_decode() : ENXIO;
++		break;
+ 	case 3:
+ 		if (vn.step >= 4) {
+ 			const uint32_t ping[3] = { 12, HFI_CMD_SYS_PING, 0xbe11 + vn.pings };
+ 			error = vn_cmd(ping);
+-			vn_poll(500, NULL);
++			vn_poll(500, NULL, NULL);
+ 		} else {
+ 			error = ENXIO;
+ 		}
+@@ -1117,20 +2265,22 @@ sweet_venus_ctl_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_venus_ctl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_venus_ctl_sysctl,
+-    "I", "Venus: 1 bring-up (power, firmware, HFI), 2 poll the queues, 3 ping");
++    "I", "Venus: 1 bring-up (power, firmware, HFI), 2 poll the queues, 3 ping, 4 decode /var/root/venus/test.h264");
+ 
+ static int
+ sweet_venus_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(arg1, arg2)
+-	char buf[512];
++	char buf[640];
+ 	uint32_t cs = vn.powered ? rd(vn.venus, CPU_CS + CS_ARG0) : 0;
+ 	snprintf(buf, sizeof(buf),
+ 	    "step=%u error=%d where=%s powered=%u fw=%u hfi=%u hw=%#x init_status=%#x arg0=%#x sys_init=%u/%#x "
+-	    "dec=%#x enc=%#x max_sessions=%u msgs=%u dbgs=%u events=%u last_event=%#x pings=%u uc=%#x fw_version=%s",
++	    "dec=%#x enc=%#x max_sessions=%u msgs=%u dbgs=%u events=%u last_event=%#x pings=%u uc=%#x fast=%u vcodec0=%u "
++	    "sessions=%u frames=%u test_frames=%u test_ms=%u fw_version=%s",
+ 	    vn.step, vn.error, vn.where[0] ? vn.where : "-", vn.powered, vn.fw_running, vn.hfi_up, vn.hw_version,
+ 	    vn.init_status, cs, vn.sys_init_done, vn.sys_init_error, vn.dec_codecs, vn.enc_codecs, vn.max_sessions, vn.msgs,
+-	    vn.dbgs, vn.events, vn.last_event, vn.pings, vn.uc.iova, vn.fw_version[0] ? vn.fw_version : "-");
++	    vn.dbgs, vn.events, vn.last_event, vn.pings, vn.uc.iova, vn_fast, vn_vc0, vn_sessions_total, vn_frames_total,
++	    vt_frames, vt_ms, vn.fw_version[0] ? vn.fw_version : "-");
+ 	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
+ 
