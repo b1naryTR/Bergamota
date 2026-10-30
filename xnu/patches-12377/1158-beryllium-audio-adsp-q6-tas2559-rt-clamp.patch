@@ -1,0 +1,4938 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5074559..5743017 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,8 @@ bsd/dev/sweet_fb.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/sweet_venus.c			standard
++bsd/dev/sweet_audio.c			standard
++bsd/dev/sweet_tas2559.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/sweet_80211.c			standard
+ bsd/dev/sweet_wpa.c			standard
+diff --git a/bsd/dev/sweet_audio.c b/bsd/dev/sweet_audio.c
+new file mode 100644
+index 0000000..61e3cfa
+--- /dev/null
++++ b/bsd/dev/sweet_audio.c
+@@ -0,0 +1,2662 @@
++/*
++ * SWEET audio, Poco F1 (SDM845): the Hexagon ADSP's audio services and the TAS2559/TAS2560 speaker amplifiers,
++ * behind the IOKit service SweetAudio (iokit/Kernel/arm/SweetAudio.cpp) that audiomxd's HAL plug-in
++ * (audio/hal/SweetAudio.driver in the Bergamota repo) drives. Patch 1158. At boot only the service is
++ * published; the hardware starts with the first client START or `sweetsysctl kern.sweet_audio_ctl=N`, and
++ * kern.sweet_audio reports where it got. Every step logs "SWEET AUDIO:".
++ *
++ *   ADSP   PAS 1 through TrustZone: adsp.mbn (ELF32, relocatable) into adsp_mem 0x8c500000 (30 MiB); AOSS QMP
++ *          "load_state adsp on" and CX at its maximum level (qcom_q6v5_prepare + the proxy power domain), then
++ *          AUTH_AND_RESET. The ADSP's SMP2P item 443 entry "slave-kernel" says fatal (bit 0), ready (1),
++ *          handover (2); ours (item 429) carries "master-kernel". SMP2P doorbell: apss_shared+0xc bit 10.
++ *   GLINK  the "lpass" SMEM edge (remote pid 2, partition 0<->2): descriptor 478 and FIFO 479 are ours, FIFO 480
++ *          the ADSP's; doorbell bit 8. The ADSP opens "apr_audio_svc"; we answer and give it 20 x 512-byte
++ *          reusable intents (qcom,intents = <512 20>). Other channels it opens are logged and left alone.
++ *   APR    over that channel, apps (domain 5) -> adsp (4): AVCS core 3 (ready query), AFE 4, ASM 7, ADM 8.
++ *   Path   AFE clock QUAD_MI2S_IBIT (48 kHz x 2 x 16 bit = 1.536 MHz, CPU master as sdm845.c), I2S config of
++ *          QUATERNARY_MI2S_RX (0x1006: SD0, stereo, WS internal), DEVICE_START; ASM session 1 maps the ring (one
++ *          region; apps_smmu SID 0x1821, its low nibble in address bits 32..35 as q6asm-dai does), OPEN_WRITE_V3
++ *          multichannel PCM, ADM COPP on the port (NULL_COPP_TOPOLOGY) + matrix map, MEDIA_FMT, RUN, then
++ *          WRITE_V2 period by period, each re-queued when WRITE_DONE for an earlier one comes back.
++ *   Amps   TAS2559 (0x4c, left) + TAS2560 (0x4d, right) on QUP0 SE5's pins 85/86, bit-banged as the touch bus
++ *          (this SE's firmware is GSI-only); resets GPIO 12/76; their firmware tas2559_uCDSP.bin is parsed and
++ *          loaded by sweet_tas2559.c. They power up after the I2S clocks run and go down before they stop.
++ *
++ * Ring (SweetAudioABI.h): 16 periods of 512 stereo 16-bit frames, write-combined, mapped read/write into the
++ * client; frame f of the stream lives at (f % 8192) * 4. Three periods are queued at the DSP; a consumed period
++ * is zeroed (so a client that stops writing gives silence) and frames_done/host_time advance in the status
++ * page, which the plug-in turns into zero timestamps. STOP keeps the path running on silence; it is torn down
++ * after kern.sweet_audio_idle_s (15) idle seconds.
++ *
++ * Firmware (kept out of git): /usr/standalone/firmware/sweet/adsp.mbn and tas2559_uCDSP.bin (the beryllium images
++ * of the sdm845-mainline firmware-xiaomi-beryllium repo). Numbers and sequences from Linux
++ * drivers/remoteproc/qcom_q6v5_pas.c + qcom_q6v5.c, drivers/soc/qcom/smp2p.c + apr.c,
++ * drivers/rpmsg/qcom_glink_native.c + qcom_glink_smem.c, sound/soc/qcom/qdsp6 (q6afe, q6adm, q6asm, q6core,
++ * q6asm-dai, q6routing), sound/soc/qcom/sdm845.c, the sdm845/beryllium device trees and the phone's live DT
++ * (GPL-2.0: numbers and sequences only, no code copied); the SMEM/SMP2P/GLINK/QMP mechanics follow
++ * beryllium_wlan.c's modem edge.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <sys/sysctl.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++#include <pexpert/pexpert.h>
++#include <mach/mach_time.h>
++#include "sweet_board.h"
++#include "sweet_tas2559.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void sweet_log_sync(void);               /* sweet_ufs.c */
++extern kern_return_t thread_terminate(thread_t); /* not in the BSD view of kern/thread.h */
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, int, thread_t *);
++extern vnode_t rootvnode;
++extern int sweet_rpmh_arc_vote(const char *res, bool max);
++extern int sweet_smmu_probe_sid(unsigned sid, unsigned level);
++struct sweet_smmu_pt;
++extern int sweet_smmu_pt_create(const unsigned *sids, unsigned nsid, struct sweet_smmu_pt **out);
++extern int sweet_smmu_pt_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t pa, uint32_t len);
++extern uint32_t sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uint32_t *fsynr0);
++
++#define AU_LOG(fmt, ...)        printf("SWEET AUDIO: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- addresses (sdm845.dtsi, live DT) */
++#define AU_SMEM_PA              0x86000000u     /* smem reserved-memory */
++#define AU_SMEM_SIZE            0x00200000u
++#define AU_MUTEX_PA             0x01f40000u     /* tcsr_mutex, stride 0x1000 */
++#define AU_SMEM_HWLOCK          3u
++#define AU_APSS_SHARED_PA       0x17990000u     /* +0xc: IPC doorbell (qcom-apcs-ipc sdm845) */
++#define AU_QMP_PA               0x0c300000u     /* aoss_qmp message RAM */
++#define AU_TLMM_NORTH_PA        0x03900000u     /* TLMM 0x3400000 + tile */
++#define AU_TLMM_SOUTH_PA        0x03d00000u
++#define AU_TLMM_EAST_PA         0x03500000u
++
++#define ADSP_PAS_ID             1u
++#define ADSP_MEM_PA             0x8c500000u     /* adsp_mem (beryllium moves it here) */
++#define ADSP_MEM_SIZE           0x01e00000u
++#define ADSP_HOST               2u              /* SMEM host id = GLINK/SMP2P remote pid */
++#define ADSP_SMP2P_IN_ITEM      443u            /* smp2p-lpass qcom,smem = <443>, <429>: [0] in, [1] out */
++#define ADSP_SMP2P_OUT_ITEM     429u
++#define ADSP_SMP2P_DOORBELL     10u
++#define ADSP_GLINK_DOORBELL     8u
++#define ADSP_CRASH_ITEM         423u            /* qcom,smem-id 0x1a7 */
++#define SMP2P_MAGIC             0x504d5324u     /* "$SMP" */
++#define SMP2P_MAX_ENTRY         16u
++#define SMP2P_ITEM_SIZE         (20u + SMP2P_MAX_ENTRY * 20u)
++#define SMP2P_FEATURE_SSR_ACK   1u
++
++#define GLINK_DESC_ITEM         478u
++#define GLINK_TX_ITEM           479u
++#define GLINK_RX_ITEM           480u
++#define GLINK_TX_SIZE           0x4000u
++#define GLINK_FEATURE_REUSE     1u
++#define GLINK_LCID              1u              /* our id for apr_audio_svc on this edge */
++#define GLINK_CHANNEL           "apr_audio_svc"
++#define GLINK_INTENTS           20u
++#define GLINK_INTENT_SIZE       512u
++#define GLINK_MAX_LINTENTS      24u
++#define GLINK_MAX_RINTENTS      64u
++#define GLINK_MSG_MAX           4096u
++
++enum { G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4, G_INTENT = 5, G_RX_DONE = 6,
++       G_RX_INTENT_REQ = 7, G_RX_INTENT_REQ_ACK = 8, G_TX_DATA = 9, G_CLOSE_ACK = 11, G_TX_DATA_CONT = 12,
++       G_READ_NOTIF = 13, G_RX_DONE_W_REUSE = 14, G_SIGNALS = 15 };
++
++/* ---- APR (include/linux/soc/qcom/apr.h, dt-bindings/soc/qcom,apr.h) */
++#define APR_HDR_SIZE            20u
++#define APR_SEQ_CMD_HDR_FIELD   ((2u << 8) | ((APR_HDR_SIZE / 4u) << 4))
++#define APR_DOMAIN_ADSP         4u
++#define APR_DOMAIN_APPS         5u
++#define APR_SVC_CORE            3u
++#define APR_SVC_AFE             4u
++#define APR_SVC_ASM             7u
++#define APR_SVC_ADM             8u
++#define APR_BASIC_RSP_RESULT    0x000110E8u
++#define APR_RSP_ACCEPTED        0x000100BEu
++
++#define AVCS_CMD_ADSP_EVENT_GET_STATE           0x0001290Cu
++#define AVCS_CMDRSP_ADSP_EVENT_GET_STATE        0x0001290Du
++
++#define AFE_PORT_CMD_DEVICE_START               0x000100E5u
++#define AFE_PORT_CMD_DEVICE_STOP                0x000100E6u
++#define AFE_PORT_CMD_SET_PARAM_V2               0x000100EFu
++#define AFE_SVC_CMD_SET_PARAM                   0x000100f3u
++#define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020Cu
++#define AFE_PARAM_ID_I2S_CONFIG                 0x0001020Du
++#define AFE_MODULE_CLOCK_SET                    0x0001028Fu
++#define AFE_PARAM_ID_CLOCK_SET                  0x00010290u
++#define AFE_PORT_ID_QUATERNARY_MI2S_RX          0x1006u
++#define Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT       0x106u
++#define Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO     1u
++#define AFE_PORT_CONFIG_SIZE                    32u     /* sizeof(union afe_port_config), as q6afe_port_start sends */
++
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5          0x00010325u
++#define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
++#define ADM_CMD_DEVICE_CLOSE_V5                 0x00010327u
++#define ADM_CMDRSP_DEVICE_OPEN_V5               0x00010329u
++#define ADM_PATH_PLAYBACK                       1u
++#define ADM_MATRIX_ID_AUDIO_RX                  0u
++#define NULL_COPP_TOPOLOGY                      0x00010312u
++
++#define ASM_STREAM_CMD_CLOSE                    0x00010BCDu
++#define ASM_STREAM_POSTPROC_TOPO_ID_NONE        0x00010C68u     /* ASM_NULL_POPP_TOPOLOGY */
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS          0x00010D92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS       0x00010D93u
++#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS        0x00010D94u
++#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2        0x00010D98u
++#define ASM_DATA_EVENT_WRITE_DONE_V2            0x00010D99u
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2      0x00010DA5u
++#define ASM_SESSION_CMD_RUN_V2                  0x00010DAAu
++#define ASM_DATA_CMD_WRITE_V2                   0x00010DABu
++#define ASM_STREAM_CMD_OPEN_WRITE_V3            0x00010DB3u
++#define ADSP_MEMORY_MAP_SHMEM8_4K_POOL          3u
++#define ASM_SESSION                             1u
++#define ASM_STREAM                              1u
++#define ASM_PORT                                ((ASM_SESSION << 8) | ASM_STREAM)
++
++/* ---- the ring (SweetAudioABI.h) */
++#define AU_PERIOD_FRAMES        512u
++#define AU_NPER                 16u
++#define AU_RING_FRAMES          (AU_PERIOD_FRAMES * AU_NPER)
++#define AU_FRAME_BYTES          4u
++#define AU_PERIOD_BYTES         (AU_PERIOD_FRAMES * AU_FRAME_BYTES)
++#define AU_RING_BYTES           (AU_RING_FRAMES * AU_FRAME_BYTES)
++#define AU_QUEUED               3u              /* periods at the DSP */
++#define AU_SID                  0x1821u         /* q6asmdai iommus = <&apps_smmu 0x1821 0x0> */
++#define AU_SID_ADDR_BITS        ((uint32_t)(AU_SID & 0xfu))     /* q6asm-dai: phys | (sid << 32) */
++#define AU_RING_IOVA            0x10000000u
++
++/* ---- pins */
++#define PIN_AMP_SDA             85u
++#define PIN_AMP_SCL             86u
++#define PIN_TAS2559_RESET       12u
++#define PIN_TAS2560_RESET       76u
++#define TAS2559_ADDR            0x4cu
++#define TAS2560_ADDR            0x4du
++
++#define AU_FW_MAX               (32u << 20)
++
++/* keep in sync with iokit/Kernel/arm/SweetAudioABI.h */
++#define SWEET_AUDIO_ABI_VERSION         1
++#define SWEET_AUDIO_MEM_RING            0u
++#define SWEET_AUDIO_MEM_STATUS          1u
++enum { SWEET_AUDIO_STATE_STOPPED = 0, SWEET_AUDIO_STATE_RUNNING = 1, SWEET_AUDIO_STATE_IDLE = 2 };
++struct sweet_audio_status {
++	uint32_t version, state, rate, ring_frames, period_frames, queued_periods;
++	volatile uint32_t seq;
++	uint32_t underruns;
++	uint64_t frames_done, host_time, start_host_time;
++	int32_t error;
++	uint32_t reserved[9];
++};
++
++enum { AU_STEP_NONE = 0, AU_STEP_BOOTED = 1, AU_STEP_GLINK = 2, AU_STEP_CHANNEL = 3, AU_STEP_Q6 = 4,
++       AU_STEP_PATH = 5 };
++
++struct au_lintent {
++	uint32_t id, size, off;
++	uint8_t *buf;
++	bool bad;
++};
++struct au_rintent {
++	uint32_t id, size;
++	bool valid, used;
++};
++struct au_rsp {
++	bool valid;
++	uint8_t svc;
++	uint32_t opcode, token;
++	uint32_t w[4];
++};
++
++static LCK_GRP_DECLARE(au_lck_grp, "sweet_audio");
++static LCK_MTX_DECLARE(au_mtx, &au_lck_grp);
++
++static struct {
++	vm_offset_t smem, mutex, ipc, qmp, tlmm_n, tlmm_s, tlmm_e;
++	unsigned step;
++	int error;
++	char where[64];
++	bool thread, adsp_up, adsp_fatal, handover;
++	uint32_t smp2p_out, smp2p_in_last;
++	bool smp2p_nego, ssr_ack;
++	struct {
++		uint32_t desc, tx, tx_len, rx, rx_len, features;
++		bool version_acked, bad_rx, open_acked, closed;
++		uint32_t rcid, next_liid, rx_msgs, tx_msgs, other_opens;
++		struct au_lintent li[GLINK_MAX_LINTENTS];
++		struct au_rintent ri[GLINK_MAX_RINTENTS];
++		bool intent_asked;
++	} g;
++	struct au_rsp rsp[8];
++	uint32_t apr_rx, apr_tx, apr_bad, apr_events, last_event;
++	uint32_t avcs_state;
++	struct sweet_smmu_pt *pt;
++	vm_offset_t ring, status;
++	ppnum_t ring_pn;
++	uint32_t mem_handle, copp_id, rate, bits;
++	bool afe_clk, afe_started, mapped, asm_open, adm_open, running, idle, tone;
++	uint64_t next_seq, done_seq, idle_since;
++	uint32_t inflight, write_dones, write_errors, starts, stops;
++	bool amps_on, amps_tried, amps_loaded;
++	int amp_error, tas_config;
++	uint8_t *tas_fw;
++	size_t tas_fw_len;
++	struct tas_fw tfw;
++	bool tas_ready;
++} au;
++
++static unsigned au_idle_s = 15;         /* kern.sweet_audio_idle_s: teardown after this long without START */
++static unsigned au_clients = 0;         /* kern.sweet_audio_clients: client STARTs allowed (0 while bring-up is new) */
++static unsigned au_amps = 1;            /* kern.sweet_audio_amps: power the amplifiers with the path */
++static unsigned au_tone_s = 3;          /* kern.sweet_audio_tone_s: ctl 2 plays this long */
++static int au_program = -1, au_config = -1;     /* kern.sweet_audio_tas_program/config: -1 = the module's choice */
++static unsigned au_tas_flags = 0;       /* kern.sweet_audio_tas_flags: TAS_FLAG_YCRC 1 (read back YRAM), _NO_FAILSAFE 2 */
++static unsigned au_i2c_half_us = 2;     /* kern.sweet_audio_i2c_half_us: half an SCL period (2 = ~200 kHz, 5 = ~100 kHz) */
++
++/* ------------------------------------------------------------------ */
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb sy" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb sy" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint64_t
++au_now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ull;
++}
++
++static void
++au_sleep_ms(unsigned ms)
++{
++	delay(ms * 1000);
++}
++
++static int
++au_fail(const char *where, int error)
++{
++	strlcpy(au.where, where, sizeof(au.where));
++	au.error = error;
++	AU_LOG("FAILED at %s (error %d)", where, error);
++	sweet_log_sync();
++	return error;
++}
++
++static bool
++au_map(void)
++{
++	if (!au.smem) {
++		au.smem = ml_io_map(AU_SMEM_PA, AU_SMEM_SIZE);
++	}
++	if (!au.mutex) {
++		au.mutex = ml_io_map(AU_MUTEX_PA, 0x4000);
++	}
++	if (!au.ipc) {
++		au.ipc = ml_io_map(AU_APSS_SHARED_PA, 0x1000);
++	}
++	if (!au.qmp) {
++		au.qmp = ml_io_map(AU_QMP_PA, 0x1000);
++	}
++	if (!au.tlmm_n) {
++		au.tlmm_n = ml_io_map(AU_TLMM_NORTH_PA, 0x40000);
++	}
++	if (!au.tlmm_s) {
++		au.tlmm_s = ml_io_map(AU_TLMM_SOUTH_PA, 0x10000);
++	}
++	if (!au.tlmm_e) {
++		au.tlmm_e = ml_io_map(AU_TLMM_EAST_PA, 0x58000);
++	}
++	return au.smem && au.mutex && au.ipc && au.qmp && au.tlmm_n && au.tlmm_s && au.tlmm_e;
++}
++
++/* ------------------------------------------------------------------ */
++/* files                                                               */
++/* ------------------------------------------------------------------ */
++
++static const char *const au_fw_dirs[] = { "/usr/standalone/firmware/sweet/", "/usr/local/share/firmware/" };
++
++/* Opens name in the firmware directories (vnode with an iocount; vnode_put when done). */
++static vnode_t
++au_file_open(const char *name, off_t *size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	if (rootvnode == NULLVP) {
++		return NULLVP;
++	}
++	for (unsigned i = 0; i < sizeof(au_fw_dirs) / sizeof(au_fw_dirs[0]); i++) {
++		char path[128];
++		vnode_t vp = NULLVP;
++		snprintf(path, sizeof(path), "%s%s", au_fw_dirs[i], name);
++		if (vnode_lookup(path, 0, &vp, ctx) != 0 || vp == NULLVP) {
++			continue;
++		}
++		if (vnode_size(vp, size, ctx) != 0 || *size <= 0 || *size > AU_FW_MAX) {
++			vnode_put(vp);
++			continue;
++		}
++		AU_LOG("firmware %s, %lld bytes", path, (long long)*size);
++		return vp;
++	}
++	return NULLVP;
++}
++
++static int
++au_file_read(vnode_t vp, off_t off, void *buf, uint32_t len)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	int resid = 0;
++	int error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)len, off, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	return error ? error : (resid ? EIO : 0);
++}
++
++/* ------------------------------------------------------------------ */
++/* SCM / PAS (as sweet_venus.c)                                        */
++/* ------------------------------------------------------------------ */
++
++#define SCM_64          0x40000000u
++#define SCM_SIP         0x02000000u
++#define SCM_INTERRUPTED 1
++#define SCM_BUSY        (-12)
++#define SCM_FN(svc, cmd) (SCM_64 | SCM_SIP | (svc) << 8 | (cmd))
++
++struct au_scm_regs {
++	uint64_t a[7];
++};
++
++static void
++au_smccc(struct au_scm_regs *r)
++{
++	register uint64_t x0 __asm__("x0") = r->a[0];
++	register uint64_t x1 __asm__("x1") = r->a[1];
++	register uint64_t x2 __asm__("x2") = r->a[2];
++	register uint64_t x3 __asm__("x3") = r->a[3];
++	register uint64_t x4 __asm__("x4") = r->a[4];
++	register uint64_t x5 __asm__("x5") = r->a[5];
++	register uint64_t x6 __asm__("x6") = r->a[6];
++	register uint64_t x7 __asm__("x7") = 0;
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++	    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	*r = (struct au_scm_regs) { { x0, x1, x2, x3, x4, x5, x6 } };
++}
++
++/* interrupted calls resumed with TZ's token for at most 10 s, busy retried (sweet_venus.c scm_call) */
++static bool
++au_scm_call(const char *name, uint32_t fn, uint32_t arginfo, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
++    int32_t *status, int32_t *result)
++{
++	const struct au_scm_regs initial = { { fn, arginfo, a1, a2, a3, a4, 0 } };
++	struct au_scm_regs r;
++	bool done = false;
++
++	AU_LOG("SCM %s fn=%#x info=%#x args=%#llx/%#llx/%#llx/%#llx", name, fn, arginfo, a1, a2, a3, a4);
++	sweet_log_sync();
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t deadline = 0, resumes = 0;
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &deadline);
++	deadline += mach_absolute_time();
++	for (unsigned busy = 0; busy <= 3 && !done; busy++) {
++		r = initial;
++		for (;;) {
++			au_smccc(&r);
++			if ((int32_t)r.a[0] != SCM_INTERRUPTED) {
++				break;
++			}
++			if (mach_absolute_time() > deadline) {
++				AU_LOG("SCM %s still interrupted after %llu resumes (10 s)", name, resumes);
++				return false;
++			}
++			uint64_t token = r.a[6];
++			r = initial;
++			r.a[0] = SCM_INTERRUPTED;
++			r.a[6] = token;
++			resumes++;
++			delay(1);
++		}
++		if ((int32_t)r.a[0] != SCM_BUSY) {
++			done = true;
++		} else {
++			delay(30000);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*status = (int32_t)r.a[0];
++	*result = (int32_t)r.a[1];
++	AU_LOG("SCM %s completed=%u status=%d result=%d resumes=%llu", name, done, *status, *result, resumes);
++	sweet_log_sync();
++	return done;
++}
++
++static bool
++au_pas(const char *name, uint32_t cmd, uint32_t arginfo, uint64_t a2, uint64_t a3)
++{
++	int32_t status = -1, result = -1;
++	return au_scm_call(name, SCM_FN(2, cmd), arginfo, ADSP_PAS_ID, a2, a3, 0, &status, &result) && status == 0 &&
++	       result == 0;
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++/*
++ * qcom_mdt_load(): INIT_IMAGE with the header block + hash segment (physically contiguous metadata), MEM_SETUP of
++ * the carve-out, the loadable segments copied (relocated) through a 1 MiB bounce buffer, straight from the file.
++ * AUTH_AND_RESET is left to the caller (it comes after load_state and the proxy votes).
++ */
++static int
++au_adsp_load(void)
++{
++	off_t fsize = 0;
++	vnode_t vp = au_file_open("adsp.mbn", &fsize);
++	int error = EINVAL;
++	uint8_t *hdr = NULL, *bounce = NULL;
++	const uint32_t hdr_len = 0x10000, bounce_len = 1u << 20;
++	vm_offset_t meta = 0, region = 0;
++	vm_size_t meta_size = 0;
++
++	if (vp == NULLVP) {
++		AU_LOG("no adsp.mbn in %s or %s", au_fw_dirs[0], au_fw_dirs[1]);
++		return ENOENT;
++	}
++	hdr = kalloc_data(hdr_len, Z_WAITOK | Z_ZERO);
++	bounce = kalloc_data(bounce_len, Z_WAITOK);
++	if (!hdr || !bounce) {
++		error = ENOMEM;
++		goto out;
++	}
++	uint32_t hlen = (uint32_t)MIN((off_t)hdr_len, fsize);
++	if ((error = au_file_read(vp, 0, hdr, hlen)) != 0) {
++		goto out;
++	}
++	error = EINVAL;
++	if (hlen < 52 || le32(hdr) != 0x464c457f || hdr[4] != 1 || hdr[5] != 1 || le16(hdr + 42) != 32) {
++		AU_LOG("adsp.mbn is not an ELF32 image");
++		goto out;
++	}
++	uint32_t phoff = le32(hdr + 28);
++	unsigned phnum = le16(hdr + 44);
++	if (phnum < 2 || phnum > 64 || phoff < 52 || (uint64_t)phoff + 32u * phnum > hlen) {
++		AU_LOG("adsp.mbn program headers out of range (%u at %#x)", phnum, phoff);
++		goto out;
++	}
++	const uint8_t *p0 = hdr + phoff, *p1 = hdr + phoff + 32;
++	uint32_t ehdr_size = le32(p0 + 16), hash_off = le32(p1 + 4), hash_size = le32(p1 + 16);
++	if (le32(p0) == 1 || (le32(p1 + 24) & (7u << 24)) != (2u << 24) || ehdr_size > hlen ||
++	    (uint64_t)hash_off + hash_size > (uint64_t)fsize || ehdr_size + hash_size > 0x10000) {
++		AU_LOG("adsp.mbn has no header block + hash segment (%#x, %#x+%#x)", ehdr_size, hash_off, hash_size);
++		goto out;
++	}
++	uint64_t min_addr = ~0ull, max_addr = 0;
++	bool relocate = false;
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint8_t *p = hdr + phoff + 32 * i;
++		uint32_t type = le32(p), off = le32(p + 4), paddr = le32(p + 12), filesz = le32(p + 16), memsz = le32(p + 20),
++		    flags = le32(p + 24);
++		if (type != 1 || (flags & (7u << 24)) == (2u << 24) || memsz == 0) {
++			continue;
++		}
++		if (filesz > memsz || (uint64_t)off + filesz > (uint64_t)fsize) {
++			AU_LOG("segment %u outside the file", i);
++			goto out;
++		}
++		relocate |= !!(flags & (1u << 27));
++		min_addr = MIN(min_addr, paddr);
++		max_addr = MAX(max_addr, ((uint64_t)paddr + memsz + 0xfff) & ~0xfffull);
++	}
++	if (min_addr == ~0ull || max_addr - min_addr > ADSP_MEM_SIZE || (!relocate && min_addr != ADSP_MEM_PA)) {
++		AU_LOG("image %#llx-%#llx (%s) does not fit adsp_mem", min_addr, max_addr, relocate ? "relocatable" : "fixed");
++		goto out;
++	}
++	uint32_t mem_size = (uint32_t)(max_addr - min_addr);
++	AU_LOG("%s image, %u segments, %#x bytes -> %#x", relocate ? "relocatable" : "fixed", phnum, mem_size, ADSP_MEM_PA);
++
++	meta_size = round_page(ehdr_size + hash_size);
++	if (kmem_alloc_contig(kernel_map, &meta, meta_size, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		error = ENOMEM;
++		goto out;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)meta);
++	for (unsigned i = 1; pn && i < meta_size / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(meta + i * PAGE_SIZE)) != pn + i) {
++			pn = 0;
++		}
++	}
++	if (!pn) {
++		AU_LOG("metadata not physically contiguous");
++		error = ENOMEM;
++		goto out;
++	}
++	memcpy((void *)meta, hdr, ehdr_size);
++	if ((error = au_file_read(vp, hash_off, (void *)(meta + ehdr_size), hash_size)) != 0) {
++		goto out;
++	}
++	sweet_dma_sync_va((const void *)meta, meta_size);
++	for (unsigned i = 0; i < meta_size / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	sweet_dma_sync_va((const void *)meta, meta_size);
++
++	error = EIO;
++	if (!au_pas("PAS INIT_IMAGE", 1, 0x82, ptoa_64(pn), 0)) {   /* SCM_ARGS(2, VAL, RW) */
++		goto out;
++	}
++	if (!au_pas("PAS MEM_SETUP", 2, 3, ADSP_MEM_PA, mem_size)) {
++		goto out_shutdown;
++	}
++	region = ml_io_map_unmappable((vm_offset_t)ADSP_MEM_PA, ADSP_MEM_SIZE, VM_WIMG_WCOMB);
++	if (!region) {
++		AU_LOG("adsp_mem map failed");
++		goto out_shutdown;
++	}
++	bzero((void *)region, mem_size);
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint8_t *p = hdr + phoff + 32 * i;
++		uint32_t type = le32(p), off = le32(p + 4), paddr = le32(p + 12), filesz = le32(p + 16), memsz = le32(p + 20),
++		    flags = le32(p + 24);
++		if (type != 1 || (flags & (7u << 24)) == (2u << 24) || memsz == 0 || filesz == 0) {
++			continue;
++		}
++		uint64_t dst = relocate ? (uint64_t)paddr - min_addr : (uint64_t)paddr - ADSP_MEM_PA;
++		if (dst + memsz > mem_size) {
++			AU_LOG("segment %u outside the image", i);
++			goto out_shutdown;
++		}
++		for (uint32_t done = 0; done < filesz;) {
++			uint32_t n = MIN(filesz - done, bounce_len);
++			if ((error = au_file_read(vp, (off_t)off + done, bounce, n)) != 0) {
++				AU_LOG("segment %u: read error %d at %#x", i, error, done);
++				error = EIO;
++				goto out_shutdown;
++			}
++			memcpy((void *)(region + dst + done), bounce, n);
++			done += n;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	AU_LOG("segments loaded");
++	error = 0;
++	goto out;
++
++out_shutdown:
++	(void)au_pas("PAS SHUTDOWN", 6, 1, 0, 0);
++out:
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	if (hdr) {
++		kfree_data(hdr, hdr_len);
++	}
++	if (bounce) {
++		kfree_data(bounce, bounce_len);
++	}
++	return error;
++}
++
++/* ------------------------------------------------------------------ */
++/* SMEM (qcom/smem.c: private partition apps<->ADSP, hwlock 3)         */
++/* ------------------------------------------------------------------ */
++
++static uint32_t
++smem_u32(uint32_t off)
++{
++	return off + 4 <= AU_SMEM_SIZE ? rd(au.smem, off) : 0;
++}
++
++static bool
++au_smem_part(uint32_t a, uint32_t b, uint32_t *off, uint32_t *psize)
++{
++	uint32_t top = AU_SMEM_SIZE - 0x1000;
++	if (smem_u32(top) != 0x434f5424u) {             /* "$TOC" */
++		return false;
++	}
++	uint32_t n = MIN(smem_u32(top + 8), 32u);
++	for (uint32_t k = 0; k < n; k++) {
++		uint32_t e = top + 32 + k * 48;
++		uint32_t offset = smem_u32(e), size = smem_u32(e + 4), hosts = smem_u32(e + 12);
++		uint32_t h0 = hosts & 0xffff, h1 = hosts >> 16;
++		if (!offset || !size || !((h0 == a && h1 == b) || (h0 == b && h1 == a))) {
++			continue;
++		}
++		if ((uint64_t)offset + size > AU_SMEM_SIZE || smem_u32(offset) != 0x54525024u) {      /* "$PRT" */
++			return false;
++		}
++		*off = offset;
++		*psize = size;
++		return true;
++	}
++	return false;
++}
++
++/* the data offset of an item in the partition of hosts a<->b (0xfffe/0xfffe: the global one), 0 if absent */
++static uint32_t
++au_smem_item(uint32_t a, uint32_t b, uint32_t item, uint32_t *size)
++{
++	uint32_t offset, psize;
++	if (!au_smem_part(a, b, &offset, &psize)) {
++		return 0;
++	}
++	uint32_t free_u = MIN(smem_u32(offset + 12), psize), pos = offset + 32;
++	for (unsigned guard = 0; pos + 16 <= offset + free_u && guard < 512; guard++) {
++		uint32_t w0 = smem_u32(pos), sz = smem_u32(pos + 4), w2 = smem_u32(pos + 8);
++		if ((w0 & 0xffff) != 0xa5a5 || sz > psize) {
++			return 0;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (w2 & 0xffff);
++			return pos + 16 + (w2 >> 16);
++		}
++		pos += 16 + (w2 >> 16) + sz;
++	}
++	return 0;
++}
++
++static bool
++au_smem_lock(void)
++{
++	const uint32_t r = AU_SMEM_HWLOCK * 0x1000;
++	for (unsigned i = 0; i < 1000; i++) {
++		wr(au.mutex, r, 1);
++		if (rd(au.mutex, r) == 1) {
++			return true;
++		}
++		delay(1000);
++	}
++	AU_LOG("SMEM hwlock %u busy (owner %#x)", AU_SMEM_HWLOCK, rd(au.mutex, r));
++	return false;
++}
++
++static void
++au_smem_unlock(void)
++{
++	const uint32_t r = AU_SMEM_HWLOCK * 0x1000;
++	if (rd(au.mutex, r) == 1) {
++		wr(au.mutex, r, 0);
++	}
++}
++
++/* qcom_smem_alloc_private() in the apps<->ADSP partition: an existing item is reused; 0 on failure */
++static uint32_t
++au_smem_alloc(uint32_t item, uint32_t size)
++{
++	uint32_t off, psize, data = 0, have = 0;
++	if (!au_smem_part(0, ADSP_HOST, &off, &psize)) {
++		AU_LOG("no apps<->adsp SMEM partition");
++		return 0;
++	}
++	if (!au_smem_lock()) {
++		return 0;
++	}
++	/* nothing in here prints: the ADSP spins on the same hwlock while we hold it */
++	uint32_t free_u = smem_u32(off + 12), free_c = smem_u32(off + 16), pos = off + 32;
++	int res = -1;                   /* -1 bad, 0 exists, 1 too small, 2 new, 3 full */
++	if (free_u > psize || free_c > psize || free_u > free_c || free_u < 32) {
++		goto out;
++	}
++	while (pos < off + free_u) {
++		uint32_t w0 = smem_u32(pos), sz = smem_u32(pos + 4), w2 = smem_u32(pos + 8);
++		if ((w0 & 0xffff) != 0xa5a5 || sz > psize) {
++			goto out;
++		}
++		if ((w0 >> 16) == item) {
++			have = sz - (w2 & 0xffff);
++			if (have >= size) {
++				data = pos + 16 + (w2 >> 16);
++				res = 0;
++			} else {
++				res = 1;
++			}
++			goto out;
++		}
++		pos += 16 + (w2 >> 16) + sz;
++	}
++	if (pos != off + free_u) {
++		goto out;
++	}
++	uint32_t asize = (size + 7u) & ~7u;
++	if (pos + 16 + asize > off + free_c) {
++		res = 3;
++		goto out;
++	}
++	wr(au.smem, pos, 0xa5a5u | (item << 16));
++	wr(au.smem, pos + 4, asize);
++	wr(au.smem, pos + 8, asize - size);
++	wr(au.smem, pos + 12, 0);
++	wr(au.smem, off + 12, free_u + 16 + asize);
++	data = pos + 16;
++	res = 2;
++out:
++	au_smem_unlock();
++	AU_LOG("SMEM item %u (%u bytes): %s at +%#x", item, size,
++	    res == 2 ? "allocated" : res == 0 ? "exists" : res == 1 ? "TOO SMALL" : res == 3 ? "PARTITION FULL" : "BAD PARTITION",
++	    data);
++	return data;
++}
++
++/* ------------------------------------------------------------------ */
++/* SMP2P with the ADSP                                                 */
++/* ------------------------------------------------------------------ */
++
++static void
++au_smp2p_kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(au.ipc, 12, 1u << ADSP_SMP2P_DOORBELL);
++}
++
++static bool
++au_smp2p_out_setup(void)
++{
++	if (au.smp2p_out) {
++		return true;
++	}
++	uint32_t d = au_smem_alloc(ADSP_SMP2P_OUT_ITEM, SMP2P_ITEM_SIZE);
++	if (!d) {
++		return false;
++	}
++	for (uint32_t k = 0; k < SMP2P_ITEM_SIZE; k += 4) {
++		wr(au.smem, d + k, 0);
++	}
++	wr(au.smem, d + 0, SMP2P_MAGIC);
++	wr(au.smem, d + 4, SMP2P_FEATURE_SSR_ACK << 8);         /* version 0 until the header is complete */
++	wr(au.smem, d + 8, 0u | (ADSP_HOST << 16));             /* local pid 0, remote pid 2 */
++	wr(au.smem, d + 12, SMP2P_MAX_ENTRY);                   /* total 16, valid 0 */
++	wr(au.smem, d + 4, (SMP2P_FEATURE_SSR_ACK << 8) | 1u);
++	au_smp2p_kick();
++	/* the one outbound entry of smp2p-lpass: "master-kernel" (bit 0 = stop) */
++	char name[16] = "master-kernel";
++	for (uint32_t c = 0; c < 16; c += 4) {
++		uint32_t w;
++		memcpy(&w, name + c, 4);
++		wr(au.smem, d + 20 + c, w);
++	}
++	wr(au.smem, d + 36, 0);
++	wr(au.smem, d + 12, SMP2P_MAX_ENTRY | (1u << 16));
++	au_smp2p_kick();
++	au.smp2p_out = d;
++	AU_LOG("smp2p item %u at +%#x: version 1, pid 0->2, entry master-kernel, doorbell bit %u", ADSP_SMP2P_OUT_ITEM, d,
++	    ADSP_SMP2P_DOORBELL);
++	return true;
++}
++
++static void
++au_crash_reason(void)
++{
++	uint32_t sz = 0, it = au_smem_item(0xfffe, 0xfffe, ADSP_CRASH_ITEM, &sz);
++	if (!it || !sz) {
++		AU_LOG("no ADSP crash reason in SMEM (item %u)", ADSP_CRASH_ITEM);
++		return;
++	}
++	char msg[129];
++	uint32_t n = MIN(sz, 128u);
++	for (uint32_t k = 0; k < n; k += 4) {
++		uint32_t w = smem_u32(it + k);
++		memcpy(msg + k, &w, MIN(4u, n - k));
++	}
++	msg[n] = 0;
++	AU_LOG("ADSP crash reason: \"%s\"", msg);
++}
++
++/* one poll of the ADSP's item: negotiation, SSR ack, slave-kernel changes */
++static void
++au_smp2p_poll(void)
++{
++	uint32_t sz = 0, it = au_smem_item(0, ADSP_HOST, ADSP_SMP2P_IN_ITEM, &sz);
++	if (!it || sz < 20 || smem_u32(it) != SMP2P_MAGIC) {
++		return;
++	}
++	if (au.smp2p_out) {
++		uint32_t in1 = smem_u32(it + 4), out1 = smem_u32(au.smp2p_out + 4);
++		if (!au.smp2p_nego && (in1 & 0xff) == (out1 & 0xff)) {
++			uint32_t feat = (out1 >> 8) & (in1 >> 8);
++			wr(au.smem, au.smp2p_out + 4, (feat << 8) | (out1 & 0xff));
++			au.smp2p_nego = true;
++			AU_LOG("smp2p negotiated: version %u, features %#x", out1 & 0xff, feat);
++		}
++		if (au.smp2p_nego && ((smem_u32(au.smp2p_out + 4) >> 8) & SMP2P_FEATURE_SSR_ACK)) {
++			bool restart = (smem_u32(it + 16) & 1u) != 0;
++			if (restart != au.ssr_ack) {
++				au.ssr_ack = !au.ssr_ack;
++				uint32_t f = smem_u32(au.smp2p_out + 16) & ~2u;
++				wr(au.smem, au.smp2p_out + 16, f | (au.ssr_ack ? 2u : 0));
++				au_smp2p_kick();
++			}
++		}
++	}
++	uint32_t valid = MIN(smem_u32(it + 12) >> 16, SMP2P_MAX_ENTRY);
++	for (uint32_t k = 0; k < valid && 20 + (k + 1) * 20 <= sz; k++) {
++		uint32_t e = it + 20 + k * 20;
++		char name[17];
++		for (uint32_t c = 0; c < 16; c += 4) {
++			uint32_t w = smem_u32(e + c);
++			memcpy(name + c, &w, 4);
++		}
++		name[16] = 0;
++		if (strcmp(name, "slave-kernel") != 0) {
++			continue;
++		}
++		uint32_t v = smem_u32(e + 16);
++		if (v == au.smp2p_in_last) {
++			return;
++		}
++		au.smp2p_in_last = v;
++		AU_LOG("smp2p slave-kernel = %#x", v);
++		if ((v & 2u) && !au.adsp_up) {
++			au.adsp_up = true;
++			AU_LOG("ADSP READY");
++		}
++		if ((v & 4u) && !au.handover) {
++			au.handover = true;
++			AU_LOG("ADSP handover (proxy votes may go)");
++		}
++		if ((v & 1u) && !au.adsp_fatal) {
++			au.adsp_fatal = true;
++			AU_LOG("ADSP reported a FATAL error");
++			au_crash_reason();
++		}
++		return;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* AOSS QMP (qcom_aoss.c; beryllium_wlan.c may have opened the link)    */
++/* ------------------------------------------------------------------ */
++
++static void
++au_qmp_kick(void)
++{
++	wr(au.ipc, 12, 1u << 0);
++}
++
++static bool
++au_qmp_wait(uint32_t off, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms; i++) {
++		if (rd(au.qmp, off) == want) {
++			return true;
++		}
++		au_sleep_ms(1);
++	}
++	return false;
++}
++
++static bool
++au_qmp_send(const char *msg)
++{
++	uint32_t magic = rd(au.qmp, 0x0), version = rd(au.qmp, 0x4);
++	uint32_t moff = rd(au.qmp, 0x38), msize = rd(au.qmp, 0x34);
++	if (magic != 0x4d41494cu || version != 1 || msize < 68 || moff + msize > 0x400) {
++		AU_LOG("QMP magic %#x version %u mailbox %#x+%#x: unusable", magic, version, moff, msize);
++		return false;
++	}
++	bool open = rd(au.qmp, 0x24) == 0xffffu && rd(au.qmp, 0x28) == 0xffffu && rd(au.qmp, 0x2c) == 0xffffu &&
++	    rd(au.qmp, 0x30) == 0xffffu;
++	if (!open) {
++		wr(au.qmp, 0x10, rd(au.qmp, 0x0c));         /* ack ucore link state */
++		wr(au.qmp, 0x24, 0xffffu);                   /* mcore link up */
++		au_qmp_kick();
++		if (!au_qmp_wait(0x28, 0xffffu, 1000)) {
++			AU_LOG("QMP link not acked");
++			return false;
++		}
++		wr(au.qmp, 0x2c, 0xffffu);                   /* mcore channel up */
++		au_qmp_kick();
++		if (!au_qmp_wait(0x14, 0xffffu, 1000)) {
++			AU_LOG("QMP ucore channel not up");
++			return false;
++		}
++		wr(au.qmp, 0x18, 0xffffu);
++		au_qmp_kick();
++		if (!au_qmp_wait(0x30, 0xffffu, 1000)) {
++			AU_LOG("QMP channel not acked");
++			return false;
++		}
++		AU_LOG("QMP opened");
++	}
++	if (!au_qmp_wait(moff, 0, 1000)) {
++		AU_LOG("QMP mailbox busy");
++		return false;
++	}
++	uint32_t words[16] = { 0 };
++	strlcpy((char *)words, msg, sizeof(words));
++	for (unsigned i = 0; i < 16; i++) {
++		wr(au.qmp, moff + 4 + 4 * i, words[i]);
++	}
++	wr(au.qmp, moff, sizeof(words));
++	(void)rd(au.qmp, moff);
++	au_qmp_kick();
++	bool ok = au_qmp_wait(moff, 0, 1000);
++	if (!ok) {
++		wr(au.qmp, moff, 0);
++	}
++	AU_LOG("QMP \"%s\" %s", msg, ok ? "consumed" : "NOT consumed");
++	return ok;
++}
++
++/* ------------------------------------------------------------------ */
++/* ADSP boot                                                           */
++/* ------------------------------------------------------------------ */
++
++static int
++au_adsp_boot(void)
++{
++	if (au.step >= AU_STEP_BOOTED) {
++		for (unsigned i = 0; i < 1000 && !au.adsp_up && !au.adsp_fatal; i++) {
++			au_smp2p_poll();
++			au_sleep_ms(5);
++		}
++		return au.adsp_up && !au.adsp_fatal ? 0 : EIO;
++	}
++	if (!au_map()) {
++		return au_fail("map", ENOMEM);
++	}
++	if (!au_smp2p_out_setup()) {
++		return au_fail("smp2p item", EIO);
++	}
++	int e = au_adsp_load();
++	if (e) {
++		return au_fail("adsp.mbn load", e);
++	}
++	/* qcom_q6v5_prepare(): load_state, then the proxy power domain (cx) at its top level; xo is always on */
++	if (!au_qmp_send("{class: image, res: load_state, name: adsp, val: on}")) {
++		AU_LOG("continuing without the AOSS load_state");
++	}
++	e = sweet_rpmh_arc_vote("cx.lvl", true);
++	AU_LOG("cx.lvl max vote: %d", e);
++	if (!au_pas("PAS AUTH_AND_RESET", 5, 1, 0, 0)) {
++		(void)au_pas("PAS SHUTDOWN", 6, 1, 0, 0);
++		return au_fail("AUTH_AND_RESET", EIO);
++	}
++	AU_LOG("ADSP authenticated and released; waiting for ready");
++	au.step = AU_STEP_BOOTED;
++	uint64_t t0 = au_now_ms();
++	while (!au.adsp_up && !au.adsp_fatal && au_now_ms() - t0 < 5000) {     /* qcom_q6v5_wait_for_start, 5 s */
++		au_smp2p_poll();
++		au_sleep_ms(5);
++	}
++	if (!au.adsp_up) {
++		return au_fail(au.adsp_fatal ? "ADSP fatal during boot" : "ADSP ready timeout", EIO);
++	}
++	AU_LOG("ADSP up after %llu ms", au_now_ms() - t0);
++	sweet_log_sync();
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* GLINK on the lpass edge                                             */
++/* ------------------------------------------------------------------ */
++
++static void
++au_glink_kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(au.ipc, 12, 1u << ADSP_GLINK_DOORBELL);
++}
++
++static uint32_t
++au_rx_avail(void)
++{
++	if (!au.g.rx) {
++		uint32_t sz = 0, it = au_smem_item(0, ADSP_HOST, GLINK_RX_ITEM, &sz);
++		if (!it || sz < 64 || (sz & 7)) {
++			return 0;
++		}
++		au.g.rx = it;
++		au.g.rx_len = sz;
++		AU_LOG("glink: the ADSP's FIFO (item %u) at +%#x, %u bytes", GLINK_RX_ITEM, it, sz);
++	}
++	uint32_t head = smem_u32(au.g.desc + 12), tail = smem_u32(au.g.desc + 8);
++	if (head >= au.g.rx_len || tail >= au.g.rx_len) {
++		return 0;
++	}
++	return head >= tail ? head - tail : au.g.rx_len - tail + head;
++}
++
++static void
++au_rx_peek(uint32_t offset, void *dst, uint32_t count)
++{
++	uint8_t *d = dst;
++	uint32_t pos = smem_u32(au.g.desc + 8) + offset;
++	while (count) {
++		while (pos >= au.g.rx_len) {
++			pos -= au.g.rx_len;
++		}
++		uint32_t w = smem_u32(au.g.rx + (pos & ~3u)), b = pos & 3u, n = MIN(4u - b, count);
++		memcpy(d, (uint8_t *)&w + b, n);
++		d += n;
++		count -= n;
++		pos += n;
++	}
++}
++
++static void
++au_rx_advance(uint32_t count)
++{
++	uint32_t tail = smem_u32(au.g.desc + 8) + count;
++	while (tail >= au.g.rx_len) {
++		tail -= au.g.rx_len;
++	}
++	wr(au.smem, au.g.desc + 8, tail);
++}
++
++static uint32_t
++au_tx_avail(void)
++{
++	uint32_t head = smem_u32(au.g.desc + 4), tail = smem_u32(au.g.desc + 0);
++	uint32_t avail = tail <= head ? au.g.tx_len - head + tail : tail - head;
++	return avail < 16 ? 0 : avail - 16;
++}
++
++static bool
++au_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	static uint8_t buf[GLINK_MSG_MAX + 64];
++	uint32_t tlen = hlen + dlen, total = (tlen + 7u) & ~7u;
++	if (total > sizeof(buf) || tlen >= au.g.tx_len) {
++		return false;
++	}
++	for (unsigned i = 0; au_tx_avail() < tlen; i++) {
++		if (i == 1000) {
++			AU_LOG("glink TX FIFO full for 1 s (head %#x tail %#x)", smem_u32(au.g.desc + 4), smem_u32(au.g.desc));
++			return false;
++		}
++		au_sleep_ms(1);
++	}
++	memcpy(buf, hdr, hlen);
++	if (dlen) {
++		memcpy(buf + hlen, data, dlen);
++	}
++	bzero(buf + tlen, total - tlen);
++	uint32_t head = smem_u32(au.g.desc + 4);
++	for (uint32_t i = 0; i < total; i += 4) {
++		uint32_t w, p = head + i;
++		memcpy(&w, buf + i, 4);
++		if (p >= au.g.tx_len) {
++			p -= au.g.tx_len;
++		}
++		wr(au.smem, au.g.tx + p, w);
++	}
++	head += total;
++	if (head >= au.g.tx_len) {
++		head -= au.g.tx_len;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(au.smem, au.g.desc + 4, head);
++	au_glink_kick();
++	return true;
++}
++
++static bool
++au_tx_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint8_t m[8];
++	memcpy(m, &cmd, 2);
++	memcpy(m + 2, &p1, 2);
++	memcpy(m + 4, &p2, 4);
++	return au_tx(m, 8, NULL, 0);
++}
++
++static bool
++au_add_intent(uint32_t size)
++{
++	for (unsigned k = 0; k < GLINK_MAX_LINTENTS; k++) {
++		struct au_lintent *in = &au.g.li[k];
++		if (in->buf) {
++			continue;
++		}
++		in->buf = kalloc_data(size, Z_WAITOK | Z_ZERO);
++		if (!in->buf) {
++			return false;
++		}
++		in->id = ++au.g.next_liid;
++		in->size = size;
++		in->off = 0;
++		struct {
++			uint16_t cmd, lcid;
++			uint32_t count, size, id;
++		} __attribute__((packed)) c = { G_INTENT, GLINK_LCID, 1, size, in->id };
++		return au_tx(&c, (uint32_t)sizeof(c), NULL, 0);
++	}
++	return false;
++}
++
++static void au_apr_rx(const uint8_t *p, uint32_t len);
++
++/* qcom_glink_native_rx() for this edge; only the service thread or a waiter holding au_mtx calls it */
++static void
++au_glink_poll(void)
++{
++	for (unsigned guard = 0; guard < 64 && !au.g.bad_rx; guard++) {
++		uint32_t avail = au_rx_avail();
++		if (avail < 8) {
++			return;
++		}
++		uint8_t m[8];
++		au_rx_peek(0, m, 8);
++		uint16_t cmd, p1;
++		uint32_t p2;
++		memcpy(&cmd, m, 2);
++		memcpy(&p1, m + 2, 2);
++		memcpy(&p2, m + 4, 4);
++		switch (cmd) {
++		case G_VERSION:
++			au_rx_advance(8);
++			if (p1 == 1) {
++				au.g.features &= p2;
++			}
++			AU_LOG("glink: version %u features %#x from the ADSP", p1, p2);
++			if (p1 != 0) {
++				(void)au_tx_cmd(G_VERSION_ACK, 1, au.g.features);
++			}
++			break;
++		case G_VERSION_ACK:
++			au_rx_advance(8);
++			if (p1 == 1 && p2 != au.g.features) {
++				au.g.features &= p2;
++				(void)au_tx_cmd(G_VERSION, 1, au.g.features);
++			} else if (p1 == 1) {
++				if (!au.g.version_acked) {
++					AU_LOG("glink: version 1 acked, features %#x", p2);
++				}
++				au.g.version_acked = true;
++			}
++			break;
++		case G_OPEN: {
++			uint32_t extra = (p2 + 7u) & ~7u;
++			char name[33];
++			if (avail < 8 + extra) {
++				return;
++			}
++			memset(name, 0, sizeof(name));
++			au_rx_peek(8, name, MIN(p2, 32u));
++			au_rx_advance(8 + extra);
++			if (strcmp(name, GLINK_CHANNEL) == 0 && !au.g.rcid) {
++				AU_LOG("glink: ADSP opens \"%s\" (its id %u); answering", name, p1);
++				au.g.rcid = p1;
++				struct {
++					uint16_t cmd, lcid;
++					uint32_t len;
++					char name[16];
++				} __attribute__((packed)) req = { G_OPEN, GLINK_LCID, sizeof(GLINK_CHANNEL), GLINK_CHANNEL };
++				(void)au_tx_cmd(G_OPEN_ACK, (uint16_t)au.g.rcid, 0);
++				(void)au_tx(&req, (uint32_t)sizeof(req), NULL, 0);
++			} else {
++				au.g.other_opens++;
++				AU_LOG("glink: ADSP opens \"%s\" (its id %u); not served", name, p1);
++			}
++			break;
++		}
++		case G_OPEN_ACK:
++			au_rx_advance(8);
++			if (p1 == GLINK_LCID && !au.g.open_acked) {
++				au.g.open_acked = true;
++				AU_LOG("glink: %s open both ways; %u x %u-byte intents", GLINK_CHANNEL, GLINK_INTENTS, GLINK_INTENT_SIZE);
++				for (unsigned k = 0; k < GLINK_INTENTS; k++) {
++					(void)au_add_intent(GLINK_INTENT_SIZE);
++				}
++			}
++			break;
++		case G_CLOSE:
++			au_rx_advance(8);
++			AU_LOG("glink: ADSP closes its id %u", p1);
++			(void)au_tx_cmd(G_CLOSE_ACK, p1, 0);
++			if (p1 == au.g.rcid) {
++				au.g.closed = true;
++			}
++			break;
++		case G_INTENT: {
++			uint32_t msglen = 8 + 8 * p2;
++			if (p2 > 64 || avail < msglen) {
++				return;
++			}
++			for (uint32_t k = 0; k < p2; k++) {
++				uint32_t pair[2];
++				au_rx_peek(8 + 8 * k, pair, 8);
++				if (p1 != au.g.rcid) {
++					continue;
++				}
++				unsigned j;
++				for (j = 0; j < GLINK_MAX_RINTENTS; j++) {
++					if (!au.g.ri[j].valid) {
++						au.g.ri[j] = (struct au_rintent){ pair[1], pair[0], true, false };
++						break;
++					}
++				}
++			}
++			au_rx_advance((msglen + 7u) & ~7u);
++			au.g.intent_asked = false;
++			break;
++		}
++		case G_RX_DONE:
++		case G_RX_DONE_W_REUSE:
++			au_rx_advance(8);
++			for (unsigned j = 0; j < GLINK_MAX_RINTENTS; j++) {
++				if (au.g.ri[j].valid && au.g.ri[j].id == p2) {
++					au.g.ri[j].used = false;
++					if (cmd == G_RX_DONE) {
++						au.g.ri[j].valid = false;
++					}
++				}
++			}
++			break;
++		case G_RX_INTENT_REQ: {
++			au_rx_advance(8);
++			bool ok = p2 <= 0x10000u && au_add_intent(MAX(p2, 1u));
++			AU_LOG("glink: ADSP asks for a %u-byte intent (%s)", p2, ok ? "given" : "refused");
++			(void)au_tx_cmd(G_RX_INTENT_REQ_ACK, GLINK_LCID, ok);
++			break;
++		}
++		case G_RX_INTENT_REQ_ACK:
++		case G_CLOSE_ACK:
++		case G_SIGNALS:
++			au_rx_advance(8);
++			break;
++		case G_READ_NOTIF:
++			au_rx_advance(8);
++			au_glink_kick();
++			break;
++		case G_TX_DATA:
++		case G_TX_DATA_CONT: {
++			if (avail < 16) {
++				return;
++			}
++			uint32_t sizes[2];
++			au_rx_peek(8, sizes, 8);
++			uint32_t chunk = sizes[0], left = sizes[1];
++			if (chunk > avail - 16) {
++				return;
++			}
++			struct au_lintent *in = NULL;
++			for (unsigned k = 0; k < GLINK_MAX_LINTENTS; k++) {
++				if (au.g.li[k].buf && au.g.li[k].id == p2) {
++					in = &au.g.li[k];
++				}
++			}
++			if (p1 != au.g.rcid || !in || in->size - in->off < chunk) {
++				AU_LOG("glink: data for id %u intent %u (%u bytes) dropped", p1, p2, chunk);
++				if (in) {
++					in->bad = true;
++				}
++			} else if (!in->bad) {
++				au_rx_peek(16, in->buf + in->off, chunk);
++				in->off += chunk;
++			}
++			au_rx_advance((16 + chunk + 7u) & ~7u);
++			if (in && left == 0) {
++				uint32_t n = in->off;
++				bool bad = in->bad;
++				in->off = 0;
++				in->bad = false;
++				if (!bad && p1 == au.g.rcid) {
++					au.g.rx_msgs++;
++					au_apr_rx(in->buf, n);
++				}
++				struct {
++					uint16_t id, lcid;
++					uint32_t liid;
++				} __attribute__((packed)) done = { G_RX_DONE_W_REUSE, GLINK_LCID, in->id };
++				(void)au_tx(&done, (uint32_t)sizeof(done), NULL, 0);
++			}
++			break;
++		}
++		default:
++			AU_LOG("glink: unknown command %u (p1 %u p2 %#x): ring stopped", cmd, p1, p2);
++			au.g.bad_rx = true;
++			return;
++		}
++	}
++}
++
++/* __qcom_glink_send() into the smallest free ADSP intent; asks for one (and waits 200 ms) when none fits */
++static bool
++au_glink_send(const void *data, uint32_t len)
++{
++	if (!au.g.open_acked || !au.g.rcid || au.g.closed || len > GLINK_MSG_MAX) {
++		return false;
++	}
++	for (unsigned tries = 0; tries < 2; tries++) {
++		struct au_rintent *best = NULL;
++		for (unsigned j = 0; j < GLINK_MAX_RINTENTS; j++) {
++			struct au_rintent *r = &au.g.ri[j];
++			if (r->valid && !r->used && r->size >= len && (!best || r->size < best->size)) {
++				best = r;
++			}
++		}
++		if (best) {
++			best->used = true;
++			struct {
++				uint16_t cmd, lcid;
++				uint32_t iid, chunk, left;
++			} __attribute__((packed)) h = { G_TX_DATA, GLINK_LCID, best->id, len, 0 };
++			if (!au_tx(&h, (uint32_t)sizeof(h), data, len)) {
++				best->used = false;
++				return false;
++			}
++			au.g.tx_msgs++;
++			return true;
++		}
++		if (!au.g.intent_asked) {
++			struct {
++				uint16_t id, cid;
++				uint32_t size;
++			} __attribute__((packed)) req = { G_RX_INTENT_REQ, GLINK_LCID, len };
++			au.g.intent_asked = true;
++			(void)au_tx(&req, (uint32_t)sizeof(req), NULL, 0);
++		}
++		for (unsigned i = 0; i < 200; i++) {
++			au_glink_poll();
++			bool have = false;
++			for (unsigned j = 0; j < GLINK_MAX_RINTENTS && !have; j++) {
++				have = au.g.ri[j].valid && !au.g.ri[j].used && au.g.ri[j].size >= len;
++			}
++			if (have) {
++				break;
++			}
++			au_sleep_ms(1);
++		}
++	}
++	AU_LOG("glink: no ADSP intent for a %u-byte message", len);
++	return false;
++}
++
++static int
++au_glink_up(void)
++{
++	if (au.step >= AU_STEP_CHANNEL) {
++		return au.g.closed ? EIO : 0;
++	}
++	if (au.step >= AU_STEP_GLINK) {
++		goto wait;
++	}
++	memset(&au.g, 0, sizeof(au.g));
++	au.g.features = GLINK_FEATURE_REUSE;
++	uint32_t sz = 0;
++	au.g.desc = au_smem_alloc(GLINK_DESC_ITEM, 32);
++	if (!au.g.desc || au_smem_item(0, ADSP_HOST, GLINK_DESC_ITEM, &sz) != au.g.desc || sz != 32) {
++		return au_fail("glink descriptor", EIO);
++	}
++	au.g.tx = au_smem_alloc(GLINK_TX_ITEM, GLINK_TX_SIZE);
++	if (!au.g.tx || au_smem_item(0, ADSP_HOST, GLINK_TX_ITEM, &sz) != au.g.tx || sz < 1024 || (sz & 7)) {
++		return au_fail("glink TX FIFO", EIO);
++	}
++	au.g.tx_len = sz;
++	wr(au.smem, au.g.desc + 8, 0);          /* *rx_pipe->tail = 0 */
++	wr(au.smem, au.g.desc + 4, 0);          /* *tx_pipe->head = 0 */
++	if (!au_tx_cmd(G_VERSION, 1, au.g.features)) {
++		return au_fail("glink version", EIO);
++	}
++	AU_LOG("glink up: descriptor +%#x, TX FIFO +%#x (%u bytes)", au.g.desc, au.g.tx, au.g.tx_len);
++	au.step = AU_STEP_GLINK;
++wait:;
++	uint64_t t0 = au_now_ms();
++	while (!au.g.open_acked && au_now_ms() - t0 < 5000) {
++		au_glink_poll();
++		au_smp2p_poll();
++		if (au.adsp_fatal || au.g.bad_rx) {
++			break;
++		}
++		au_sleep_ms(2);
++	}
++	if (!au.g.open_acked) {
++		return au_fail(au.g.rcid ? "apr_audio_svc open ack" : "apr_audio_svc never opened by the ADSP", EIO);
++	}
++	au.step = AU_STEP_CHANNEL;
++	AU_LOG("apr_audio_svc up after %llu ms", au_now_ms() - t0);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* APR                                                                 */
++/* ------------------------------------------------------------------ */
++
++static void au_write_done(uint32_t token, uint32_t status);
++
++static void
++au_apr_rx(const uint8_t *p, uint32_t len)
++{
++	if (len < APR_HDR_SIZE) {
++		au.apr_bad++;
++		return;
++	}
++	uint16_t hf = le16(p), psz = le16(p + 2);
++	uint32_t hsz = ((hf >> 4) & 0xfu) * 4u;
++	if (hsz < APR_HDR_SIZE || psz > len || hsz > psz) {
++		au.apr_bad++;
++		AU_LOG("APR: bad packet (field %#x size %u of %u)", hf, psz, len);
++		return;
++	}
++	uint8_t src_svc = p[4];
++	uint32_t token = le32(p + 12), opcode = le32(p + 16);
++	const uint8_t *pl = p + hsz;
++	uint32_t plen = psz - hsz, w[4] = { 0 };
++	for (unsigned i = 0; i < 4 && 4 * i + 4 <= plen; i++) {
++		w[i] = le32(pl + 4 * i);
++	}
++	au.apr_rx++;
++	if (opcode == ASM_DATA_EVENT_WRITE_DONE_V2) {
++		au_write_done(token, w[3]);
++		return;
++	}
++	if (opcode == APR_RSP_ACCEPTED) {
++		return;
++	}
++	if (opcode != APR_BASIC_RSP_RESULT && opcode != ADM_CMDRSP_DEVICE_OPEN_V5 &&
++	    opcode != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS && opcode != AVCS_CMDRSP_ADSP_EVENT_GET_STATE) {
++		au.apr_events++;
++		au.last_event = opcode;
++		AU_LOG("APR: event %#x from svc %u (token %#x, %#x %#x)", opcode, src_svc, token, w[0], w[1]);
++		return;
++	}
++	if (opcode == APR_BASIC_RSP_RESULT && w[0] == ASM_DATA_CMD_WRITE_V2) {
++		au.write_errors++;
++		AU_LOG("APR: WRITE_V2 rejected, status %#x", w[1]);
++		return;
++	}
++	unsigned slot = 0;
++	for (unsigned i = 0; i < 8; i++) {
++		if (!au.rsp[i].valid) {
++			slot = i;
++			break;
++		}
++	}
++	au.rsp[slot] = (struct au_rsp){ true, src_svc, opcode, token, { w[0], w[1], w[2], w[3] } };
++}
++
++/*
++ * One APR command and its answer. want == APR_BASIC_RSP_RESULT waits for the basic result naming this opcode and
++ * returns its status as an error; otherwise for want itself (out gets its first 4 payload words).
++ */
++static int
++au_apr2(uint8_t svc, uint16_t src_port, uint16_t dest_port, uint32_t token, uint32_t opcode, const void *pl,
++    uint32_t plen, uint32_t want, uint32_t *out, unsigned timeout_ms)
++{
++	uint8_t pkt[APR_HDR_SIZE + 256];
++	if (plen > sizeof(pkt) - APR_HDR_SIZE) {
++		return EINVAL;
++	}
++	uint32_t size = APR_HDR_SIZE + plen;
++	struct {
++		uint16_t hdr_field, pkt_size;
++		uint8_t src_svc, src_domain;
++		uint16_t src_port;
++		uint8_t dest_svc, dest_domain;
++		uint16_t dest_port;
++		uint32_t token, opcode;
++	} __attribute__((packed)) h = { APR_SEQ_CMD_HDR_FIELD, (uint16_t)size, svc, APR_DOMAIN_APPS, src_port, svc,
++	                               APR_DOMAIN_ADSP, dest_port, token, opcode };
++	memcpy(pkt, &h, APR_HDR_SIZE);
++	if (plen) {
++		memcpy(pkt + APR_HDR_SIZE, pl, plen);
++	}
++	if (want) {
++		for (unsigned i = 0; i < 8; i++) {
++			if (au.rsp[i].valid && au.rsp[i].svc == svc &&
++			    (au.rsp[i].opcode == want && (want != APR_BASIC_RSP_RESULT || au.rsp[i].w[0] == opcode))) {
++				au.rsp[i].valid = false;        /* a stale answer to the same command */
++			}
++		}
++	}
++	if (!au_glink_send(pkt, size)) {
++		return EIO;
++	}
++	au.apr_tx++;
++	if (!want) {
++		return 0;
++	}
++	uint64_t t0 = au_now_ms();
++	for (;;) {
++		for (unsigned i = 0; i < 8; i++) {
++			struct au_rsp *r = &au.rsp[i];
++			if (!r->valid || r->svc != svc) {
++				continue;
++			}
++			/* a command answered with a basic result instead of its own response opcode is an error answer */
++			if (r->opcode == APR_BASIC_RSP_RESULT && r->w[0] == opcode && want != APR_BASIC_RSP_RESULT) {
++				r->valid = false;
++				AU_LOG("APR: svc %u opcode %#x answered with status %#x", svc, opcode, r->w[1]);
++				return EIO;
++			}
++			if (r->opcode != want || (want == APR_BASIC_RSP_RESULT && r->w[0] != opcode)) {
++				continue;
++			}
++			r->valid = false;
++			if (out) {
++				memcpy(out, r->w, sizeof(r->w));
++			}
++			if (want == APR_BASIC_RSP_RESULT && r->w[1] != 0) {
++				AU_LOG("APR: svc %u opcode %#x failed, status %#x", svc, opcode, r->w[1]);
++				return EIO;
++			}
++			return 0;
++		}
++		if (au_now_ms() - t0 > timeout_ms) {
++			AU_LOG("APR: svc %u opcode %#x: no answer in %u ms", svc, opcode, timeout_ms);
++			return ETIMEDOUT;
++		}
++		au_glink_poll();
++		au_smp2p_poll();
++		if (au.adsp_fatal) {
++			return EIO;
++		}
++		au_sleep_ms(1);
++	}
++}
++
++static int
++au_apr(uint8_t svc, uint16_t port, uint32_t token, uint32_t opcode, const void *pl, uint32_t plen, uint32_t want,
++    uint32_t *out, unsigned timeout_ms)
++{
++	return au_apr2(svc, port, port, token, opcode, pl, plen, want, out, timeout_ms);
++}
++
++/* q6core_is_adsp_ready(): AVCS state until non-zero; an old firmware without the command counts as ready */
++static int
++au_q6_ready(void)
++{
++	if (au.step >= AU_STEP_Q6) {
++		return 0;
++	}
++	uint64_t t0 = au_now_ms();
++	while (au_now_ms() - t0 < 10000) {
++		uint32_t out[4] = { 0 };
++		int e = au_apr(APR_SVC_CORE, 0, 0, AVCS_CMD_ADSP_EVENT_GET_STATE, NULL, 0, AVCS_CMDRSP_ADSP_EVENT_GET_STATE,
++		    out, 500);
++		if (e == 0 && out[0]) {
++			au.avcs_state = out[0];
++			break;
++		}
++		if (e == EIO && !au.adsp_fatal) {
++			au.avcs_state = 1;
++			AU_LOG("AVCS state query refused: assuming ready");
++			break;
++		}
++		au_sleep_ms(50);
++	}
++	if (!au.avcs_state) {
++		return au_fail("AVCS ready", ETIMEDOUT);
++	}
++	AU_LOG("Q6 ready (AVCS state %u) after %llu ms", au.avcs_state, au_now_ms() - t0);
++	au.step = AU_STEP_Q6;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* pins and the amplifiers' bus                                        */
++/* ------------------------------------------------------------------ */
++
++static vm_offset_t
++au_tlmm(unsigned pin)
++{
++	if (pin == 12) {
++		return au.tlmm_s;
++	}
++	if (pin >= 57 && pin <= 61) {
++		return au.tlmm_n;
++	}
++	return au.tlmm_e;               /* 76, 85, 86 */
++}
++
++/* ctl: [1:0] pull (0 none, 1 down, 3 up), [5:2] function, [8:6] drive (mA / 2 - 1), [9] output enable */
++static void
++au_pin_cfg(unsigned pin, unsigned func, unsigned drive_ma, unsigned pull, bool oe, int out)
++{
++	vm_offset_t b = au_tlmm(pin);
++	uint32_t ctl = (pull & 3u) | ((func & 0xfu) << 2) | (((drive_ma / 2u) - 1u) & 7u) << 6 | (oe ? 1u << 9 : 0);
++	if (out >= 0) {
++		wr(b, pin * 0x1000u + 4, out ? 2u : 0u);
++	}
++	wr(b, pin * 0x1000u, ctl);
++}
++
++static void
++au_mi2s_pins(void)
++{
++	/* quat_mi2s_active (sck 58, ws 59: drive 8, no pull, output high) + quat_mi2s_sd0_active (60), function qua_mi2s */
++	au_pin_cfg(58, 1, 8, 0, true, 1);
++	au_pin_cfg(59, 1, 8, 0, true, 1);
++	au_pin_cfg(60, 1, 8, 0, false, -1);
++}
++
++#define BB_HALF_US      (au_i2c_half_us ? au_i2c_half_us : 1u)
++
++static void
++bb_line(unsigned pin, bool high)
++{
++	vm_offset_t b = au_tlmm(pin);
++	uint32_t off = pin * 0x1000u;
++	if (high) {
++		wr(b, off, rd(b, off) & ~0x200u);                       /* release: the pull-ups take it high */
++	} else {
++		wr(b, off + 4, rd(b, off + 4) & ~2u);
++		wr(b, off, rd(b, off) | 0x200u);                        /* drive low */
++	}
++}
++
++static bool
++bb_get(unsigned pin)
++{
++	return rd(au_tlmm(pin), pin * 0x1000u + 4) & 1u;
++}
++
++static bool
++bb_scl_high(void)
++{
++	bb_line(PIN_AMP_SCL, true);
++	for (unsigned i = 0; i < 1000; ++i) {
++		if (bb_get(PIN_AMP_SCL)) {
++			delay(BB_HALF_US);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++bb_start(void)
++{
++	bb_line(PIN_AMP_SDA, true);
++	if (!bb_scl_high()) {
++		return false;
++	}
++	bb_line(PIN_AMP_SDA, false);
++	delay(BB_HALF_US);
++	bb_line(PIN_AMP_SCL, false);
++	delay(BB_HALF_US);
++	return true;
++}
++
++static void
++bb_stop(void)
++{
++	bb_line(PIN_AMP_SDA, false);
++	delay(BB_HALF_US);
++	(void)bb_scl_high();
++	bb_line(PIN_AMP_SDA, true);
++	delay(BB_HALF_US);
++}
++
++static int
++bb_write(uint8_t v)
++{
++	for (int b = 7; b >= 0; --b) {
++		bb_line(PIN_AMP_SDA, (v >> b) & 1u);
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return ETIMEDOUT;
++		}
++		bb_line(PIN_AMP_SCL, false);
++	}
++	bb_line(PIN_AMP_SDA, true);
++	delay(BB_HALF_US);
++	if (!bb_scl_high()) {
++		return ETIMEDOUT;
++	}
++	bool nack = bb_get(PIN_AMP_SDA);
++	bb_line(PIN_AMP_SCL, false);
++	delay(BB_HALF_US);
++	return nack ? ENXIO : 0;
++}
++
++static int
++bb_read(uint8_t *v, bool ack)
++{
++	uint8_t x = 0;
++	bb_line(PIN_AMP_SDA, true);
++	for (int b = 7; b >= 0; --b) {
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return ETIMEDOUT;
++		}
++		x |= (uint8_t)(bb_get(PIN_AMP_SDA) << b);
++		bb_line(PIN_AMP_SCL, false);
++	}
++	bb_line(PIN_AMP_SDA, !ack);
++	delay(BB_HALF_US);
++	if (!bb_scl_high()) {
++		return ETIMEDOUT;
++	}
++	bb_line(PIN_AMP_SCL, false);
++	bb_line(PIN_AMP_SDA, true);
++	*v = x;
++	return 0;
++}
++
++static void
++au_amp_bus_init(void)
++{
++	/* plain GPIOs, pull-up as the sleep state (the board pulls up too), output value 0, released */
++	au_pin_cfg(PIN_AMP_SDA, 0, 2, 3, false, 0);
++	au_pin_cfg(PIN_AMP_SCL, 0, 2, 3, false, 0);
++	au_pin_cfg(PIN_TAS2559_RESET, 0, 2, 0, true, -1);
++	au_pin_cfg(PIN_TAS2560_RESET, 0, 2, 0, true, -1);
++	delay(100);
++	if (!bb_get(PIN_AMP_SDA) || !bb_get(PIN_AMP_SCL)) {
++		/* a slave holding SDA: nine clocks and a stop (i2c bus recovery) */
++		for (unsigned i = 0; i < 9 && !bb_get(PIN_AMP_SDA); i++) {
++			bb_line(PIN_AMP_SCL, false);
++			delay(BB_HALF_US);
++			(void)bb_scl_high();
++		}
++		bb_stop();
++		AU_LOG("amp bus recovered: sda=%d scl=%d", bb_get(PIN_AMP_SDA), bb_get(PIN_AMP_SCL));
++	}
++}
++
++static int
++au_i2c_write(void *ctx, uint8_t addr, uint8_t reg, const uint8_t *data, unsigned len)
++{
++#pragma unused(ctx)
++	int err = bb_start() ? 0 : ETIMEDOUT;
++	if (!err) {
++		err = bb_write((uint8_t)(addr << 1));
++	}
++	if (!err) {
++		err = bb_write(reg);
++	}
++	for (unsigned i = 0; !err && i < len; ++i) {
++		err = bb_write(data[i]);
++	}
++	bb_stop();
++	return err;
++}
++
++static int
++au_i2c_read(void *ctx, uint8_t addr, uint8_t reg, uint8_t *data, unsigned len)
++{
++#pragma unused(ctx)
++	int err = bb_start() ? 0 : ETIMEDOUT;
++	if (!err) {
++		err = bb_write((uint8_t)(addr << 1));
++	}
++	if (!err) {
++		err = bb_write(reg);
++	}
++	if (!err) {
++		err = bb_start() ? 0 : ETIMEDOUT;   /* repeated START */
++	}
++	if (!err) {
++		err = bb_write((uint8_t)(addr << 1) | 1u);
++	}
++	for (unsigned i = 0; !err && i < len; ++i) {
++		err = bb_read(&data[i], i + 1 < len);
++	}
++	bb_stop();
++	return err;
++}
++
++static void
++au_tas_sleep(void *ctx, unsigned ms)
++{
++#pragma unused(ctx)
++	au_sleep_ms(ms);
++}
++
++static void
++au_tas_reset(void *ctx, int dev, int level)
++{
++#pragma unused(ctx)
++	unsigned pin = dev == 0 ? PIN_TAS2559_RESET : PIN_TAS2560_RESET;
++	wr(au_tlmm(pin), pin * 0x1000u + 4, level ? 2u : 0u);
++}
++
++static void
++au_tas_log(void *ctx, const char *msg)
++{
++#pragma unused(ctx)
++	AU_LOG("tas: %s", msg);
++}
++
++static const struct tas_ops au_tas_ops = {
++	.write = au_i2c_write, .read = au_i2c_read, .sleep_ms = au_tas_sleep, .reset = au_tas_reset, .log = au_tas_log,
++	.ctx = NULL,
++};
++
++static int
++au_tas_load(void)
++{
++	if (au.tas_ready) {
++		return 0;
++	}
++	off_t size = 0;
++	vnode_t vp = au_file_open("tas2559_uCDSP.bin", &size);
++	if (vp == NULLVP) {
++		AU_LOG("no tas2559_uCDSP.bin in %s or %s", au_fw_dirs[0], au_fw_dirs[1]);
++		return ENOENT;
++	}
++	int e = ENOMEM;
++	if (size > (off_t)(1u << 20)) {
++		e = EFBIG;
++	} else if ((au.tas_fw = kalloc_data((vm_size_t)size, Z_WAITOK)) != NULL) {
++		au.tas_fw_len = (size_t)size;
++		e = au_file_read(vp, 0, au.tas_fw, (uint32_t)size);
++	}
++	vnode_put(vp);
++	if (e == 0) {
++		int r = tas_fw_parse(au.tas_fw, au.tas_fw_len, &au.tfw);
++		e = r < 0 ? EINVAL : 0;
++		AU_LOG("tas2559_uCDSP.bin parsed: %d (%u programs, %u configurations, default for 48 kHz %d)", r,
++		    au.tfw.nprograms, au.tfw.nconfigs, r < 0 ? r : tas_select_configuration(&au.tfw, 48000, -1, 0));
++	}
++	if (e && au.tas_fw) {
++		kfree_data(au.tas_fw, au.tas_fw_len);
++		au.tas_fw = NULL;
++	}
++	au.tas_ready = e == 0;
++	return e;
++}
++
++/* both amplifiers answer on the bus (their reset lines released) */
++static int
++au_amps_probe(void)
++{
++	au_amp_bus_init();
++	au_tas_reset(NULL, 0, 1);
++	au_tas_reset(NULL, 1, 1);
++	au_sleep_ms(5);
++	uint8_t v = 0;
++	int a = au_i2c_read(NULL, TAS2559_ADDR, 0x00, &v, 1);
++	AU_LOG("TAS2559 @%#x: reg 0 read %d (%#x)", TAS2559_ADDR, a, v);
++	int b = au_i2c_read(NULL, TAS2560_ADDR, 0x00, &v, 1);
++	AU_LOG("TAS2560 @%#x: reg 0 read %d (%#x)", TAS2560_ADDR, b, v);
++	return a ? a : b;
++}
++
++/* tas_load(): resets, defaults, program, PLL, configuration; no I2S clock needed (the driver does it at boot) */
++static int
++au_amps_load(void)
++{
++	if (au.amps_loaded) {
++		return 0;
++	}
++	int e = au_tas_load();
++	if (e) {
++		return au.amp_error = e;
++	}
++	au_amp_bus_init();
++	uint64_t t0 = au_now_ms();
++	int r = tas_load(&au_tas_ops, &au.tfw, 48000, au_program, au_config, au_tas_flags);
++	AU_LOG("amplifiers loaded: configuration %d (%llu ms)", r, au_now_ms() - t0);
++	if (r < 0) {
++		return au.amp_error = EIO;
++	}
++	au.tas_config = r;
++	au.amps_loaded = true;
++	return 0;
++}
++
++static void
++au_amps_status(const char *when)
++{
++	struct tas_status st;
++	memset(&st, 0, sizeof(st));
++	int r = tas_read_status(&au_tas_ops, TAS_DEV_BOTH, &st);
++	AU_LOG("amplifiers %s: status %d, TAS2559 rev %#x guard %#x power %#x flags %#x/%#x, TAS2560 power %#x flags %#x/%#x, "
++	    "errors %#x", when, r, st.a_rev, st.a_safe_guard, st.a_power_up, st.a_flags1, st.a_flags2, st.b_power_up,
++	    st.b_flags1, st.b_flags2, st.errors);
++}
++
++/* tas_start() once BCLK runs (after the AFE port started): safe guard, startup, TAS2560 post-power-up, unmute */
++static int
++au_amps_on(void)
++{
++	if (au.amps_on) {
++		return 0;
++	}
++	au.amps_tried = true;
++	int e = au_amps_load();
++	if (e) {
++		return e;
++	}
++	uint64_t t0 = au_now_ms();
++	int r = tas_start(&au_tas_ops, &au.tfw, au.tas_config, au_tas_flags);
++	AU_LOG("amplifiers started: %d (%llu ms)", r, au_now_ms() - t0);
++	if (r < 0) {
++		au.amps_loaded = false;         /* a failed start ran the failsafe: load again next time */
++		au_amps_status("after a failed start");
++		return au.amp_error = EIO;
++	}
++	au.amps_on = true;
++	au.amp_error = 0;
++	au_sleep_ms(30);                        /* past the clock-error detection window */
++	au_amps_status("after start");
++	return 0;
++}
++
++/* tas_power_down() before the I2S port stops */
++static void
++au_amps_off(void)
++{
++	if (!au.amps_on) {
++		return;
++	}
++	int r = tas_power_down(&au_tas_ops, &au.tfw, au.tas_config, au_tas_flags);
++	AU_LOG("amplifiers powered down: %d", r);
++	au.amps_on = false;
++	if (r < 0) {
++		au.amps_loaded = false;
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* the ring and the stream                                             */
++/* ------------------------------------------------------------------ */
++
++static void
++au_status_publish(void)
++{
++	volatile struct sweet_audio_status *s = (volatile struct sweet_audio_status *)au.status;
++	if (!s) {
++		return;
++	}
++	s->seq++;
++	__asm__ volatile ("dmb sy" ::: "memory");
++	s->state = au.running ? (au.idle ? SWEET_AUDIO_STATE_IDLE : SWEET_AUDIO_STATE_RUNNING) : SWEET_AUDIO_STATE_STOPPED;
++	s->rate = au.rate;
++	s->frames_done = au.done_seq * AU_PERIOD_FRAMES;
++	s->host_time = mach_absolute_time();
++	s->error = au.error;
++	__asm__ volatile ("dmb sy" ::: "memory");
++	s->seq++;
++}
++
++static int
++au_ring_alloc(void)
++{
++	if (au.ring) {
++		return 0;
++	}
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, AU_RING_BYTES, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	for (unsigned i = 1; pn && i < AU_RING_BYTES / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(va + i * PAGE_SIZE)) != pn + i) {
++			pn = 0;
++		}
++	}
++	if (!pn) {
++		AU_LOG("ring not physically contiguous");
++		return ENOMEM;
++	}
++	/* write-combined everywhere: the client writes, the DSP reads, nobody cleans caches */
++	sweet_dma_sync_va((const void *)va, AU_RING_BYTES);
++	for (unsigned i = 0; i < AU_RING_BYTES / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	vm_offset_t st = 0;
++	if (kmem_alloc(kernel_map, &st, PAGE_SIZE, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	struct sweet_audio_status *s = (struct sweet_audio_status *)st;
++	s->version = SWEET_AUDIO_ABI_VERSION;
++	s->ring_frames = AU_RING_FRAMES;
++	s->period_frames = AU_PERIOD_FRAMES;
++	s->queued_periods = AU_QUEUED;
++	au.ring = va;
++	au.ring_pn = pn;
++	au.status = st;
++	AU_LOG("ring %u bytes at pa %#llx, status page ready", AU_RING_BYTES, ptoa_64(pn));
++	return 0;
++}
++
++static int
++au_smmu_map(void)
++{
++	if (au.pt) {
++		return 0;
++	}
++	unsigned sid = AU_SID;
++	(void)sweet_smmu_probe_sid(sid, 1);
++	int e = sweet_smmu_pt_create(&sid, 1, &au.pt);
++	if (e) {
++		au.pt = NULL;
++		return au_fail("apps_smmu bank for SID 0x1821", e);
++	}
++	e = sweet_smmu_pt_map(au.pt, AU_RING_IOVA, ptoa_64(au.ring_pn), AU_RING_BYTES);
++	if (e) {
++		return au_fail("ring IOVA map", e);
++	}
++	AU_LOG("ring at IOVA %#x (DSP address %#x_%08x)", AU_RING_IOVA, AU_SID_ADDR_BITS, AU_RING_IOVA);
++	return 0;
++}
++
++static void
++au_smmu_report(const char *when)
++{
++	if (!au.pt) {
++		return;
++	}
++	uint64_t far = 0;
++	uint32_t fsynr = 0, fsr = sweet_smmu_pt_fault(au.pt, &far, &fsynr);
++	if (fsr & 0xc00001feu) {
++		AU_LOG("SMMU FAULT %s: fsr %#x far %#llx fsynr0 %#x", when, fsr, far, fsynr);
++	}
++}
++
++static int
++au_queue(uint64_t seq)
++{
++	uint32_t slot = (uint32_t)(seq % AU_NPER);
++	struct {
++		uint32_t lsw, msw, handle, size, seq_id, ts_lsw, ts_msw, flags;
++	} __attribute__((packed)) w = { AU_RING_IOVA + slot * AU_PERIOD_BYTES, AU_SID_ADDR_BITS, au.mem_handle,
++	                               AU_PERIOD_BYTES, slot, 0, 0, 0 };
++	__asm__ volatile ("dsb sy" ::: "memory");
++	int e = au_apr(APR_SVC_ASM, ASM_PORT, slot, ASM_DATA_CMD_WRITE_V2, &w, sizeof(w), 0, NULL, 0);
++	if (!e) {
++		au.inflight++;
++	}
++	return e;
++}
++
++static void
++au_write_done(uint32_t token, uint32_t status)
++{
++	au.write_dones++;
++	if (au.inflight) {
++		au.inflight--;
++	}
++	if (status != 0) {
++		au.write_errors++;
++	}
++	uint32_t slot = (uint32_t)(au.done_seq % AU_NPER);
++	if ((token & 0xffffu) != slot && au.write_dones < 8) {
++		AU_LOG("WRITE_DONE for period %u, expected %u", token & 0xffffu, slot);
++	}
++	au.done_seq++;
++	if (!au.tone) {
++		bzero((void *)(au.ring + slot * AU_PERIOD_BYTES), AU_PERIOD_BYTES);
++	}
++	au_status_publish();
++	static bool refilling;
++	if (au.running && !refilling) {
++		refilling = true;
++		while (au.inflight < AU_QUEUED && au_queue(au.next_seq) == 0) {
++			au.next_seq++;
++		}
++		refilling = false;
++	}
++}
++
++/* sdm845_snd_startup()/shutdown(): QUAD_MI2S_IBIT through the AFE service (q6afe_port_set_sysclk -> CLOCK_SET) */
++static int
++au_afe_clock(uint32_t hz)
++{
++	struct {
++		uint32_t payload_size, lsw, msw, handle;
++		uint32_t module_id, param_id;
++		uint16_t param_size, reserved;
++		uint32_t minor, clk_id, freq;
++		uint16_t attri, root;
++		uint32_t enable;
++	} __attribute__((packed)) c = { 12 + 20, 0, 0, 0, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, 20, 0, 1,
++	                               Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT, hz, Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO, 0,
++	                               hz ? 1u : 0u };
++	return au_apr(APR_SVC_AFE, 0, 1024, AFE_SVC_CMD_SET_PARAM, &c, sizeof(c), APR_BASIC_RSP_RESULT, NULL, 1000);
++}
++
++/* the reverse of au_path_start, as far as it got */
++static void
++au_path_stop(void)
++{
++	au_amps_off();
++	au.running = false;
++	if (au.asm_open) {
++		(void)au_apr(APR_SVC_ASM, ASM_PORT, ASM_SESSION, ASM_STREAM_CMD_CLOSE, NULL, 0, APR_BASIC_RSP_RESULT, NULL, 1000);
++		au.asm_open = false;
++	}
++	if (au.adm_open) {
++		/* q6adm_device_close(): to the COPP's port */
++		int e = au_apr2(APR_SVC_ADM, AFE_PORT_ID_QUATERNARY_MI2S_RX, (uint16_t)au.copp_id,
++		    (uint32_t)AFE_PORT_ID_QUATERNARY_MI2S_RX << 16, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, APR_BASIC_RSP_RESULT, NULL,
++		    1000);
++		AU_LOG("ADM COPP %u close: %d", au.copp_id, e);
++		au.adm_open = false;
++	}
++	if (au.mapped) {
++		uint32_t handle = au.mem_handle;
++		(void)au_apr(APR_SVC_ASM, 0, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &handle, 4, APR_BASIC_RSP_RESULT, NULL, 1000);
++		au.mapped = false;
++	}
++	if (au.afe_started) {
++		struct {
++			uint16_t port, reserved;
++		} __attribute__((packed)) stop = { AFE_PORT_ID_QUATERNARY_MI2S_RX, 0 };
++		(void)au_apr(APR_SVC_AFE, 0, AFE_PORT_ID_QUATERNARY_MI2S_RX, AFE_PORT_CMD_DEVICE_STOP, &stop, sizeof(stop),
++		    APR_BASIC_RSP_RESULT, NULL, 1000);
++		au.afe_started = false;
++	}
++	if (au.afe_clk) {
++		(void)au_afe_clock(0);
++		au.afe_clk = false;
++	}
++	au.idle = false;
++	au.stops++;
++	au_status_publish();
++	AU_LOG("path stopped");
++}
++
++static int
++au_path_start(uint32_t rate)
++{
++	int e;
++	if (au.step < AU_STEP_Q6) {
++		return ENXIO;
++	}
++	if ((e = au_ring_alloc()) != 0 || (e = au_smmu_map()) != 0) {
++		return e ? e : EIO;
++	}
++	au.rate = rate;
++	au.bits = 16;
++	au_mi2s_pins();
++
++	/* sdm845_snd_startup(): QUAD_MI2S_IBIT = 48 kHz x 2 x 16 bit */
++	if ((e = au_afe_clock(48000u * 2u * 16u)) != 0) {
++		return au_fail("AFE clock QUAD_MI2S_IBIT", e);
++	}
++	au.afe_clk = true;
++	/* q6afe_i2s_port_prepare() + q6afe_port_start(): I2S config (the union's size, as Linux sends it), DEVICE_START */
++	{
++		struct {
++			uint16_t port_id, payload_size;
++			uint32_t lsw, msw, handle;
++			uint32_t module_id, param_id;
++			uint16_t param_size, reserved;
++			uint32_t minor;
++			uint16_t bit_width, channel_mode, mono_stereo, ws_src;
++			uint32_t sample_rate;
++			uint16_t data_format, reserved2;
++			uint8_t pad[AFE_PORT_CONFIG_SIZE - 16];
++		} __attribute__((packed)) c;
++		bzero(&c, sizeof(c));
++		c.port_id = AFE_PORT_ID_QUATERNARY_MI2S_RX;
++		c.payload_size = 12 + AFE_PORT_CONFIG_SIZE;
++		c.module_id = AFE_MODULE_AUDIO_DEV_INTERFACE;
++		c.param_id = AFE_PARAM_ID_I2S_CONFIG;
++		c.param_size = AFE_PORT_CONFIG_SIZE;
++		c.minor = 1;                    /* AFE_API_VERSION_I2S_CONFIG */
++		c.bit_width = 16;
++		c.channel_mode = 1;             /* AFE_PORT_I2S_SD0 */
++		c.mono_stereo = 1;              /* AFE_PORT_I2S_STEREO */
++		c.ws_src = 1;                   /* AFE_PORT_CONFIG_I2S_WS_SRC_INTERNAL: CPU is master (SND_SOC_DAIFMT_BP_FP) */
++		c.sample_rate = 48000;
++		c.data_format = 0;              /* AFE_LINEAR_PCM_DATA */
++		e = au_apr(APR_SVC_AFE, 0, AFE_PORT_ID_QUATERNARY_MI2S_RX, AFE_PORT_CMD_SET_PARAM_V2, &c, sizeof(c),
++		    APR_BASIC_RSP_RESULT, NULL, 1000);
++		if (e) {
++			au_path_stop();
++			return au_fail("AFE I2S config", e);
++		}
++		struct {
++			uint16_t port, reserved;
++		} __attribute__((packed)) s = { AFE_PORT_ID_QUATERNARY_MI2S_RX, 0 };
++		e = au_apr(APR_SVC_AFE, 0, AFE_PORT_ID_QUATERNARY_MI2S_RX, AFE_PORT_CMD_DEVICE_START, &s, sizeof(s),
++		    APR_BASIC_RSP_RESULT, NULL, 1000);
++		if (e) {
++			au_path_stop();
++			return au_fail("AFE DEVICE_START", e);
++		}
++		au.afe_started = true;
++	}
++	/* q6asm_map_memory_regions(): the whole ring as one region */
++	{
++		struct {
++			uint16_t pool, num;
++			uint32_t flags;
++			uint32_t lsw, msw, size;
++		} __attribute__((packed)) m = { ADSP_MEMORY_MAP_SHMEM8_4K_POOL, 1, 0, AU_RING_IOVA, AU_SID_ADDR_BITS,
++		                               AU_RING_BYTES };
++		uint32_t out[4] = { 0 };
++		e = au_apr(APR_SVC_ASM, 0, (ASM_SESSION << 8), ASM_CMD_SHARED_MEM_MAP_REGIONS, &m, sizeof(m),
++		    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, out, 1000);
++		if (e || !out[0]) {
++			au_path_stop();
++			return au_fail("ASM shared memory map", e ? e : EIO);
++		}
++		au.mem_handle = out[0];
++		au.mapped = true;
++	}
++	/* q6asm_open_write(): multichannel PCM, 16 bit, to the device matrix */
++	{
++		struct {
++			uint32_t mode_flags;
++			uint16_t sink, bits;
++			uint32_t popp, fmt;
++		} __attribute__((packed)) o = { 0, 0, 16, ASM_STREAM_POSTPROC_TOPO_ID_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
++		e = au_apr(APR_SVC_ASM, ASM_PORT, ASM_SESSION, ASM_STREAM_CMD_OPEN_WRITE_V3, &o, sizeof(o),
++		    APR_BASIC_RSP_RESULT, NULL, 1000);
++		if (e) {
++			au_path_stop();
++			return au_fail("ASM OPEN_WRITE_V3", e);
++		}
++		au.asm_open = true;
++	}
++	/* q6routing_stream_open(): an ADM COPP on the port, then the RX matrix maps session 1 to it */
++	{
++		struct {
++			uint16_t flags, mode, ep1, ep2;
++			uint32_t topology;
++			uint16_t channels, bit_width;
++			uint32_t rate;
++			uint8_t map[8];
++		} __attribute__((packed)) o = { 0, ADM_PATH_PLAYBACK, AFE_PORT_ID_QUATERNARY_MI2S_RX, 0, NULL_COPP_TOPOLOGY, 2,
++		                               16, 48000, { 1, 2, 0, 0, 0, 0, 0, 0 } };
++		uint32_t out[4] = { 0 };
++		e = au_apr(APR_SVC_ADM, AFE_PORT_ID_QUATERNARY_MI2S_RX, (uint32_t)AFE_PORT_ID_QUATERNARY_MI2S_RX << 16,
++		    ADM_CMD_DEVICE_OPEN_V5, &o, sizeof(o), ADM_CMDRSP_DEVICE_OPEN_V5, out, 1000);
++		if (e || out[0] != 0) {
++			au_path_stop();
++			return au_fail("ADM DEVICE_OPEN_V5", e ? e : EIO);
++		}
++		au.copp_id = out[1] & 0xffffu;
++		au.adm_open = true;
++		AU_LOG("ADM COPP %u on port %#x", au.copp_id, AFE_PORT_ID_QUATERNARY_MI2S_RX);
++		struct {
++			uint32_t matrix, sessions;
++			uint16_t session, copps;
++			uint16_t copp[2];
++		} __attribute__((packed)) mm = { ADM_MATRIX_ID_AUDIO_RX, 1, ASM_SESSION, 1, { (uint16_t)au.copp_id, 0 } };
++		e = au_apr(APR_SVC_ADM, 0, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &mm, sizeof(mm), APR_BASIC_RSP_RESULT, NULL,
++		    1000);
++		if (e) {
++			au_path_stop();
++			return au_fail("ADM MATRIX_MAP", e);
++		}
++	}
++	/* q6asm_media_format_block_multi_ch_pcm(), then RUN */
++	{
++		struct {
++			uint32_t fmt_blk_size;
++			uint16_t channels, bits;
++			uint32_t rate;
++			uint16_t is_signed, reserved;
++			uint8_t map[8];
++		} __attribute__((packed)) f = { 20, 2, 16, rate, 1, 0, { 1, 2, 0, 0, 0, 0, 0, 0 } };
++		e = au_apr(APR_SVC_ASM, ASM_PORT, ASM_SESSION, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &f, sizeof(f),
++		    APR_BASIC_RSP_RESULT, NULL, 1000);
++		if (e) {
++			au_path_stop();
++			return au_fail("ASM MEDIA_FMT", e);
++		}
++		struct {
++			uint32_t flags, lsw, msw;
++		} __attribute__((packed)) r = { 0, 0, 0 };
++		e = au_apr(APR_SVC_ASM, ASM_PORT, ASM_SESSION, ASM_SESSION_CMD_RUN_V2, &r, sizeof(r), APR_BASIC_RSP_RESULT,
++		    NULL, 1000);
++		if (e) {
++			au_path_stop();
++			return au_fail("ASM RUN", e);
++		}
++	}
++	au.running = true;
++	au.idle = false;
++	au.inflight = 0;
++	au.next_seq = au.done_seq;
++	while (au.inflight < AU_QUEUED && au_queue(au.next_seq) == 0) {
++		au.next_seq++;
++	}
++	au.step = AU_STEP_PATH;
++	au.starts++;
++	au_status_publish();
++	AU_LOG("path running at %u Hz (session %u, COPP %u, map handle %#x)", rate, ASM_SESSION, au.copp_id, au.mem_handle);
++	sweet_log_sync();
++	if (au_amps) {
++		int a = au_amps_on();
++		if (a) {
++			AU_LOG("amplifiers not powered (%d); the path keeps running", a);
++		}
++	}
++	return 0;
++}
++
++/* everything up to a ready Q6 */
++static int
++au_bring_up(void)
++{
++	int e = au_adsp_boot();
++	if (!e) {
++		e = au_glink_up();
++	}
++	if (!e) {
++		e = au_q6_ready();
++	}
++	if (!e && au_amps && !au.amps_loaded) {
++		int a = au_amps_load();
++		if (a) {
++			AU_LOG("amplifiers not loaded (%d); the path can still run", a);
++		}
++	}
++	sweet_log_sync();
++	return e;
++}
++
++/* ------------------------------------------------------------------ */
++/* service thread and the C interface of SweetAudio.cpp                */
++/* ------------------------------------------------------------------ */
++
++void sweet_audio_lock(void);
++void sweet_audio_unlock(void);
++int sweet_audio_start(uint32_t rate);
++int sweet_audio_stop(void);
++int sweet_audio_memory(uint32_t type, vm_offset_t *kva, uint32_t *size);
++void sweet_audio_init(void);
++extern void SweetAudioPublish(void);            /* iokit/Kernel/arm/SweetAudio.cpp */
++
++static void
++au_thread(void *arg, wait_result_t wr)
++{
++#pragma unused(arg, wr)
++	for (;;) {
++		lck_mtx_lock(&au_mtx);
++		if (au.step >= AU_STEP_GLINK && !au.g.bad_rx) {
++			au_glink_poll();
++		}
++		if (au.step >= AU_STEP_BOOTED) {
++			au_smp2p_poll();
++		}
++		if (au.running && au.idle && au_idle_s && au_now_ms() - au.idle_since > au_idle_s * 1000ull) {
++			AU_LOG("idle for %u s: tearing the path down", au_idle_s);
++			au_path_stop();
++		}
++		bool fast = au.running;
++		lck_mtx_unlock(&au_mtx);
++		au_sleep_ms(fast ? 2 : 50);
++	}
++}
++
++static void
++au_thread_start(void)
++{
++	if (au.thread) {
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start_priority((thread_continue_t)au_thread, NULL, 91, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++		au.thread = true;
++	}
++}
++
++void
++sweet_audio_lock(void)
++{
++	lck_mtx_lock(&au_mtx);
++}
++
++void
++sweet_audio_unlock(void)
++{
++	lck_mtx_unlock(&au_mtx);
++}
++
++/* START from the client: everything comes up on first use; a running path at the same rate just leaves idle */
++int
++sweet_audio_start(uint32_t rate)
++{
++	if (rate != 44100 && rate != 48000) {
++		return EINVAL;
++	}
++	if (!au_clients) {
++		return ENODEV;          /* the plug-in stays on its own clock until the path is trusted */
++	}
++	au.tone = false;
++	if (au.running && au.rate == rate) {
++		au.idle = false;
++		au_status_publish();
++		return 0;
++	}
++	if (au.running) {
++		au_path_stop();
++	}
++	int e = au_bring_up();
++	au_thread_start();
++	if (!e) {
++		e = au_path_start(rate);
++	}
++	return e;
++}
++
++/* STOP from the client: the path keeps running on silence until the idle timeout */
++int
++sweet_audio_stop(void)
++{
++	if (au.running && !au.idle) {
++		au.idle = true;
++		au.idle_since = au_now_ms();
++		au_status_publish();
++	}
++	return 0;
++}
++
++int
++sweet_audio_memory(uint32_t type, vm_offset_t *kva, uint32_t *size)
++{
++	int e = au_ring_alloc();
++	if (e) {
++		return e;
++	}
++	if (type == SWEET_AUDIO_MEM_RING) {
++		*kva = au.ring;
++		*size = AU_RING_BYTES;
++		return 0;
++	}
++	if (type == SWEET_AUDIO_MEM_STATUS) {
++		*kva = au.status;
++		*size = PAGE_SIZE;
++		return 0;
++	}
++	return EINVAL;
++}
++
++static void
++au_publish_thread(void *arg, wait_result_t wr)
++{
++#pragma unused(arg, wr)
++	delay(15 * 1000 * 1000);
++	SweetAudioPublish();
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_audio_init(void)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetaudio", &on, sizeof(on));
++	if (!on || !sweet_board_beryllium()) {
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start((thread_continue_t)au_publish_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* sysctls                                                             */
++/* ------------------------------------------------------------------ */
++
++/* a 3 kHz sine at -12 dBFS (16 frames per cycle at 48 kHz) that repeats exactly over the ring */
++static void
++au_fill_tone(void)
++{
++	static const int16_t q[16] = { 0, 3135, 5793, 7568, 8191, 7568, 5793, 3135, 0, -3135, -5793, -7568, -8191, -7568,
++		                       -5793, -3135 };
++	uint32_t *f = (uint32_t *)au.ring;
++	for (uint32_t i = 0; i < AU_RING_FRAMES; i++) {
++		int16_t v = (int16_t)(q[i % 16] / 2);
++		f[i] = (uint16_t)v | ((uint32_t)(uint16_t)v << 16);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static int
++sweet_audio_ctl_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = (int)au.step;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (!sweet_board_beryllium()) {
++		return ENODEV;
++	}
++	lck_mtx_lock(&au_mtx);
++	if (!au_map()) {
++		lck_mtx_unlock(&au_mtx);
++		return ENOMEM;
++	}
++	switch (value) {
++	case 1:
++		error = au_bring_up();
++		au_thread_start();
++		break;
++	case 2:
++		/* a tone for kern.sweet_audio_tone_s seconds, then STOP (the path idles out later) */
++		error = au_bring_up();
++		au_thread_start();
++		if (!error && !au.running) {
++			error = au_path_start(48000);
++		}
++		if (!error) {
++			au.tone = true;
++			au_fill_tone();
++			au.idle = false;
++			uint64_t t0 = au_now_ms();
++			while (au_now_ms() - t0 < au_tone_s * 1000ull && au.running) {
++				au_glink_poll();
++				au_sleep_ms(2);
++			}
++			au_smmu_report("tone");
++			AU_LOG("tone done: %u periods played, %u write errors, %u events (last %#x)", (unsigned)au.done_seq,
++			    au.write_errors, au.apr_events, au.last_event);
++			au.tone = false;
++			bzero((void *)au.ring, AU_RING_BYTES);
++			(void)sweet_audio_stop();
++		}
++		break;
++	case 3:
++		if (au.running) {
++			au_path_stop();
++		}
++		break;
++	case 4:
++		error = au_amps_probe();
++		break;
++	case 5:
++		error = au.running ? au_amps_on() : ENXIO;
++		break;
++	case 6:
++		au_amps_off();
++		break;
++	case 7:
++		au_amp_bus_init();
++		error = au_amps_load();
++		break;
++	case 8:
++		au_amp_bus_init();
++		au_amps_status("on request");
++		break;
++	default:
++		error = EINVAL;
++		break;
++	}
++	lck_mtx_unlock(&au_mtx);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_ctl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_audio_ctl_sysctl,
++    "I", "audio: 1 bring-up (ADSP, GLINK, APR, Q6 ready), 2 tone for sweet_audio_tone_s s, 3 stop the path, "
++    "4 probe the amplifiers, 5 amplifiers on (needs the path), 6 amplifiers off, 7 load tas2559_uCDSP.bin into them, "
++    "8 amplifier status");
++
++SYSCTL_UINT(_kern, OID_AUTO, sweet_audio_idle_s, CTLFLAG_RW | CTLFLAG_LOCKED, &au_idle_s, 0,
++    "audio: seconds without START before the path is torn down (0 = never)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_audio_clients, CTLFLAG_RW | CTLFLAG_LOCKED, &au_clients, 0,
++    "audio: let IOKit clients (the HAL plug-in) START the path");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_audio_amps, CTLFLAG_RW | CTLFLAG_LOCKED, &au_amps, 0,
++    "audio: power the TAS2559/TAS2560 amplifiers with the path");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_audio_tone_s, CTLFLAG_RW | CTLFLAG_LOCKED, &au_tone_s, 0,
++    "audio: length of the ctl 2 tone");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_audio_tas_flags, CTLFLAG_RW | CTLFLAG_LOCKED, &au_tas_flags, 0,
++    "audio: tas2559 module flags (1 read back YRAM, 2 no failsafe)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_audio_i2c_half_us, CTLFLAG_RW | CTLFLAG_LOCKED, &au_i2c_half_us, 0,
++    "audio: half SCL period of the amplifiers' bit-banged I2C in microseconds");
++SYSCTL_INT(_kern, OID_AUTO, sweet_audio_tas_program, CTLFLAG_RW | CTLFLAG_LOCKED, &au_program, 0,
++    "audio: TAS2559 firmware program (-1 = default)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_audio_tas_config, CTLFLAG_RW | CTLFLAG_LOCKED, &au_config, 0,
++    "audio: TAS2559 firmware configuration (-1 = default)");
++
++static int
++sweet_audio_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[768];
++	uint32_t gd[4] = { 0 };
++	if (au.smem && au.g.desc) {
++		for (unsigned i = 0; i < 4; i++) {
++			gd[i] = smem_u32(au.g.desc + 4 * i);
++		}
++	}
++	snprintf(buf, sizeof(buf),
++	    "step=%u error=%d where=%s adsp_up=%u fatal=%u handover=%u smp2p=%#x glink=%u/%u ring=%#x/%#x/%#x/%#x rx_fifo=%u "
++	    "rcid=%u opens=%u rx=%u tx=%u "
++	    "apr_rx=%u apr_tx=%u apr_bad=%u events=%u last_event=%#x avcs=%u running=%u idle=%u rate=%u copp=%u "
++	    "handle=%#x done=%llu queued=%llu inflight=%u write_dones=%u write_errors=%u starts=%u stops=%u amps=%u "
++	    "amp_error=%d tas=%u loaded=%u config=%d",
++	    au.step, au.error, au.where[0] ? au.where : "-", au.adsp_up, au.adsp_fatal, au.handover, au.smp2p_in_last,
++	    au.g.version_acked, au.g.open_acked, gd[0], gd[1], gd[2], gd[3], au.g.rx_len, au.g.rcid, au.g.other_opens,
++	    au.g.rx_msgs, au.g.tx_msgs, au.apr_rx,
++	    au.apr_tx, au.apr_bad, au.apr_events, au.last_event, au.avcs_state, au.running, au.idle, au.rate, au.copp_id,
++	    au.mem_handle, au.done_seq, au.next_seq, au.inflight, au.write_dones, au.write_errors, au.starts, au.stops,
++	    au.amps_on, au.amp_error, au.tas_ready, au.amps_loaded, au.tas_config);
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_audio_sysctl, "A",
++    "audio state (bsd/dev/sweet_audio.c)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_tas2559.c b/bsd/dev/sweet_tas2559.c
+new file mode 100644
+index 0000000..800ddae
+--- /dev/null
++++ b/bsd/dev/sweet_tas2559.c
+@@ -0,0 +1,1669 @@
++/*
++ * Kernel copy of audio/tas2559/tas2559_fw.c (the Bergamota repo), the TAS2559/TAS2560 bring-up that
++ * bsd/dev/sweet_audio.c drives over its bit-banged I2C. Keep the two in sync.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * TAS2559 + TAS2560 bring-up, freestanding C11 (only memset/memcmp from the C library, no allocation,
++ * no floating point, no recursion, no VLAs). Stack (aarch64 gcc -O2): about 560 bytes on the normal
++ * load path, 750 with TAS_FLAG_YCRC, about 1 KiB worst case (an I2C error logged during a YRAM
++ * read-back), plus whatever the tas_ops callbacks use.
++ *
++ * Original code reimplementing the logic of TI's tas2559.c (GPL-2.0, the mainline-style port used on
++ * this phone). Register numbers, the default/startup/unmute/shutdown tables and their delays are
++ * carried over from it as data.
++ *
++ * ---- Firmware container (tas2559_uCDSP.bin, all integers big-endian; fw_parse_*() in the driver) ----
++ *  header : "5552", u32 size, u32 checksum, u32 PPC version, u32 FW version, u32 driver version,
++ *           u32 timestamp, 64-byte DDC name, NUL-terminated description, u32 device family (must be 0),
++ *           u32 device (must be 4 = TAS2559)
++ *  u16 PLL count, each: 64-byte name, description, block
++ *  u16 program count, each: 64-byte name, description, u8 app mode, u16 boost, data
++ *  u16 configuration count, each: 64-byte name, description, [u16 devices if driver version >= 0x300
++ *           or 0x101 <= version < 0x200, else both], u8 program, u8 PLL, u32 sample rate,
++ *           [u8 PLL source, u32 PLL source rate if version >= 0x400], data
++ *  calibrations (same as programs but u8 program, u8 configuration), parsed only if MORE than 64
++ *           bytes remain after the configurations (driver quirk kept)
++ *  data   : 64-byte name, description, u16 block count, blocks
++ *  block  : u32 type, [u8 PRAM checksum present, u8 PRAM checksum, u8 YRAM checksum present,
++ *           u8 YRAM checksum if version >= 0x200], u32 command count, count * 4-byte commands
++ * The header checksum is a CRC-32 (IEEE, as zlib) over the first `size` bytes with the checksum field
++ * read as zero. The driver does not check it; tas_fw_parse() does.
++ *
++ * ---- Block commands (tas2559_load_block) ----
++ *  [book, page, offset <= 0x7f, value]  write value to (book, page, offset)
++ *  [hi, lo, 0x81, x]                    sleep (hi << 8 | lo) ms
++ *  [hi, lo, 0x85, x] [book, page, offset, d0] d1 ...
++ *                                       write L = (hi << 8 | lo) bytes d0.. starting at (book, page,
++ *                                       offset) in one auto-increment I2C write; L <= 1 writes d0 only.
++ *                                       Consumes 2 + (L >= 2 ? (L - 2) / 4 + 1 : 0) command words.
++ *  any other offset >= 0x80             skipped (the driver ignores it)
++ * Bursts must stay inside the page (offset + L - 1 <= 127): the driver's regmap has max_register 128
++ * and the TI tooling splits bursts per page; tas_fw_parse() rejects anything else.
++ *
++ * ---- Which device a block goes to ----
++ *  PLL (0x00), PGM_DEV_A (0x01), CFG_COEFF_DEV_A (0x03), CFG_PRE_DEV_A (0x04)   -> TAS2559 (0x4c)
++ *  PGM_DEV_B (0x08), CFG_PRE_DEV_B (0x0b), PST_POWERUP_DEV_B (0x0e)              -> TAS2560 (0x4d)
++ *  CFG_COEFF_DEV_B (0x0a) is requested by tas2559_load_coefficient() but its load_block() has no
++ *  device for it and fails with -EINVAL; kept (TAS_EBLOCK). The beryllium file has none.
++ *
++ * ---- Book/page addressing (tas2559_change_book_page), the same on both chips ----
++ *  Register 0 of every page selects the page; register 127 of page 0 selects the book. Per device the
++ *  driver caches the current book and page. Same book: write reg 0 = page if the page differs. Other
++ *  book: write reg 0 = 0, reg 127 = book, then reg 0 = page if page != 0. The cache is unknown after
++ *  the reset GPIO toggles (the driver stores -1 into unsigned chars, i.e. 0xff; here it is a real
++ *  "unknown" state, which only differs for book 255, never used) and, in this code, at the start of
++ *  every public call and after a failed write. A write to both devices selects on the TAS2559, then the
++ *  TAS2560, then writes the TAS2559, then the TAS2560.
++ *
++ * ---- TAS2559 vs TAS2560 ----
++ *  PRAM checksum: TAS2559 write 1 to B0_P0_R33 before the block, read B0_P0_R32 after it; TAS2560 write
++ *  1 to and read back B0_P0_R126. DAC gain: TAS2559 B0_P0_R6 bits 6:3, TAS2560 B0_P0_R4 bits 3:0.
++ *  The TAS2560 has no DSP program (its "program" is 8 register writes); its coefficients (book 0, pages
++ *  50..52) are written after it is powered up (PST_POWERUP_DEV_B).
++ *
++ * ---- Checksums ----
++ *  PRAM: blocks with the PRAM flag (here only the TAS2559 program blocks) are checked against the chip's
++ *  CRC register exactly like the driver; a mismatch fails the load (the port has no retry).
++ *  YRAM: the port skips these bytes ("skip YRAM checksum data for simplicity") and does not parse
++ *  ti,ycrc-enable. With TAS_FLAG_YCRC every write into a YRAM window is read back and summed as
++ *  sum(crc8(byte)) mod 256, CRC-8 polynomial 0x4d MSB-first, init 0, over the YRAM windows of tas2559.h
++ *  (TAS2559: book 140 page 42 R88-127, pages 43-55 R8-127, page 56 R8-47; book 0 pages 50-60 R8-127,
++ *  page 61 R8-27, minus the coefficient swap word B0_P53_R44-47; book 120 page 12 R104-107. TAS2560:
++ *  book 0 pages 50-52 R8-127). This reproduces all 51 YRAM checksums in the beryllium file.
++ *
++ * ---- Clocks (from the beryllium file, not from a datasheet) ----
++ *  Every PLL block sets B0_P1_R115 = 0x0f (main clock from the PLL) and B0_P1_R116 = 0x00 (PLL input
++ *  GPIO1, which the driver's startup table calls BCLK), D = 0, and J chosen for 73.728 MHz at 48 kHz:
++ *  J = 48 for "BCLK 1.536 MHz" (PLL 0, 3, 4) and J = 24 for "BCLK 3.072 MHz" (PLL 1). No MCLK is used.
++ *  The TAS2560 program sets its PLL from its own BCLK pin, P = 1, J = 16, and it is identical in the
++ *  1.536 and 3.072 MHz configurations; together with the TAS2559 program setting up ASIM (B0_P1_R98..103)
++ *  and GPIO8..10, and the DSP's channel matrix (B0_P53_R20..40) routing both input channels, this means
++ *  the TAS2560 is clocked and fed by the TAS2559's ASIM port, not by the SoC. Inference, not verified.
++ *
++ * ---- Calibration ----
++ *  The port has no calibration support at all and the file has no calibration section, so nothing is
++ *  done: the DSP keeps the default speaker resistance of the tuning (B140_P47_R40 = 0x39666666 and
++ *  B140_P54_R12 = 0x48b32d4b in configuration 0, 7.175 and 9.0875 ohm if Q5.27).
++ */
++#include "sweet_tas2559.h"
++#include <sys/systm.h>
++#include <string.h>             /* memset, memcmp (kernel copy of tas_shim.h) */
++
++/* log formatting lives in out-of-line functions so its line buffer is only on the stack while logging */
++#if defined(__GNUC__) || defined(__clang__)
++#define TAS_COLD __attribute__((cold, noinline))
++#define TAS_NOINLINE __attribute__((noinline))
++#else
++#define TAS_COLD
++#define TAS_NOINLINE
++#endif
++
++/* Packed register number, TAS2559_REG(book, page, reg) of tas2559.h */
++#define TAS_REG(b, p, r) (((uint32_t)(b) << 15) | ((uint32_t)(p) << 7) | (uint32_t)(r))
++#define TAS_BOOK(x)      ((uint8_t)((x) >> 15))
++#define TAS_PAGE(x)      ((uint8_t)(((x) >> 7) & 0xff))
++#define TAS_PREG(x)      ((uint8_t)((x) & 0x7f))
++
++#define TAS_PAGE_SEL 0    /* every page */
++#define TAS_BOOK_SEL 127  /* page 0 of every book */
++
++/* TAS2559 (DevA) */
++#define A_SW_RESET        TAS_REG(0, 0, 1)
++#define A_REV_PGID        TAS_REG(0, 0, 3)
++#define A_POWER_CTRL1     TAS_REG(0, 0, 4)
++#define A_POWER_CTRL2     TAS_REG(0, 0, 5)
++#define A_SPK_CTRL        TAS_REG(0, 0, 6)
++#define A_MUTE            TAS_REG(0, 0, 7)
++#define A_SAR_ADC2        TAS_REG(0, 0, 21)
++#define A_CRC_CHECKSUM    TAS_REG(0, 0, 32)
++#define A_CRC_RESET       TAS_REG(0, 0, 33)
++#define A_SAFE_GUARD      TAS_REG(0, 0, 37)
++#define A_CLK_ERR_CTRL    TAS_REG(0, 0, 44)
++#define A_CLK_ERR_CTRL2   TAS_REG(0, 0, 45)
++#define A_CLK_ERR_CTRL3   TAS_REG(0, 0, 46)
++#define A_POWER_UP_FLAG   TAS_REG(0, 0, 100)
++#define A_FLAGS_1         TAS_REG(0, 0, 104)
++#define A_FLAGS_2         TAS_REG(0, 0, 108)
++#define A_ASI1_DAC_FORMAT TAS_REG(0, 1, 1)
++#define A_GPIO1_PIN       TAS_REG(0, 1, 61)
++#define A_GPIO2_PIN       TAS_REG(0, 1, 62)
++#define A_GPIO_HIZ_CTRL2  TAS_REG(0, 1, 80)
++#define A_SOFT_MUTE       TAS_REG(100, 0, 7)
++
++/* TAS2560 (DevB) */
++#define B_DEV_MODE        TAS_REG(0, 0, 2)
++#define B_SPK_CTRL        TAS_REG(0, 0, 4)
++#define B_MUTE            TAS_REG(0, 0, 7)
++#define B_DAI_FMT         TAS_REG(0, 0, 20)
++#define B_ASI_CFG_1       TAS_REG(0, 0, 24)
++#define B_CLK_ERR_CTRL    TAS_REG(0, 0, 33)
++#define B_FLAGS_1         TAS_REG(0, 0, 38)
++#define B_FLAGS_2         TAS_REG(0, 0, 39)
++#define B_POWER_UP_FLAG   TAS_REG(0, 0, 42)
++#define B_CLK_ERR_CTRL2   TAS_REG(0, 0, 80)
++#define B_CRC_CHK         TAS_REG(0, 0, 126)
++
++#define TAS_SAFE_GUARD_PATTERN 0x5a
++
++/* driver versions gating container fields */
++#define PPC_DRIVER_CRCCHK        0x00000200u
++#define PPC_DRIVER_CONFDEV       0x00000300u
++#define PPC_DRIVER_MTPLLSRC      0x00000400u
++#define PPC_DRIVER_CFGDEV_NONCRC 0x00000101u
++
++#define DA  TAS_DEV_A
++#define DB  TAS_DEV_B
++#define DAB TAS_DEV_BOTH
++
++/* ------------------------------------------------------------------------------------------------ */
++/* The driver's register tables (tas2559_dev_load_data format: device, register or delay, value).    */
++
++enum { SEQ_END = 0, SEQ_WRITE, SEQ_UDELAY, SEQ_MDELAY };
++
++struct tas_seq {
++	uint8_t  dev;   /* entry runs if (filter & dev); writes go to dev itself */
++	uint8_t  op;
++	uint16_t val;   /* register value, or delay in us/ms */
++	uint32_t reg;
++};
++
++#define SEQ_W(d, r, v) { (d), SEQ_WRITE, (v), (r) }
++#define SEQ_US(d, v)   { (d), SEQ_UDELAY, (v), 0 }
++#define SEQ_MS(d, v)   { (d), SEQ_MDELAY, (v), 0 }
++#define SEQ_STOP       { 0, SEQ_END, 0, 0 }
++
++/* p_tas2559_default_data */
++static const struct tas_seq seq_default[] = {
++	SEQ_W(DA, A_SAR_ADC2, 0x05),       /* enable SAR ADC */
++	SEQ_W(DA, A_CLK_ERR_CTRL2, 0x21),  /* clk1: hysteresis 0.34 ms, clock halt 22 ms */
++	SEQ_W(DA, A_CLK_ERR_CTRL3, 0x21),  /* clk2: ramp down 15 dB/us, hysteresis 10.66 us, halt 22 ms */
++	SEQ_W(DB, B_CLK_ERR_CTRL2, 0x21),  /* ramp down 15 dB/us, clk1 hysteresis 0.34 ms, clk2 10.6 us */
++	SEQ_W(DA, A_SAFE_GUARD, TAS_SAFE_GUARD_PATTERN),
++	SEQ_W(DA, A_CLK_ERR_CTRL, 0x00),   /* clock error detection off until startup */
++	SEQ_W(DB, B_CLK_ERR_CTRL, 0x00),
++	SEQ_STOP
++};
++
++/* tas2559_load_default(): read-modify-write steps after the table */
++struct tas_upd {
++	uint8_t  dev, mask, val;
++	uint32_t reg;
++};
++
++static const struct tas_upd upd_default[] = {
++	{ DA, 0x18, 0x00, A_ASI1_DAC_FORMAT },  /* ASI1 word length 16 bit (ti,bit-rate = 16) */
++	{ DB, 0x03, 0x00, B_DAI_FMT },          /* TAS2560 word length 16 bit */
++	{ DA, 0x01, 0x01, A_ASI1_DAC_FORMAT },  /* DOUT tri-state during extra BCLKs */
++	{ DB, 0x02, 0x02, B_ASI_CFG_1 },        /* the same for the TAS2560 */
++	{ DA, 0x30, 0x30, A_GPIO_HIZ_CTRL2 },   /* IRQ pin: low/Hi-Z, active-high driven */
++};
++
++/* p_tas2559_startup_data */
++static const struct tas_seq seq_startup[] = {
++	SEQ_W(DA, A_GPIO1_PIN, 0x01),      /* enable BCLK */
++	SEQ_W(DA, A_GPIO2_PIN, 0x01),      /* enable WCLK */
++	SEQ_W(DA, A_POWER_CTRL2, 0xa0),    /* class-D, boost power up */
++	SEQ_W(DA, A_POWER_CTRL2, 0xa3),    /* + I/V sense */
++	SEQ_W(DA, A_POWER_CTRL1, 0xf8),    /* PLL, DSP, clock dividers power up */
++	SEQ_US(DAB, 2000),
++	SEQ_W(DB, B_DEV_MODE, 0x02),
++	SEQ_W(DB, B_MUTE, 0x41),
++	SEQ_US(DAB, 2000),
++	SEQ_W(DA, A_CLK_ERR_CTRL, 0x2b),   /* enable clock error detection */
++	SEQ_W(DB, B_CLK_ERR_CTRL, 0x0b),
++	SEQ_STOP
++};
++
++/* p_tas2559_unmute_data */
++static const struct tas_seq seq_unmute[] = {
++	SEQ_W(DA, A_MUTE, 0x00),
++	SEQ_W(DB, B_MUTE, 0x40),
++	SEQ_W(DA, A_SOFT_MUTE, 0x00),
++	SEQ_STOP
++};
++
++/* p_tas2559_shutdown_data */
++static const struct tas_seq seq_shutdown[] = {
++	SEQ_W(DA, A_CLK_ERR_CTRL, 0x00),   /* clock error detection off */
++	SEQ_W(DB, B_CLK_ERR_CTRL, 0x00),
++	SEQ_W(DA, A_SOFT_MUTE, 0x01),      /* soft mute */
++	SEQ_W(DB, B_MUTE, 0x41),
++	SEQ_W(DB, B_MUTE, 0x01),
++	SEQ_MS(DAB, 10),
++	SEQ_MS(DB, 20),
++	SEQ_W(DA, A_POWER_CTRL1, 0x60),    /* DSP power down */
++	SEQ_MS(DA, 2),
++	SEQ_W(DA, A_MUTE, 0x03),           /* mute */
++	SEQ_W(DA, A_POWER_CTRL2, 0x00),    /* class-D, boost power down */
++	SEQ_W(DA, A_POWER_CTRL1, 0x00),    /* all power down */
++	SEQ_W(DB, B_DEV_MODE, 0x01),
++	SEQ_W(DA, A_GPIO1_PIN, 0x00),      /* disable BCLK */
++	SEQ_W(DA, A_GPIO2_PIN, 0x00),      /* disable WCLK */
++	SEQ_STOP
++};
++
++/* p_tas2559_shutdown_DevB_data: walked with filter DevB, so its TAS2559 lines never run (as in the driver) */
++static const struct tas_seq seq_shutdown_b[] = {
++	SEQ_W(DA, A_CLK_ERR_CTRL, 0x00),
++	SEQ_W(DB, B_CLK_ERR_CTRL, 0x00),
++	SEQ_W(DB, B_MUTE, 0x41),
++	SEQ_W(DB, B_MUTE, 0x01),
++	SEQ_W(DA, A_POWER_CTRL1, 0x60),
++	SEQ_MS(DAB, 30),
++	SEQ_W(DB, B_DEV_MODE, 0x01),
++	SEQ_W(DA, A_POWER_CTRL2, 0x00),
++	SEQ_W(DA, A_POWER_CTRL1, 0x00),
++	SEQ_W(DA, A_GPIO1_PIN, 0x00),
++	SEQ_W(DA, A_GPIO2_PIN, 0x00),
++	SEQ_STOP
++};
++
++/* ------------------------------------------------------------------------------------------------ */
++/* Small helpers                                                                                     */
++
++static const uint8_t tas_addr7[2] = { TAS2559_I2C_ADDR, TAS2560_I2C_ADDR };
++
++const char *
++tas_strerror(int err)
++{
++	switch (err) {
++	case TAS_OK:         return "ok";
++	case TAS_EINVAL:     return "invalid argument";
++	case TAS_EFORMAT:    return "malformed firmware";
++	case TAS_ECHECKSUM:  return "firmware CRC-32 mismatch";
++	case TAS_ELIMIT:     return "firmware exceeds a table limit";
++	case TAS_ENOENT:     return "no matching program/configuration";
++	case TAS_EIO:        return "I2C transfer failed";
++	case TAS_EPCRC:      return "PRAM checksum mismatch";
++	case TAS_EYCRC:      return "YRAM read-back/checksum mismatch";
++	case TAS_ESAFEGUARD: return "safe-guard register lost (chip was reset)";
++	case TAS_EBLOCK:     return "block type has no target device";
++	default:             return "unknown error";
++	}
++}
++
++const char *
++tas_block_type_name(uint32_t type)
++{
++	switch (type) {
++	case TAS_BLOCK_PLL:               return "PLL";
++	case TAS_BLOCK_PGM_DEV_A:         return "PGM_DEV_A";
++	case TAS_BLOCK_CFG_COEFF_DEV_A:   return "CFG_COEFF_DEV_A";
++	case TAS_BLOCK_CFG_PRE_DEV_A:     return "CFG_PRE_DEV_A";
++	case TAS_BLOCK_CFG_POST:          return "CFG_POST";
++	case TAS_BLOCK_CFG_POST_POWER:    return "CFG_POST_POWER";
++	case TAS_BLOCK_PGM_DEV_B:         return "PGM_DEV_B";
++	case TAS_BLOCK_CFG_COEFF_DEV_B:   return "CFG_COEFF_DEV_B";
++	case TAS_BLOCK_CFG_PRE_DEV_B:     return "CFG_PRE_DEV_B";
++	case TAS_BLOCK_PGM_ALL:           return "PGM_ALL";
++	case TAS_BLOCK_PST_POWERUP_DEV_B: return "PST_POWERUP_DEV_B";
++	default:                          return "?";
++	}
++}
++
++/* tas2559_load_block(): device index a block is written to, -1 if the driver rejects the type */
++static int
++block_target(uint32_t type)
++{
++	switch (type) {
++	case TAS_BLOCK_PLL:
++	case TAS_BLOCK_PGM_DEV_A:
++	case TAS_BLOCK_CFG_COEFF_DEV_A:
++	case TAS_BLOCK_CFG_PRE_DEV_A:
++		return 0;
++	case TAS_BLOCK_PGM_DEV_B:
++	case TAS_BLOCK_PST_POWERUP_DEV_B:
++	case TAS_BLOCK_CFG_PRE_DEV_B:
++		return 1;
++	default:
++		return -1;
++	}
++}
++
++/* device whose YRAM windows a block's checksum covers (CFG_COEFF_DEV_B counted as TAS2560 here) */
++static int
++ychk_target(uint32_t type)
++{
++	if (type == TAS_BLOCK_CFG_COEFF_DEV_B)
++		return 1;
++	return block_target(type);
++}
++
++/* YRAM window [lo, hi] of (book, page) on device idx; 0 if the page holds no YRAM (tas2559.h) */
++static int
++yram_window(int idx, uint8_t book, uint8_t page, uint8_t *lo, uint8_t *hi)
++{
++	if (idx == 0) {
++		if (book == 140) {                       /* TAS2559_YRAM_BOOK1 */
++			if (page == 42) { *lo = 88; *hi = 127; return 1; }               /* YRAM1 */
++			if (page >= 43 && page <= 55) { *lo = 8; *hi = 127; return 1; }  /* YRAM2 */
++			if (page == 56) { *lo = 8; *hi = 47; return 1; }                 /* YRAM3 */
++		} else if (book == 0) {                  /* TAS2559_YRAM_BOOK2 */
++			if (page >= 50 && page <= 60) { *lo = 8; *hi = 127; return 1; }  /* YRAM4 */
++			if (page == 61) { *lo = 8; *hi = 27; return 1; }                 /* YRAM5 */
++		} else if (book == 120) {                /* TAS2559_YRAM_BOOK3 */
++			if (page == 12) { *lo = 104; *hi = 107; return 1; }              /* YRAM6 */
++		}
++		return 0;
++	}
++	if (book == 0 && page >= 50 && page <= 52) {  /* TAS2560_YRAM */
++		*lo = 8;
++		*hi = 127;
++		return 1;
++	}
++	return 0;
++}
++
++/* TAS2559 coefficient swap word B0_P53_R44..47: a command, not memory ("should not include") */
++static int
++yram_excluded(int idx, uint8_t book, uint8_t page, unsigned reg)
++{
++	return idx == 0 && book == 0 && page == 53 && reg >= 44 && reg <= 47;
++}
++
++static uint8_t
++crc8_4d(uint8_t v)
++{
++	unsigned i;
++
++	for (i = 0; i < 8; i++)
++		v = (uint8_t)((v & 0x80) ? (v << 1) ^ 0x4d : v << 1);
++	return v;
++}
++
++/* CRC-32 (IEEE 802.3, reflected 0xedb88320), 4 bits at a time */
++static const uint32_t crc32_nibble[16] = {
++	0x00000000u, 0x1db71064u, 0x3b6e20c8u, 0x26d930acu, 0x76dc4190u, 0x6b6b51f4u, 0x4db26158u, 0x5005713cu,
++	0xedb88320u, 0xf00f9344u, 0xd6d6a3e8u, 0xcb61b38cu, 0x9b64c2b0u, 0x86d3d2d4u, 0xa00ae278u, 0xbdbdf21cu,
++};
++
++static uint32_t
++crc32_fw(const uint8_t *p, size_t n)
++{
++	uint32_t crc = 0xffffffffu;
++	size_t i;
++
++	for (i = 0; i < n; i++) {
++		uint8_t b = (i >= 8 && i < 12) ? 0 : p[i];   /* the checksum field counts as zero */
++
++		crc ^= b;
++		crc = (crc >> 4) ^ crc32_nibble[crc & 15];
++		crc = (crc >> 4) ^ crc32_nibble[crc & 15];
++	}
++	return ~crc;
++}
++
++/* ------------------------------------------------------------------------------------------------ */
++/* One-line log formatting                                                                           */
++
++#define TAS_LINE_MAX 200
++
++struct tas_line {
++	char     s[TAS_LINE_MAX];
++	unsigned n;
++};
++
++static void
++ln_c(struct tas_line *l, char c)
++{
++	if (l->n + 1 < TAS_LINE_MAX)
++		l->s[l->n++] = c;
++}
++
++static void
++ln_s(struct tas_line *l, const char *s)
++{
++	while (*s)
++		ln_c(l, *s++);
++}
++
++/* at most n characters, stopping at NUL, non-printable bytes as '?' (names come from the file) */
++static void
++ln_sn(struct tas_line *l, const char *s, unsigned n)
++{
++	unsigned i;
++
++	for (i = 0; i < n && s[i]; i++)
++		ln_c(l, (s[i] >= 0x20 && s[i] < 0x7f) ? s[i] : '?');
++}
++
++static void
++ln_u(struct tas_line *l, uint32_t v)
++{
++	char t[10];
++	unsigned k = 0;
++
++	do {
++		t[k++] = (char)('0' + v % 10);
++		v /= 10;
++	} while (v);
++	while (k)
++		ln_c(l, t[--k]);
++}
++
++static void
++ln_x(struct tas_line *l, uint32_t v, unsigned digits)
++{
++	static const char hex[] = "0123456789abcdef";
++
++	ln_s(l, "0x");
++	while (digits--)
++		ln_c(l, hex[(v >> (4 * digits)) & 15]);
++}
++
++static void
++ln_reg(struct tas_line *l, uint8_t book, uint8_t page, uint8_t reg)
++{
++	ln_s(l, "B");
++	ln_u(l, book);
++	ln_s(l, "_P");
++	ln_u(l, page);
++	ln_s(l, "_R");
++	ln_u(l, reg);
++}
++
++static void
++ln_start(struct tas_line *l, const char *s)
++{
++	l->n = 0;
++	ln_s(l, "tas2559: ");
++	ln_s(l, s);
++}
++
++static void
++ln_emit(const struct tas_ops *ops, struct tas_line *l)
++{
++	l->s[l->n] = 0;
++	if (ops && ops->log)
++		ops->log(ops->ctx, l->s);
++}
++
++static TAS_NOINLINE void
++log_s(const struct tas_ops *ops, const char *s)
++{
++	struct tas_line l;
++
++	ln_start(&l, s);
++	ln_emit(ops, &l);
++}
++
++/* "I2C <what> 0x4c B0_P0_R1 len 1 failed"; book < 0: register only */
++static TAS_COLD void
++log_xfer(const struct tas_ops *ops, const char *what, uint8_t addr, int book, uint8_t page, uint8_t reg,
++	 unsigned len)
++{
++	struct tas_line l;
++
++	ln_start(&l, "I2C ");
++	ln_s(&l, what);
++	ln_s(&l, " ");
++	ln_x(&l, addr, 2);
++	if (book >= 0) {
++		ln_s(&l, " ");
++		ln_reg(&l, (uint8_t)book, page, reg);
++	} else {
++		ln_s(&l, " reg ");
++		ln_u(&l, reg);
++	}
++	ln_s(&l, " len ");
++	ln_u(&l, len);
++	ln_s(&l, " failed");
++	ln_emit(ops, &l);
++}
++
++/* "block PGM_DEV_A: PRAM checksum firmware 0x35, chip 0x12" */
++static TAS_COLD void
++log_chk(const struct tas_ops *ops, uint32_t type, const char *what, uint8_t want, uint8_t got)
++{
++	struct tas_line l;
++
++	ln_start(&l, "block ");
++	ln_s(&l, tas_block_type_name(type));
++	ln_s(&l, ": ");
++	ln_s(&l, what);
++	ln_s(&l, " firmware ");
++	ln_x(&l, want, 2);
++	ln_s(&l, ", chip ");
++	ln_x(&l, got, 2);
++	ln_emit(ops, &l);
++}
++
++/* ------------------------------------------------------------------------------------------------ */
++/* Command decoding                                                                                  */
++
++int
++tas_block_next(const struct tas_block *b, uint32_t *pos, struct tas_cmd *c)
++{
++	uint32_t i = *pos;
++	const uint8_t *w, *a;
++	uint32_t len, next;
++
++	if (i >= b->ncmds)
++		return 0;
++	w = b->cmds + 4u * (size_t)i;
++	c->index = i;
++	c->opcode = w[2];
++	c->data = 0;
++	c->len = 0;
++	c->delay_ms = 0;
++	c->book = c->page = c->reg = 0;
++
++	if (w[2] <= 0x7f) {
++		c->op = TAS_CMD_WRITE;
++		c->book = w[0];
++		c->page = w[1];
++		c->reg = w[2];
++		c->data = w + 3;
++		c->len = 1;
++		*pos = i + 1;
++		return 1;
++	}
++	if (w[2] == 0x81) {
++		c->op = TAS_CMD_DELAY;
++		c->delay_ms = (uint16_t)((w[0] << 8) | w[1]);
++		*pos = i + 1;
++		return 1;
++	}
++	if (w[2] != 0x85) {
++		c->op = TAS_CMD_UNKNOWN;
++		*pos = i + 1;
++		return 1;
++	}
++
++	/* burst: the address word follows, data starts in its last byte */
++	len = ((uint32_t)w[0] << 8) | w[1];
++	if (b->ncmds - i < 2)
++		return TAS_EFORMAT;
++	a = w + 4;
++	if (a[2] > 0x7f)
++		return TAS_EFORMAT;
++	next = i + 2;
++	if (len >= 2) {
++		next += (len - 2) / 4 + 1;
++		if (next > b->ncmds || (uint32_t)a[2] + len - 1 > 127)
++			return TAS_EFORMAT;
++	} else {
++		len = 1;   /* the driver writes d0 for lengths 0 and 1 */
++	}
++	c->op = TAS_CMD_WRITE;
++	c->book = a[0];
++	c->page = a[1];
++	c->reg = a[2];
++	c->data = a + 3;
++	c->len = (uint16_t)len;
++	*pos = next;
++	return 1;
++}
++
++uint8_t
++tas_block_ychk(const struct tas_block *b)
++{
++	int idx = ychk_target(b->type);
++	uint32_t pos = 0;
++	struct tas_cmd c;
++	uint8_t sum = 0, lo, hi;
++	unsigned i;
++
++	if (idx < 0)
++		return 0;
++	while (tas_block_next(b, &pos, &c) == 1) {
++		if (c.op != TAS_CMD_WRITE || !yram_window(idx, c.book, c.page, &lo, &hi))
++			continue;
++		for (i = 0; i < c.len; i++) {
++			unsigned reg = c.reg + i;
++
++			if (reg >= lo && reg <= hi && !yram_excluded(idx, c.book, c.page, reg))
++				sum = (uint8_t)(sum + crc8_4d(c.data[i]));
++		}
++	}
++	return sum;
++}
++
++/* ------------------------------------------------------------------------------------------------ */
++/* Parser                                                                                            */
++
++struct cur {
++	const uint8_t *b;
++	size_t pos, end;
++	int err;
++};
++
++static int
++cur_need(struct cur *c, size_t n)
++{
++	if (c->err)
++		return 0;
++	if (n > c->end - c->pos) {
++		c->err = TAS_EFORMAT;
++		return 0;
++	}
++	return 1;
++}
++
++static uint8_t
++g8(struct cur *c)
++{
++	if (!cur_need(c, 1))
++		return 0;
++	return c->b[c->pos++];
++}
++
++static uint16_t
++g16(struct cur *c)
++{
++	uint16_t v;
++
++	if (!cur_need(c, 2))
++		return 0;
++	v = (uint16_t)((c->b[c->pos] << 8) | c->b[c->pos + 1]);
++	c->pos += 2;
++	return v;
++}
++
++static uint32_t
++g32(struct cur *c)
++{
++	uint32_t v;
++
++	if (!cur_need(c, 4))
++		return 0;
++	v = ((uint32_t)c->b[c->pos] << 24) | ((uint32_t)c->b[c->pos + 1] << 16) |
++	    ((uint32_t)c->b[c->pos + 2] << 8) | c->b[c->pos + 3];
++	c->pos += 4;
++	return v;
++}
++
++/* 64-byte name field: length up to the first NUL */
++static const char *
++gname(struct cur *c, uint8_t *len)
++{
++	const char *s;
++	uint8_t n = 0;
++
++	*len = 0;
++	if (!cur_need(c, 64))
++		return "";
++	s = (const char *)(c->b + c->pos);
++	while (n < 64 && s[n])
++		n++;
++	*len = n;
++	c->pos += 64;
++	return s;
++}
++
++/* NUL-terminated description, the NUL must be inside the container */
++static const char *
++gstr(struct cur *c)
++{
++	size_t i;
++	const char *s;
++
++	if (c->err)
++		return "";
++	for (i = c->pos; i < c->end; i++)
++		if (c->b[i] == 0)
++			break;
++	if (i >= c->end) {
++		c->err = TAS_EFORMAT;
++		return "";
++	}
++	s = (const char *)(c->b + c->pos);
++	c->pos = i + 1;
++	return s;
++}
++
++static int
++parse_block(struct cur *c, struct tas_fw *fw)
++{
++	struct tas_block *b;
++	struct tas_cmd cmd;
++	uint32_t pos = 0;
++	int r;
++
++	if (fw->nblocks >= TAS_MAX_BLOCKS)
++		return TAS_ELIMIT;
++	b = &fw->blocks[fw->nblocks];
++	b->type = g32(c);
++	if (fw->driver_version >= PPC_DRIVER_CRCCHK) {
++		b->pchk_present = g8(c);
++		b->pchk = g8(c);
++		b->ychk_present = g8(c);
++		b->ychk = g8(c);
++	}
++	b->ncmds = g32(c);
++	if (c->err)
++		return c->err;
++	if (b->ncmds > (c->end - c->pos) / 4)
++		return TAS_EFORMAT;
++	b->cmds = c->b + c->pos;
++	c->pos += (size_t)b->ncmds * 4;
++
++	/* walk the commands once the way the loader will */
++	while ((r = tas_block_next(b, &pos, &cmd)) == 1) {
++		if (cmd.op == TAS_CMD_DELAY) {
++			b->n_delays++;
++			b->delay_ms += cmd.delay_ms;
++		} else if (cmd.op == TAS_CMD_UNKNOWN) {
++			b->n_unknown++;
++		} else {
++			if (cmd.len > 1) {
++				b->n_bursts++;
++				b->burst_bytes += cmd.len;
++				if (cmd.len > b->max_burst)
++					b->max_burst = cmd.len;
++			} else {
++				b->n_writes++;
++			}
++			if (cmd.reg == TAS_PAGE_SEL || (cmd.page == 0 && cmd.reg + cmd.len - 1u >= TAS_BOOK_SEL))
++				b->n_select++;
++		}
++	}
++	if (r < 0)
++		return r;
++	b->ychk_calc = tas_block_ychk(b);
++	fw->nblocks++;
++	return TAS_OK;
++}
++
++static int
++parse_data(struct cur *c, struct tas_fw *fw, struct tas_data *d)
++{
++	unsigned i, n;
++	int r;
++
++	d->name = gname(c, &d->name_len);
++	d->desc = gstr(c);
++	n = g16(c);
++	if (c->err)
++		return c->err;
++	d->first_block = (uint16_t)fw->nblocks;
++	d->nblocks = (uint16_t)n;
++	for (i = 0; i < n; i++) {
++		r = parse_block(c, fw);
++		if (r)
++			return r;
++	}
++	return TAS_OK;
++}
++
++static int
++parse_all(struct cur *c, struct tas_fw *fw)
++{
++	unsigned i, n;
++	int r;
++
++	/* header (fw_parse_header) */
++	c->pos = 4;
++	fw->fw_size = g32(c);
++	fw->checksum = g32(c);
++	fw->ppc_version = g32(c);
++	fw->fw_version = g32(c);
++	fw->driver_version = g32(c);
++	fw->timestamp = g32(c);
++	if (c->err)
++		return c->err;
++	if (fw->fw_size < 104 || fw->fw_size > fw->len)
++		return TAS_EFORMAT;
++	c->end = fw->fw_size;
++	fw->ddc_name = gname(c, &fw->ddc_name_len);
++	fw->desc = gstr(c);
++	fw->device_family = g32(c);
++	fw->device = g32(c);
++	if (c->err)
++		return c->err;
++	if (fw->device_family != 0 || fw->device != 4)
++		return TAS_EFORMAT;
++
++	/* PLLs (fw_parse_pll_data) */
++	fw->off_plls = c->pos;
++	n = g16(c);
++	if (c->err)
++		return c->err;
++	if (n > TAS_MAX_PLLS)
++		return TAS_ELIMIT;
++	for (i = 0; i < n; i++) {
++		struct tas_pll *p = &fw->plls[i];
++
++		p->name = gname(c, &p->name_len);
++		p->desc = gstr(c);
++		if (c->err)
++			return c->err;
++		p->block = (uint16_t)fw->nblocks;
++		r = parse_block(c, fw);
++		if (r)
++			return r;
++		fw->nplls = i + 1;
++	}
++
++	/* programs (fw_parse_program_data) */
++	fw->off_programs = c->pos;
++	n = g16(c);
++	if (c->err)
++		return c->err;
++	if (n > TAS_MAX_PROGRAMS)
++		return TAS_ELIMIT;
++	for (i = 0; i < n; i++) {
++		struct tas_program *p = &fw->programs[i];
++
++		p->name = gname(c, &p->name_len);
++		p->desc = gstr(c);
++		p->app_mode = g8(c);
++		p->boost = g16(c);
++		r = parse_data(c, fw, &p->data);
++		if (r)
++			return r;
++		fw->nprograms = i + 1;
++	}
++
++	/* configurations (fw_parse_configuration_data) */
++	fw->off_configs = c->pos;
++	n = g16(c);
++	if (c->err)
++		return c->err;
++	if (n > TAS_MAX_CONFIGS)
++		return TAS_ELIMIT;
++	for (i = 0; i < n; i++) {
++		struct tas_config *g = &fw->configs[i];
++		uint32_t v = fw->driver_version;
++
++		g->name = gname(c, &g->name_len);
++		g->desc = gstr(c);
++		if (v >= PPC_DRIVER_CONFDEV || (v >= PPC_DRIVER_CFGDEV_NONCRC && v < PPC_DRIVER_CRCCHK))
++			g->devices = g16(c);
++		else
++			g->devices = TAS_DEV_BOTH;
++		g->program = g8(c);
++		g->pll = g8(c);
++		g->sample_rate = g32(c);
++		if (v >= PPC_DRIVER_MTPLLSRC) {
++			g->pll_src = g8(c);
++			g->pll_src_rate = g32(c);
++		}
++		if (c->err)
++			return c->err;
++		/* references the driver dereferences without checking */
++		if (g->devices < 1 || g->devices > 3 || g->program >= fw->nprograms || g->pll >= fw->nplls)
++			return TAS_EFORMAT;
++		r = parse_data(c, fw, &g->data);
++		if (r)
++			return r;
++		fw->nconfigs = i + 1;
++	}
++	if (fw->nprograms == 0 || fw->nconfigs == 0)
++		return TAS_EFORMAT;   /* tas2559_fw_ready(): "contains no programs/configurations" */
++
++	/* calibrations (fw_parse_calibration_data), only if more than 64 bytes are left */
++	fw->off_cals = c->pos;
++	if (c->end - c->pos > 64) {
++		n = g16(c);
++		if (c->err)
++			return c->err;
++		if (n > TAS_MAX_CALIBRATIONS)
++			return TAS_ELIMIT;
++		for (i = 0; i < n; i++) {
++			struct tas_calibration *k = &fw->calibrations[i];
++
++			k->name = gname(c, &k->name_len);
++			k->desc = gstr(c);
++			k->program = g8(c);
++			k->configuration = g8(c);
++			if (c->err)
++				return c->err;
++			if (k->program >= fw->nprograms || k->configuration >= fw->nconfigs)
++				return TAS_EFORMAT;
++			r = parse_data(c, fw, &k->data);
++			if (r)
++				return r;
++			fw->ncalibrations = i + 1;
++		}
++	}
++	fw->off_end = c->pos;
++	fw->ignored = c->end - c->pos;
++	fw->trailing = fw->len - fw->fw_size;
++
++	if (crc32_fw(fw->base, fw->fw_size) != fw->checksum)
++		return TAS_ECHECKSUM;
++	return TAS_OK;
++}
++
++int
++tas_fw_parse(const uint8_t *data, size_t len, struct tas_fw *out)
++{
++	static const uint8_t magic[4] = { '5', '5', '5', '2' };
++	struct cur c;
++	int r;
++
++	if (!out)
++		return TAS_EINVAL;
++	memset(out, 0, sizeof(*out));
++	if (!data)
++		return TAS_EINVAL;
++	out->base = data;
++	out->len = len;
++	if (len < 104 || memcmp(data, magic, 4) != 0)
++		return TAS_EFORMAT;
++	c.b = data;
++	c.pos = 0;
++	c.end = len;
++	c.err = 0;
++	r = parse_all(&c, out);
++	if (r)
++		out->err_off = c.pos;
++	return r;
++}
++
++/* ------------------------------------------------------------------------------------------------ */
++/* Register access with the driver's book/page caching                                               */
++
++struct tas_io {
++	const struct tas_ops *ops;
++	unsigned flags;
++	int16_t  book[2], page[2];   /* -1: unknown */
++	uint32_t errs;               /* TAS_ERR_* collected during this call */
++};
++
++static void
++io_init(struct tas_io *io, const struct tas_ops *ops, unsigned flags)
++{
++	io->ops = ops;
++	io->flags = flags;
++	io->book[0] = io->book[1] = -1;
++	io->page[0] = io->page[1] = -1;
++	io->errs = 0;
++}
++
++static void
++io_forget(struct tas_io *io, int idx)
++{
++	io->book[idx] = -1;
++	io->page[idx] = -1;
++}
++
++static int
++io_raw_write(struct tas_io *io, int idx, uint8_t reg, const uint8_t *d, unsigned len)
++{
++	if (io->ops->write(io->ops->ctx, tas_addr7[idx], reg, d, len) >= 0)
++		return TAS_OK;
++	io->errs |= idx ? TAS_ERR_DEVB_I2C_COMM : TAS_ERR_DEVA_I2C_COMM;
++	io_forget(io, idx);
++	log_xfer(io->ops, "write", tas_addr7[idx], -1, 0, reg, len);
++	return TAS_EIO;
++}
++
++/* tas2559_change_book_page() for one device */
++static int
++io_select(struct tas_io *io, int idx, uint8_t book, uint8_t page)
++{
++	uint8_t v;
++
++	if (io->book[idx] == book) {
++		if (io->page[idx] == page)
++			return TAS_OK;
++		v = page;
++		if (io_raw_write(io, idx, TAS_PAGE_SEL, &v, 1))
++			return TAS_EIO;
++		io->page[idx] = page;
++		return TAS_OK;
++	}
++	v = 0;
++	if (io_raw_write(io, idx, TAS_PAGE_SEL, &v, 1))
++		return TAS_EIO;
++	io->page[idx] = 0;
++	v = book;
++	if (io_raw_write(io, idx, TAS_BOOK_SEL, &v, 1))
++		return TAS_EIO;
++	io->book[idx] = book;
++	if (page != 0) {
++		v = page;
++		if (io_raw_write(io, idx, TAS_PAGE_SEL, &v, 1))
++			return TAS_EIO;
++		io->page[idx] = page;
++	}
++	return TAS_OK;
++}
++
++/* tas2559_dev_write()/tas2559_dev_bulk_write(): select on every device in mask, then write each */
++static int
++io_write(struct tas_io *io, unsigned mask, uint8_t book, uint8_t page, uint8_t reg,
++	 const uint8_t *d, unsigned len)
++{
++	int idx;
++
++	for (idx = 0; idx < 2; idx++)
++		if ((mask & (1u << idx)) && io_select(io, idx, book, page))
++			return TAS_EIO;
++	for (idx = 0; idx < 2; idx++) {
++		if (!(mask & (1u << idx)))
++			continue;
++		if (io_raw_write(io, idx, reg, d, len))
++			return TAS_EIO;
++		/* a write that hits a selection register makes the cache stale */
++		if (reg == TAS_PAGE_SEL || (page == 0 && reg + len - 1u >= TAS_BOOK_SEL))
++			io_forget(io, idx);
++	}
++	return TAS_OK;
++}
++
++static int
++io_write1(struct tas_io *io, unsigned mask, uint32_t reg, uint8_t val)
++{
++	return io_write(io, mask, TAS_BOOK(reg), TAS_PAGE(reg), TAS_PREG(reg), &val, 1);
++}
++
++/* tas2559_dev_read(): one device */
++static int
++io_read(struct tas_io *io, int idx, uint8_t book, uint8_t page, uint8_t reg, uint8_t *d, unsigned len)
++{
++	if (io_select(io, idx, book, page))
++		return TAS_EIO;
++	if (io->ops->read(io->ops->ctx, tas_addr7[idx], reg, d, len) >= 0)
++		return TAS_OK;
++	io->errs |= idx ? TAS_ERR_DEVB_I2C_COMM : TAS_ERR_DEVA_I2C_COMM;
++	io_forget(io, idx);
++	log_xfer(io->ops, "read", tas_addr7[idx], book, page, reg, len);
++	return TAS_EIO;
++}
++
++static int
++io_read1(struct tas_io *io, int idx, uint32_t reg, uint8_t *val)
++{
++	return io_read(io, idx, TAS_BOOK(reg), TAS_PAGE(reg), TAS_PREG(reg), val, 1);
++}
++
++/* regmap_update_bits(): read, merge, write only if the value changes */
++static int
++io_update(struct tas_io *io, int idx, uint32_t reg, uint8_t mask, uint8_t val)
++{
++	uint8_t old, nv;
++
++	if (io_read1(io, idx, reg, &old))
++		return TAS_EIO;
++	nv = (uint8_t)((old & ~mask) | (val & mask));
++	if (nv == old)
++		return TAS_OK;
++	return io_write1(io, 1u << idx, reg, nv);
++}
++
++/* tas2559_dev_load_data() */
++static int
++io_seq(struct tas_io *io, const struct tas_seq *s, unsigned filter)
++{
++	int r;
++
++	for (; s->op != SEQ_END; s++) {
++		if (!(filter & s->dev))
++			continue;
++		if (s->op == SEQ_UDELAY) {
++			io->ops->sleep_ms(io->ops->ctx, (s->val + 999u) / 1000u);
++		} else if (s->op == SEQ_MDELAY) {
++			io->ops->sleep_ms(io->ops->ctx, s->val);
++		} else {
++			r = io_write1(io, s->dev, s->reg, (uint8_t)s->val);
++			if (r)
++				return r;
++		}
++	}
++	return TAS_OK;
++}
++
++/* tas2559_hw_reset(): both chips, one after the other; the selection cache becomes unknown */
++static void
++io_hw_reset(struct tas_io *io)
++{
++	int idx;
++
++	for (idx = 0; idx < 2; idx++) {
++		io->ops->reset(io->ops->ctx, idx, 0);
++		io->ops->sleep_ms(io->ops->ctx, 5);
++		io->ops->reset(io->ops->ctx, idx, 1);
++		io->ops->sleep_ms(io->ops->ctx, 2);
++		io_forget(io, idx);
++	}
++}
++
++/* failsafe(): shutdown, hardware and software reset, DAC gains to 0 */
++static void
++io_failsafe(struct tas_io *io)
++{
++	if (io->flags & TAS_FLAG_NO_FAILSAFE)
++		return;
++	log_s(io->ops, "failsafe: shutdown, reset, DAC gain 0");
++	io->errs |= TAS_ERR_FAILSAFE;
++	(void)io_seq(io, seq_shutdown, TAS_DEV_BOTH);
++	io_hw_reset(io);
++	(void)io_write1(io, TAS_DEV_BOTH, A_SW_RESET, 0x01);
++	io->ops->sleep_ms(io->ops->ctx, 1);
++	(void)io_write1(io, TAS_DEV_A, A_SPK_CTRL, 0x04);
++	(void)io_write1(io, TAS_DEV_B, B_SPK_CTRL, 0x50);
++}
++
++static TAS_COLD void
++log_block_error(struct tas_io *io, const struct tas_block *b, const struct tas_cmd *c, const char *what, int err)
++{
++	struct tas_line l;
++
++	ln_start(&l, "block ");
++	ln_x(&l, b->type, 2);
++	ln_s(&l, " ");
++	ln_s(&l, tas_block_type_name(b->type));
++	if (c) {
++		ln_s(&l, " command ");
++		ln_u(&l, c->index);
++		ln_s(&l, " ");
++		ln_reg(&l, c->book, c->page, c->reg);
++		ln_s(&l, " len ");
++		ln_u(&l, c->len);
++	}
++	ln_s(&l, ": ");
++	ln_s(&l, what);
++	ln_s(&l, ": ");
++	ln_s(&l, tas_strerror(err));
++	ln_emit(io->ops, &l);
++}
++
++/* the Android driver's YRAM check for one write: read back the YRAM part, compare, sum CRC-8s */
++static TAS_NOINLINE int
++io_yram_verify(struct tas_io *io, int idx, const struct tas_cmd *c, uint8_t *sum)
++{
++	uint8_t lo, hi, first, last, buf[128];
++	unsigned reg, n, i, any = 0;
++
++	if (!yram_window(idx, c->book, c->page, &lo, &hi))
++		return TAS_OK;
++	first = c->reg > lo ? c->reg : lo;
++	last = (unsigned)c->reg + c->len - 1u < hi ? (uint8_t)(c->reg + c->len - 1u) : hi;
++	if (first > last)
++		return TAS_OK;
++	for (reg = first; reg <= last; reg++)
++		if (!yram_excluded(idx, c->book, c->page, reg))
++			any = 1;
++	if (!any)
++		return TAS_OK;   /* the coefficient swap command alone */
++	n = (unsigned)last - first + 1u;
++	if (io_read(io, idx, c->book, c->page, first, buf, n))
++		return TAS_EIO;
++	for (i = 0; i < n; i++) {
++		reg = first + i;
++		if (yram_excluded(idx, c->book, c->page, reg))
++			continue;
++		if (buf[i] != c->data[reg - c->reg])
++			return TAS_EYCRC;
++		*sum = (uint8_t)(*sum + crc8_4d(buf[i]));
++	}
++	return TAS_OK;
++}
++
++/* tas2559_load_block() */
++static int
++io_block(struct tas_io *io, const struct tas_block *b)
++{
++	int idx = block_target(b->type), r;
++	uint32_t pos = 0;
++	struct tas_cmd c;
++	uint8_t v, ysum = 0;
++	int ycheck = (io->flags & TAS_FLAG_YCRC) && b->ychk_present;
++
++	if (idx < 0) {
++		log_block_error(io, b, 0, "type", TAS_EBLOCK);
++		return TAS_EBLOCK;
++	}
++	if (b->pchk_present) {
++		r = io_write1(io, 1u << idx, idx ? B_CRC_CHK : A_CRC_RESET, 1);
++		if (r) {
++			log_block_error(io, b, 0, "PRAM checksum reset", r);
++			return r;
++		}
++	}
++	while ((r = tas_block_next(b, &pos, &c)) == 1) {
++		if (c.op == TAS_CMD_DELAY) {
++			io->ops->sleep_ms(io->ops->ctx, c.delay_ms);
++		} else if (c.op == TAS_CMD_WRITE) {
++			r = io_write(io, 1u << idx, c.book, c.page, c.reg, c.data, c.len);
++			if (!r && ycheck)
++				r = io_yram_verify(io, idx, &c, &ysum);
++			if (r) {
++				if (r == TAS_EYCRC)
++					io->errs |= TAS_ERR_YRAM_CRCCHK;
++				log_block_error(io, b, &c, "write", r);
++				return r;
++			}
++		}
++		/* TAS_CMD_UNKNOWN: skipped like the driver */
++	}
++	if (r < 0) {
++		log_block_error(io, b, 0, "command stream", r);
++		return r;
++	}
++	if (b->pchk_present) {
++		r = io_read1(io, idx, idx ? B_CRC_CHK : A_CRC_CHECKSUM, &v);
++		if (r) {
++			log_block_error(io, b, 0, "PRAM checksum read", r);
++			return r;
++		}
++		if (v != b->pchk) {
++			io->errs |= TAS_ERR_PRAM_CRCCHK;
++			log_chk(io->ops, b->type, "PRAM checksum", b->pchk, v);
++			return TAS_EPCRC;
++		}
++	}
++	if (ycheck && ysum != b->ychk) {
++		io->errs |= TAS_ERR_YRAM_CRCCHK;
++		log_chk(io->ops, b->type, "YRAM checksum (read back)", b->ychk, ysum);
++		return TAS_EYCRC;
++	}
++	return TAS_OK;
++}
++
++/* tas2559_load_data(): every block of that type, in file order */
++static int
++io_data(struct tas_io *io, const struct tas_fw *fw, const struct tas_data *d, uint32_t type)
++{
++	unsigned i;
++	int r;
++
++	for (i = 0; i < d->nblocks; i++) {
++		const struct tas_block *b = &fw->blocks[d->first_block + i];
++
++		if (b->type != type)
++			continue;
++		r = io_block(io, b);
++		if (r)
++			return r;
++	}
++	return TAS_OK;
++}
++
++static TAS_COLD int
++fail(struct tas_io *io, const char *fn, const char *step, int err)
++{
++	struct tas_line l;
++
++	ln_start(&l, fn);
++	ln_s(&l, ": ");
++	ln_s(&l, step);
++	ln_s(&l, " failed: ");
++	ln_s(&l, tas_strerror(err));
++	if (io->errs) {
++		ln_s(&l, " (errors ");
++		ln_x(&l, io->errs, 8);
++		ln_s(&l, ")");
++	}
++	ln_emit(io->ops, &l);
++	return err;
++}
++
++static int
++ops_ok(const struct tas_ops *ops)
++{
++	return ops && ops->write && ops->read && ops->sleep_ms && ops->reset;
++}
++
++/* ------------------------------------------------------------------------------------------------ */
++/* Public sequences                                                                                  */
++
++int
++tas_select_configuration(const struct tas_fw *fw, unsigned sample_rate, int program, unsigned bclk_hz)
++{
++	unsigned i;
++
++	if (!fw || fw->nconfigs == 0)
++		return TAS_EINVAL;
++	if (program < 0)
++		program = 0;                       /* tas2559_fw_ready(): no previous program */
++	if ((unsigned)program >= fw->nprograms)
++		return TAS_ENOENT;
++	if (sample_rate == 0)
++		sample_rate = program == 1 ? 96000 : 48000;   /* tas2559_set_program() */
++	for (i = 0; i < fw->nconfigs; i++) {
++		const struct tas_config *g = &fw->configs[i];
++
++		if (g->program == (unsigned)program && g->sample_rate == sample_rate &&
++		    (bclk_hz == 0 || g->pll_src_rate == bclk_hz))
++			return (int)i;
++	}
++	return TAS_ENOENT;
++}
++
++static TAS_COLD void
++log_no_config(const struct tas_ops *ops, int program, unsigned sample_rate)
++{
++	struct tas_line l;
++
++	ln_start(&l, "tas_load: no configuration of program ");
++	ln_u(&l, (uint32_t)program);
++	ln_s(&l, " for ");
++	ln_u(&l, sample_rate ? sample_rate : (program == 1 ? 96000u : 48000u));
++	ln_s(&l, " Hz");
++	ln_emit(ops, &l);
++}
++
++/* "program 0 'Tuning Mode', configuration 0 '...' 48000 Hz, PLL 0 (source 0 at 1536000 Hz)" */
++static TAS_NOINLINE void
++log_selection(const struct tas_ops *ops, const struct tas_fw *fw, int program, int configuration)
++{
++	const struct tas_program *p = &fw->programs[program];
++	const struct tas_config *g = &fw->configs[configuration];
++	struct tas_line l;
++
++	ln_start(&l, "program ");
++	ln_u(&l, (uint32_t)program);
++	ln_s(&l, " '");
++	ln_sn(&l, p->name, p->name_len);
++	ln_s(&l, "', configuration ");
++	ln_u(&l, (uint32_t)configuration);
++	ln_s(&l, " '");
++	ln_sn(&l, g->name, g->name_len);
++	ln_s(&l, "' ");
++	ln_u(&l, g->sample_rate);
++	ln_s(&l, " Hz, PLL ");
++	ln_u(&l, g->pll);
++	ln_s(&l, " (source ");
++	ln_u(&l, g->pll_src);
++	ln_s(&l, " at ");
++	ln_u(&l, g->pll_src_rate);
++	ln_s(&l, " Hz)");
++	ln_emit(ops, &l);
++}
++
++/* program/configuration as the caller asked; -1s resolved like the driver */
++static int
++resolve(struct tas_io *io, const struct tas_fw *fw, unsigned sample_rate, int *program, int *configuration)
++{
++	int r;
++
++	if (*configuration >= 0) {
++		const struct tas_config *g;
++
++		if ((unsigned)*configuration >= fw->nconfigs)
++			return fail(io, "tas_load", "configuration index", TAS_ENOENT);
++		g = &fw->configs[*configuration];
++		if (*program < 0)
++			*program = g->program;
++		if (g->program != (unsigned)*program)   /* "configuration program doesn't match" */
++			return fail(io, "tas_load", "configuration/program match", TAS_ENOENT);
++		if (sample_rate && g->sample_rate != sample_rate)
++			return fail(io, "tas_load", "configuration sample rate", TAS_ENOENT);
++		return TAS_OK;
++	}
++	if (*program < 0)
++		*program = 0;
++	r = tas_select_configuration(fw, sample_rate, *program, 0);
++	if (r < 0) {
++		log_no_config(io->ops, *program, sample_rate);
++		return r;
++	}
++	*configuration = r;
++	return TAS_OK;
++}
++
++static int
++do_load(struct tas_io *io, const struct tas_fw *fw, unsigned sample_rate, int program, int configuration)
++{
++	const struct tas_program *p;
++	const struct tas_config *g;
++	const struct tas_pll *pll;
++	unsigned i;
++	int r;
++
++	r = resolve(io, fw, sample_rate, &program, &configuration);
++	if (r)
++		return r;
++	p = &fw->programs[program];
++	g = &fw->configs[configuration];
++	pll = &fw->plls[g->pll];
++	log_selection(io->ops, fw, program, configuration);
++
++	/* tas2559_set_program(): hardware reset, software reset, defaults */
++	io_hw_reset(io);
++	r = io_write1(io, TAS_DEV_BOTH, A_SW_RESET, 0x01);
++	if (r)
++		return fail(io, "tas_load", "software reset", r);
++	io->ops->sleep_ms(io->ops->ctx, 1);
++	r = io_seq(io, seq_default, TAS_DEV_BOTH);
++	if (r)
++		return fail(io, "tas_load", "default registers", r);
++	for (i = 0; i < sizeof(upd_default) / sizeof(upd_default[0]); i++) {
++		const struct tas_upd *u = &upd_default[i];
++
++		r = io_update(io, u->dev == TAS_DEV_B, u->reg, u->mask, u->val);
++		if (r)
++			return fail(io, "tas_load", "default register update", r);
++	}
++
++	/* program */
++	r = io_data(io, fw, &p->data, TAS_BLOCK_PGM_DEV_A);
++	if (r)
++		return fail(io, "tas_load", "TAS2559 program", r);
++	r = io_data(io, fw, &p->data, TAS_BLOCK_PGM_DEV_B);
++	if (r)
++		return fail(io, "tas_load", "TAS2560 program", r);
++
++	/* tas2559_load_coefficient(-1, configuration, false) */
++	r = io_block(io, &fw->blocks[pll->block]);
++	if (r)
++		return fail(io, "tas_load", "PLL", r);
++	if (g->devices & TAS_DEV_A) {
++		r = io_data(io, fw, &g->data, TAS_BLOCK_CFG_PRE_DEV_A);
++		if (r)
++			return fail(io, "tas_load", "TAS2559 configuration pre block", r);
++	}
++	if (g->devices & TAS_DEV_B) {
++		r = io_data(io, fw, &g->data, TAS_BLOCK_CFG_PRE_DEV_B);
++		if (r)
++			return fail(io, "tas_load", "TAS2560 configuration pre block", r);
++	}
++	if (g->devices & TAS_DEV_A) {
++		r = io_data(io, fw, &g->data, TAS_BLOCK_CFG_COEFF_DEV_A);
++		if (r)
++			return fail(io, "tas_load", "TAS2559 coefficients", r);
++	}
++	if (g->devices & TAS_DEV_B) {
++		r = io_data(io, fw, &g->data, TAS_BLOCK_CFG_COEFF_DEV_B);
++		if (r)
++			return fail(io, "tas_load", "TAS2560 coefficients", r);
++	}
++	/* calibration: the driver has none and the file has none, the tuning's default R0 stays */
++	return configuration;
++}
++
++static int
++do_start(struct tas_io *io, const struct tas_fw *fw, int configuration)
++{
++	const struct tas_config *g = &fw->configs[configuration];
++	unsigned devices = g->devices;
++	uint8_t v;
++	int r;
++
++	/* tas2559_enable(true) */
++	r = io_read1(io, 0, A_SAFE_GUARD, &v);
++	if (r)
++		return fail(io, "tas_start", "safe-guard read", r);
++	if (v != TAS_SAFE_GUARD_PATTERN) {
++		io->errs |= TAS_ERR_SAFE_GUARD;
++		return fail(io, "tas_start", "safe-guard check", TAS_ESAFEGUARD);
++	}
++	/* tas2559_DevStartup(): a TAS2560-only configuration still starts the TAS2559 */
++	r = io_seq(io, seq_startup, devices == TAS_DEV_B ? TAS_DEV_BOTH : devices);
++	if (r)
++		return fail(io, "tas_start", "startup sequence", r);
++	if (devices & TAS_DEV_B) {
++		r = io_data(io, fw, &g->data, TAS_BLOCK_PST_POWERUP_DEV_B);
++		if (r)
++			return fail(io, "tas_start", "TAS2560 post-power-up block", r);
++	}
++	r = io_seq(io, seq_unmute, devices);
++	if (r)
++		return fail(io, "tas_start", "unmute", r);
++	return configuration;
++}
++
++static int
++config_ok(const struct tas_fw *fw, int configuration)
++{
++	return fw && configuration >= 0 && (unsigned)configuration < fw->nconfigs;
++}
++
++int
++tas_load(const struct tas_ops *ops, const struct tas_fw *fw, unsigned sample_rate,
++	 int program, int configuration, unsigned flags)
++{
++	struct tas_io io;
++	int r;
++
++	if (!ops_ok(ops) || !fw || fw->nconfigs == 0)
++		return TAS_EINVAL;
++	io_init(&io, ops, flags);
++	r = do_load(&io, fw, sample_rate, program, configuration);
++	if (r < 0 && r != TAS_ENOENT)
++		io_failsafe(&io);
++	return r;
++}
++
++int
++tas_start(const struct tas_ops *ops, const struct tas_fw *fw, int configuration, unsigned flags)
++{
++	struct tas_io io;
++	int r;
++
++	if (!ops_ok(ops) || !config_ok(fw, configuration))
++		return TAS_EINVAL;
++	io_init(&io, ops, flags);
++	r = do_start(&io, fw, configuration);
++	if (r < 0)
++		io_failsafe(&io);
++	return r;
++}
++
++int
++tas_power_up(const struct tas_ops *ops, const struct tas_fw *fw, unsigned sample_rate,
++	     int program, int configuration, unsigned flags)
++{
++	struct tas_io io;
++	int r;
++
++	if (!ops_ok(ops) || !fw || fw->nconfigs == 0)
++		return TAS_EINVAL;
++	io_init(&io, ops, flags);
++	r = do_load(&io, fw, sample_rate, program, configuration);
++	if (r >= 0)
++		r = do_start(&io, fw, r);   /* same book/page cache, like the driver */
++	if (r < 0 && r != TAS_ENOENT)
++		io_failsafe(&io);
++	if (r >= 0)
++		log_s(ops, "powered up");
++	return r;
++}
++
++int
++tas_power_down(const struct tas_ops *ops, const struct tas_fw *fw, int configuration, unsigned flags)
++{
++	struct tas_io io;
++	unsigned devices = TAS_DEV_BOTH;
++	uint8_t v;
++	int r;
++
++	if (!ops_ok(ops))
++		return TAS_EINVAL;
++	if (configuration >= 0) {
++		if (!config_ok(fw, configuration))
++			return TAS_EINVAL;
++		devices = fw->configs[configuration].devices;
++	}
++	io_init(&io, ops, flags);
++	/* tas2559_enable(false) */
++	r = io_read1(&io, 0, A_SAFE_GUARD, &v);
++	if (r) {
++		fail(&io, "tas_power_down", "safe-guard read", r);
++		io_failsafe(&io);
++		return r;
++	}
++	if (v != TAS_SAFE_GUARD_PATTERN) {
++		io.errs |= TAS_ERR_SAFE_GUARD;
++		fail(&io, "tas_power_down", "safe-guard check", TAS_ESAFEGUARD);
++		io_failsafe(&io);
++		return TAS_ESAFEGUARD;
++	}
++	/* tas2559_DevShutdown() */
++	if (devices == TAS_DEV_B)
++		r = io_seq(&io, seq_shutdown_b, TAS_DEV_B);
++	else
++		r = io_seq(&io, seq_shutdown, devices);
++	if (r) {
++		fail(&io, "tas_power_down", "shutdown sequence", r);
++		io_failsafe(&io);
++		return r;
++	}
++	log_s(ops, "powered down");
++	return TAS_OK;
++}
++
++int
++tas_set_dac_gain(const struct tas_ops *ops, unsigned mask, unsigned gain)
++{
++	struct tas_io io;
++	int r;
++
++	if (!ops_ok(ops) || gain > 15 || mask == 0 || mask > TAS_DEV_BOTH)
++		return TAS_EINVAL;
++	io_init(&io, ops, 0);
++	if (mask & TAS_DEV_A) {
++		r = io_update(&io, 0, A_SPK_CTRL, 0x78, (uint8_t)(gain << 3));
++		if (r)
++			return fail(&io, "tas_set_dac_gain", "TAS2559 B0_P0_R6", r);
++	}
++	if (mask & TAS_DEV_B) {
++		r = io_update(&io, 1, B_SPK_CTRL, 0x0f, (uint8_t)gain);
++		if (r)
++			return fail(&io, "tas_set_dac_gain", "TAS2560 B0_P0_R4", r);
++	}
++	return TAS_OK;
++}
++
++/*
++ * The decoding below is the interrupt handler of TI's full Android driver (not part of the port this
++ * file follows): register addresses are those of tas2559.h, bit meanings are unverified here.
++ */
++int
++tas_read_status(const struct tas_ops *ops, unsigned mask, struct tas_status *st)
++{
++	struct tas_io io;
++	int r = TAS_OK;
++
++	if (!ops_ok(ops) || !st || mask == 0 || mask > TAS_DEV_BOTH)
++		return TAS_EINVAL;
++	memset(st, 0, sizeof(*st));
++	io_init(&io, ops, 0);
++	if (mask & TAS_DEV_A) {
++		if (io_read1(&io, 0, A_REV_PGID, &st->a_rev) || io_read1(&io, 0, A_SAFE_GUARD, &st->a_safe_guard) ||
++		    io_read1(&io, 0, A_POWER_UP_FLAG, &st->a_power_up) || io_read1(&io, 0, A_FLAGS_1, &st->a_flags1) ||
++		    io_read1(&io, 0, A_FLAGS_2, &st->a_flags2))
++			r = TAS_EIO;
++		if (st->a_safe_guard != TAS_SAFE_GUARD_PATTERN) st->errors |= TAS_ERR_SAFE_GUARD;
++		if (st->a_flags1 & 0x80) st->errors |= TAS_ERR_OVER_CURRENT;
++		if (st->a_flags1 & 0x40) st->errors |= TAS_ERR_UNDER_VOLTAGE;
++		if (st->a_flags1 & 0x20) st->errors |= TAS_ERR_CLK_HALT;
++		if (st->a_flags1 & 0x10) st->errors |= TAS_ERR_DIE_OVERTEMP;
++		if (st->a_flags1 & 0x08) st->errors |= TAS_ERR_BROWNOUT;
++		if (st->a_flags1 & 0x04) st->errors |= TAS_ERR_CLK_LOST;
++		if (st->a_flags2 & 0x08) st->errors |= TAS_ERR_CLK_DET1;
++		if (st->a_flags2 & 0x04) st->errors |= TAS_ERR_CLK_DET2;
++		if ((st->a_power_up & 0xc0) != 0xc0) st->errors |= TAS_ERR_CLASSD_PWR;
++	}
++	if (mask & TAS_DEV_B) {
++		if (io_read1(&io, 1, B_POWER_UP_FLAG, &st->b_power_up) || io_read1(&io, 1, B_FLAGS_1, &st->b_flags1) ||
++		    io_read1(&io, 1, B_FLAGS_2, &st->b_flags2))
++			r = TAS_EIO;
++		if (st->b_flags1 & 0x80) st->errors |= TAS_ERR_OVER_CURRENT;
++		if (st->b_flags1 & 0x40) st->errors |= TAS_ERR_UNDER_VOLTAGE;
++		if (st->b_flags1 & 0x10) st->errors |= TAS_ERR_DIE_OVERTEMP;
++		if (st->b_flags1 & 0x08) st->errors |= TAS_ERR_BROWNOUT;
++		if (st->b_flags1 & 0x04) st->errors |= TAS_ERR_CLK_LOST;
++		if (st->b_flags2 & 0x08) st->errors |= TAS_ERR_CLK_DET1;
++		if (st->b_flags2 & 0x04) st->errors |= TAS_ERR_CLK_DET2;
++		if ((st->b_power_up & 0xc0) != 0xc0) st->errors |= TAS_ERR_CLASSD_PWR;
++	}
++	st->errors |= io.errs;
++	return r;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_tas2559.h b/bsd/dev/sweet_tas2559.h
+new file mode 100644
+index 0000000..ce81077
+--- /dev/null
++++ b/bsd/dev/sweet_tas2559.h
+@@ -0,0 +1,265 @@
++/*
++ * TAS2559 + TAS2560 smart-amplifier bring-up for the Poco F1 (beryllium), freestanding C11.
++ *
++ * Original reimplementation of the logic of TI's Linux driver (tas2559.c/tas2559.h, GPL-2.0, the
++ * mainline-style port used on this phone). Register numbers, book/page addressing, the firmware
++ * command encoding and the driver's default/startup/unmute/shutdown tables with their timing are
++ * carried over as data. Everything reaches the hardware through struct tas_ops.
++ *
++ * Topology (inferred from the firmware, see the notes at the top of tas2559_fw.c): the SoC's I2S
++ * (QUAT MI2S SD0) feeds the TAS2559 (DevA, 0x4c). Its DSP runs speaker protection for both channels and
++ * forwards the processed second channel to the TAS2560 (DevB, 0x4d) over its ASIM port.
++ */
++#ifndef TAS2559_FW_H
++#define TAS2559_FW_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* 7-bit I2C addresses on QUP0 SE5 (ti,tas2559-addr / ti,tas2560-addr) */
++#ifndef TAS2559_I2C_ADDR
++#define TAS2559_I2C_ADDR 0x4c
++#endif
++#ifndef TAS2560_I2C_ADDR
++#define TAS2560_I2C_ADDR 0x4d
++#endif
++
++/* Device masks (the driver's enum channel): configuration device sets and tas_set_dac_gain(). */
++#define TAS_DEV_A    1u  /* TAS2559 */
++#define TAS_DEV_B    2u  /* TAS2560 */
++#define TAS_DEV_BOTH 3u
++
++/*
++ * Hardware access. write = one I2C write [reg][data...] (auto-increment); read = write [reg], repeated
++ * start, read len bytes. Both return < 0 on failure. reset drives the reset GPIO of dev (0 = TAS2559 on
++ * GPIO 12, 1 = TAS2560 on GPIO 76) to the electrical level given: both resets are active low (the driver
++ * drives 0, waits 5 ms, drives 1, waits 2 ms). log receives one formatted line, may be NULL.
++ */
++struct tas_ops {
++	int  (*write)(void *ctx, uint8_t addr7, uint8_t reg, const uint8_t *data, unsigned len);
++	int  (*read)(void *ctx, uint8_t addr7, uint8_t reg, uint8_t *data, unsigned len);
++	void (*sleep_ms)(void *ctx, unsigned ms);
++	void (*reset)(void *ctx, int dev, int level);
++	void (*log)(void *ctx, const char *msg);
++	void *ctx;
++};
++
++/* Error codes (all negative). */
++#define TAS_OK          0
++#define TAS_EINVAL     (-1)  /* bad argument */
++#define TAS_EFORMAT    (-2)  /* malformed firmware */
++#define TAS_ECHECKSUM  (-3)  /* firmware header CRC-32 does not match the file */
++#define TAS_ELIMIT     (-4)  /* firmware exceeds one of the fixed table sizes below */
++#define TAS_ENOENT     (-5)  /* no such program, or no configuration for that rate/program/BCLK */
++#define TAS_EIO        (-6)  /* an I2C callback failed */
++#define TAS_EPCRC      (-7)  /* PRAM checksum read from the chip differs from the firmware (driver: -EAGAIN) */
++#define TAS_EYCRC      (-8)  /* YRAM read-back differs from what was written (TAS_FLAG_YCRC) */
++#define TAS_ESAFEGUARD (-9)  /* safe-guard register lost, the TAS2559 was reset (driver: -EPIPE) */
++#define TAS_EBLOCK     (-10) /* block type the driver cannot route to a device */
++
++/* Flags for tas_power_up()/tas_load()/tas_start()/tas_power_down(). */
++#define TAS_FLAG_YCRC        0x1u /* read back every YRAM write and check the block's YRAM checksum */
++#define TAS_FLAG_NO_FAILSAFE 0x2u /* on error leave the chips as they are instead of the driver's failsafe() */
++
++/* Error bits (the driver's mnErrCode values), reported by tas_read_status(). */
++#define TAS_ERR_DEVA_I2C_COMM 0x00000002u
++#define TAS_ERR_DEVB_I2C_COMM 0x00000004u
++#define TAS_ERR_PRAM_CRCCHK   0x00000008u
++#define TAS_ERR_YRAM_CRCCHK   0x00000010u
++#define TAS_ERR_CLK_DET2      0x00000020u
++#define TAS_ERR_CLK_DET1      0x00000040u
++#define TAS_ERR_CLK_LOST      0x00000080u
++#define TAS_ERR_BROWNOUT      0x00000100u
++#define TAS_ERR_DIE_OVERTEMP  0x00000200u
++#define TAS_ERR_CLK_HALT      0x00000400u
++#define TAS_ERR_UNDER_VOLTAGE 0x00000800u
++#define TAS_ERR_OVER_CURRENT  0x00001000u
++#define TAS_ERR_CLASSD_PWR    0x00002000u
++#define TAS_ERR_SAFE_GUARD    0x00004000u
++#define TAS_ERR_FAILSAFE      0x40000000u
++
++/* Firmware block types and what loads them. */
++#define TAS_BLOCK_PLL               0x00 /* TAS2559, configuration's PLL */
++#define TAS_BLOCK_PGM_DEV_A         0x01 /* TAS2559, program */
++#define TAS_BLOCK_CFG_COEFF_DEV_A   0x03 /* TAS2559, configuration */
++#define TAS_BLOCK_CFG_PRE_DEV_A     0x04 /* TAS2559, configuration, before the coefficients */
++#define TAS_BLOCK_CFG_POST          0x05 /* never loaded by the driver */
++#define TAS_BLOCK_CFG_POST_POWER    0x06 /* never loaded by the driver */
++#define TAS_BLOCK_PGM_DEV_B         0x08 /* TAS2560, program */
++#define TAS_BLOCK_CFG_COEFF_DEV_B   0x0a /* requested by the driver but rejected by its load_block() */
++#define TAS_BLOCK_CFG_PRE_DEV_B     0x0b /* TAS2560, configuration */
++#define TAS_BLOCK_PGM_ALL           0x0d /* never loaded by the driver */
++#define TAS_BLOCK_PST_POWERUP_DEV_B 0x0e /* TAS2560, after power-up */
++
++/* Program application modes (TAS2559_APP_*). */
++#define TAS_APP_ROM1MODE   0
++#define TAS_APP_ROM2MODE   1
++#define TAS_APP_TUNINGMODE 2
++#define TAS_APP_ROM1_96KHZ 3
++#define TAS_APP_ROM2_96KHZ 4
++#define TAS_APP_RAMMODE    5
++
++/* Fixed table sizes (the beryllium file has 5 PLLs, 4 programs, 18 configurations, 73 blocks). */
++#define TAS_MAX_PLLS         16
++#define TAS_MAX_PROGRAMS     16
++#define TAS_MAX_CONFIGS      64
++#define TAS_MAX_CALIBRATIONS 16
++#define TAS_MAX_BLOCKS       256
++
++/*
++ * Everything below points into the firmware buffer given to tas_fw_parse(), which must stay mapped
++ * while the struct is used. Names are the file's 64-byte fields: not necessarily NUL-terminated, use
++ * name_len. Descriptions are NUL-terminated (checked).
++ */
++struct tas_block {
++	uint32_t type;
++	uint8_t  pchk_present, pchk;  /* PRAM checksum, compared with the chip's CRC register */
++	uint8_t  ychk_present, ychk;  /* YRAM checksum (only checked with TAS_FLAG_YCRC) */
++	uint32_t ncmds;               /* 4-byte command words */
++	const uint8_t *cmds;
++	/* filled in by the parser's validation pass */
++	uint32_t n_writes;            /* single-register writes (including 0x85 with length <= 1) */
++	uint32_t n_bursts;            /* 0x85 bursts of length >= 2 */
++	uint32_t burst_bytes, max_burst;
++	uint32_t n_delays, delay_ms;  /* 0x81 commands and their total */
++	uint32_t n_unknown;           /* other offsets >= 0x80, skipped like the driver does */
++	uint32_t n_select;            /* writes touching a page (reg 0) or book (P0 R127) register */
++	uint8_t  ychk_calc;           /* YRAM checksum computed from the file */
++};
++
++struct tas_data {
++	const char *name; uint8_t name_len;
++	const char *desc;
++	uint16_t first_block, nblocks;  /* indices into tas_fw.blocks */
++};
++
++struct tas_pll {
++	const char *name; uint8_t name_len;
++	const char *desc;
++	uint16_t block;
++};
++
++struct tas_program {
++	const char *name; uint8_t name_len;
++	const char *desc;
++	uint8_t  app_mode;
++	uint16_t boost;
++	struct tas_data data;
++};
++
++struct tas_config {
++	const char *name; uint8_t name_len;
++	const char *desc;
++	uint16_t devices;       /* TAS_DEV_* */
++	uint8_t  program, pll;
++	uint32_t sample_rate;
++	uint8_t  pll_src;       /* driver version >= 0x400, else 0 */
++	uint32_t pll_src_rate;  /* Hz, driver version >= 0x400, else 0 */
++	struct tas_data data;
++};
++
++struct tas_calibration {
++	const char *name; uint8_t name_len;
++	const char *desc;
++	uint8_t program, configuration;
++	struct tas_data data;
++};
++
++struct tas_fw {
++	const uint8_t *base;
++	size_t   len;           /* bytes given to the parser */
++	uint32_t fw_size, checksum, ppc_version, fw_version, driver_version, timestamp;
++	const char *ddc_name; uint8_t ddc_name_len;
++	const char *desc;
++	uint32_t device_family, device;
++	unsigned nplls, nprograms, nconfigs, ncalibrations, nblocks;
++	struct tas_pll plls[TAS_MAX_PLLS];
++	struct tas_program programs[TAS_MAX_PROGRAMS];
++	struct tas_config configs[TAS_MAX_CONFIGS];
++	struct tas_calibration calibrations[TAS_MAX_CALIBRATIONS];
++	struct tas_block blocks[TAS_MAX_BLOCKS];
++	/* section layout: header [0, off_plls), PLLs, programs, configurations, calibrations [off_cals, off_end) */
++	size_t   off_plls, off_programs, off_configs, off_cals, off_end;
++	size_t   ignored;       /* bytes in [off_end, fw_size) the driver ignores (<= 64 left after the configurations) */
++	size_t   trailing;      /* bytes in [fw_size, len) */
++	size_t   err_off;       /* where parsing stopped on error */
++};
++
++/* One decoded firmware command (tas_block_next). */
++#define TAS_CMD_WRITE   1  /* write len bytes at data to (book, page, reg) */
++#define TAS_CMD_DELAY   2  /* sleep delay_ms */
++#define TAS_CMD_UNKNOWN 3  /* offset byte >= 0x80 other than 0x81/0x85: skipped */
++struct tas_cmd {
++	uint8_t  op;
++	uint8_t  book, page, reg;
++	uint16_t len;
++	uint16_t delay_ms;
++	uint8_t  opcode;
++	uint32_t index;        /* first command word */
++	const uint8_t *data;
++};
++
++/* Raw status registers and the driver's decoding (tas_read_status). */
++struct tas_status {
++	uint8_t  a_rev;          /* TAS2559 B0_P0_R3: PG version (0x00 1.0, 0x10 2.0, 0x20 2.1) */
++	uint8_t  a_safe_guard;   /* TAS2559 B0_P0_R37: 0x5a after tas_load() */
++	uint8_t  a_power_up;     /* TAS2559 B0_P0_R100 */
++	uint8_t  a_flags1;       /* TAS2559 B0_P0_R104 */
++	uint8_t  a_flags2;       /* TAS2559 B0_P0_R108 */
++	uint8_t  b_power_up;     /* TAS2560 B0_P0_R42 */
++	uint8_t  b_flags1;       /* TAS2560 B0_P0_R38 */
++	uint8_t  b_flags2;       /* TAS2560 B0_P0_R39 */
++	uint32_t errors;         /* TAS_ERR_* */
++};
++
++/* Parse and validate the container (no allocation). Returns TAS_OK or a negative error. */
++int tas_fw_parse(const uint8_t *fw, size_t len, struct tas_fw *out);
++
++/* Decode the next command of a block; returns 1 with *c filled, 0 at the end, TAS_EFORMAT if malformed. */
++int tas_block_next(const struct tas_block *b, uint32_t *pos, struct tas_cmd *c);
++
++/*
++ * The driver's choice: program < 0 means 0 (the first program after firmware load); sample_rate 0 means
++ * the rate tas2559_set_program() assumes (96000 for program 1, else 48000). Returns the first
++ * configuration of that program with that rate, and (if bclk_hz != 0, an addition) that PLL source rate.
++ */
++int tas_select_configuration(const struct tas_fw *fw, unsigned sample_rate, int program, unsigned bclk_hz);
++
++/*
++ * Full bring-up: tas_load() then tas_start(). program/configuration < 0 select like the driver; a given
++ * configuration must belong to the program and have sample_rate (if non-zero). Returns the configuration
++ * index loaded, or a negative error after logging the failing step (and running the failsafe).
++ */
++int tas_power_up(const struct tas_ops *ops, const struct tas_fw *fw, unsigned sample_rate,
++		 int program, int configuration, unsigned flags);
++
++/*
++ * tas2559_set_program() while powered down: resets, defaults, program, PLL, configuration. The driver
++ * does this at boot without any I2S clock. If the amplifier is playing, call tas_power_down() first
++ * (the driver shuts down before reprogramming). Returns the configuration index or a negative error.
++ */
++int tas_load(const struct tas_ops *ops, const struct tas_fw *fw, unsigned sample_rate,
++	     int program, int configuration, unsigned flags);
++
++/* tas2559_enable(true) on loaded chips: safe guard, startup, TAS2560 post-power-up block, unmute. Needs BCLK. */
++int tas_start(const struct tas_ops *ops, const struct tas_fw *fw, int configuration, unsigned flags);
++
++/* tas2559_enable(false): safe guard, shutdown sequence. configuration < 0 = both devices. */
++int tas_power_down(const struct tas_ops *ops, const struct tas_fw *fw, int configuration, unsigned flags);
++
++/* tas2559_set_DAC_gain(): gain 0..15 into the DAC gain field of the devices in mask. */
++int tas_set_dac_gain(const struct tas_ops *ops, unsigned mask, unsigned gain);
++
++/*
++ * Read and decode power-up and fault flags of the devices in mask (no writes besides page selects;
++ * reading may clear sticky flags). The bit meanings come from TI's full Android driver, unverified.
++ */
++int tas_read_status(const struct tas_ops *ops, unsigned mask, struct tas_status *st);
++
++/* YRAM checksum of a block computed from the file (what the chip should read back). */
++uint8_t tas_block_ychk(const struct tas_block *b);
++
++const char *tas_strerror(int err);
++const char *tas_block_type_name(uint32_t type);
++
++#endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 33a94c0..6c11369 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -76,6 +76,7 @@ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
+ extern void sweet80211_init(void);
+ extern void sweet_venus_init(void);   /* bsd/dev/sweet_venus.c */
++extern void sweet_audio_init(void);   /* bsd/dev/sweet_audio.c */
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+ extern void sweet_charger_start(void);
+@@ -1166,6 +1167,7 @@ sweet_ufs_init(void)
+ 	beryllium_wlan_init();      /* boot-arg sweetwlan=N, off by default */
+ 	sweet80211_init();          /* boot-arg sweet80211=N (iOS 26 Wi-Fi stand-in), off by default */
+ 	sweet_venus_init();         /* Venus video codec: IOKit service at boot, hardware on first use; sweetvenus=0 off */
++	sweet_audio_init();         /* ADSP audio + amplifiers: IOKit service at boot, hardware on first use; sweetaudio=0 off */
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetAudio.cpp b/iokit/Kernel/arm/SweetAudio.cpp
+new file mode 100644
+index 0000000..7589214
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAudio.cpp
+@@ -0,0 +1,194 @@
++/*
++ * SweetAudio: IOKit service and user client for the Poco F1's speaker path (bsd/dev/sweet_audio.c: the ADSP's
++ * audio services and the TAS2559/TAS2560 amplifiers).
++ *
++ * Published at boot by sweet_audio_init()'s thread (beryllium only); the hardware is not touched until the first
++ * START. The user client class is AppleVirtIOSoundUserClient, a name audiomxd's
++ * com.apple.security.exception.iokit-user-client-class list admits (no AppleVirtIOSound exists here), so the HAL
++ * plug-in (audio/hal/SweetAudio.driver in the Bergamota repo) can open it inside audiomxd.
++ *
++ * Selectors (SweetAudioABI.h): START at a sample rate, STOP. clientMemoryForType maps the ring (read/write,
++ * write-combined) and the status page (read-only). One mutex in the C side serializes everything.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++
++#include "SweetAudioABI.h"
++
++extern "C" {
++/* bsd/dev/sweet_audio.c; every call but lock/unlock with sweet_audio_lock() held */
++void sweet_audio_lock(void);
++void sweet_audio_unlock(void);
++int sweet_audio_start(uint32_t rate);
++int sweet_audio_stop(void);
++int sweet_audio_memory(uint32_t type, vm_offset_t *kva, uint32_t *size);
++void SweetAudioPublish(void);
++}
++
++class SweetAudio : public IOService {
++	OSDeclareDefaultStructors(SweetAudio);
++};
++
++OSDefineMetaClassAndStructors(SweetAudio, IOService);
++
++class SweetAudioUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetAudioUserClient);
++
++	bool    fStarted;
++	bool    fClosed;
++	int32_t fPid;
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAudioUserClient, IOUserClient);
++
++/* The class name audiomxd's entitlement list admits (com.apple.security.exception.iokit-user-client-class). */
++class AppleVirtIOSoundUserClient : public SweetAudioUserClient {
++	OSDeclareDefaultStructors(AppleVirtIOSoundUserClient);
++};
++
++OSDefineMetaClassAndStructors(AppleVirtIOSoundUserClient, SweetAudioUserClient);
++
++extern "C" void
++SweetAudioPublish(void)
++{
++	SweetAudio *svc = OSTypeAlloc(SweetAudio);
++	if (svc != NULL && svc->init()) {
++		svc->setName(SWEET_AUDIO_SERVICE_NAME);
++		svc->setProperty(kIOUserClientClassKey, "AppleVirtIOSoundUserClient");
++		svc->setProperty("SweetAudioABIVersion", (uint64_t)SWEET_AUDIO_ABI_VERSION, 32);
++		IOService *platform = IOService::getPlatform();
++		if (platform != NULL && svc->attach(platform)) {
++			svc->registerService();
++			IOLog("SWEET AUDIO: %s published (user client class AppleVirtIOSoundUserClient)\n", SWEET_AUDIO_SERVICE_NAME);
++		} else {
++			IOLog("SWEET AUDIO: cannot attach %s to the platform\n", SWEET_AUDIO_SERVICE_NAME);
++		}
++	}
++	OSSafeReleaseNULL(svc);
++}
++
++/* ------------------------------------------------------------------ */
++
++static IOReturn
++audio_ret(int e)
++{
++	switch (e) {
++	case 0:
++		return kIOReturnSuccess;
++	case EINVAL:
++		return kIOReturnBadArgument;
++	case ENOMEM:
++		return kIOReturnNoMemory;
++	case ETIMEDOUT:
++		return kIOReturnTimeout;
++	case ENOENT:
++		return kIOReturnNotFound;
++	case ENXIO:
++	case ENODEV:
++		return kIOReturnNoDevice;
++	default:
++		return kIOReturnIOError;
++	}
++}
++
++bool
++SweetAudioUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fStarted = false;
++	fClosed = false;
++	fPid = proc_selfpid();
++	return true;
++}
++
++IOReturn
++SweetAudioUserClient::clientClose(void)
++{
++	sweet_audio_lock();
++	if (!fClosed) {
++		fClosed = true;
++		if (fStarted) {
++			(void)sweet_audio_stop();
++			fStarted = false;
++		}
++	}
++	sweet_audio_unlock();
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAudioUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	vm_offset_t kva = 0;
++	uint32_t size = 0;
++
++	if (type != SWEET_AUDIO_MEM_RING && type != SWEET_AUDIO_MEM_STATUS) {
++		return kIOReturnBadArgument;
++	}
++	sweet_audio_lock();
++	int e = sweet_audio_memory(type, &kva, &size);
++	sweet_audio_unlock();
++	if (e) {
++		return audio_ret(e);
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)kva, size,
++	    type == SWEET_AUDIO_MEM_RING ? kIODirectionInOut : kIODirectionOut, kernel_task);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	*memory = md;                   /* the reference goes to the caller */
++	*options = type == SWEET_AUDIO_MEM_RING ? kIOMapWriteCombineCache : kIOMapReadOnly;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAudioUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	int e;
++
++	if (fClosed) {
++		return kIOReturnNotOpen;
++	}
++	switch (selector) {
++	case SWEET_AUDIO_SEL_START:
++		if (args->scalarInputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		sweet_audio_lock();
++		e = sweet_audio_start((uint32_t)args->scalarInput[0]);
++		if (!e) {
++			fStarted = true;
++		}
++		sweet_audio_unlock();
++		return audio_ret(e);
++	case SWEET_AUDIO_SEL_STOP:
++		sweet_audio_lock();
++		e = sweet_audio_stop();
++		fStarted = false;
++		sweet_audio_unlock();
++		return audio_ret(e);
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetAudioABI.h b/iokit/Kernel/arm/SweetAudioABI.h
+new file mode 100644
+index 0000000..bc6d593
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAudioABI.h
+@@ -0,0 +1,52 @@
++/*
++ * SweetAudio user-client ABI (iokit/Kernel/arm/SweetAudio.cpp, bsd/dev/sweet_audio.c), shared with the HAL plug-in
++ * (audio/hal in the Bergamota repo). Version 1.
++ *
++ *   START   scalar in: sample rate (44100 or 48000). The ADSP, the stream and the amplifiers come up on first use
++ *           (seconds); a running stream at the same rate only leaves idle.
++ *   STOP    the stream keeps running on silence; it is torn down after kern.sweet_audio_idle_s (15 s).
++ *
++ * clientMemoryForType(SWEET_AUDIO_MEM_RING): the ring, read/write, write-combined: SWEET_AUDIO_RING_FRAMES frames of
++ * interleaved stereo signed 16-bit. Frame f of the stream (frames_done counts from 0 at the first START and never
++ * goes back) lives at frame (f % SWEET_AUDIO_RING_FRAMES). The DSP takes SWEET_AUDIO_PERIOD_FRAMES at a time and
++ * holds SWEET_AUDIO_QUEUED periods beyond frames_done, so frame f must be written before frames_done reaches
++ * f - (SWEET_AUDIO_QUEUED - 1) * SWEET_AUDIO_PERIOD_FRAMES. A consumed period is zeroed.
++ * clientMemoryForType(SWEET_AUDIO_MEM_STATUS): struct sweet_audio_status, read-only; a consistent copy is one read
++ * between two equal, even values of seq. host_time is mach_absolute_time() when frames_done last advanced.
++ */
++#ifndef SWEET_AUDIO_ABI_H
++#define SWEET_AUDIO_ABI_H
++
++#include <stdint.h>
++
++#define SWEET_AUDIO_SERVICE_NAME        "SweetAudio"
++#define SWEET_AUDIO_ABI_VERSION         1
++
++enum {
++	SWEET_AUDIO_SEL_START = 0,
++	SWEET_AUDIO_SEL_STOP = 1,
++};
++
++#define SWEET_AUDIO_MEM_RING            0u
++#define SWEET_AUDIO_MEM_STATUS          1u
++#define SWEET_AUDIO_RING_FRAMES         8192u
++#define SWEET_AUDIO_PERIOD_FRAMES       512u
++#define SWEET_AUDIO_QUEUED              3u
++#define SWEET_AUDIO_CHANNELS            2u
++
++enum {
++	SWEET_AUDIO_STATE_STOPPED = 0,
++	SWEET_AUDIO_STATE_RUNNING = 1,
++	SWEET_AUDIO_STATE_IDLE = 2,
++};
++
++struct sweet_audio_status {
++	uint32_t version, state, rate, ring_frames, period_frames, queued_periods;
++	volatile uint32_t seq;
++	uint32_t underruns;
++	uint64_t frames_done, host_time, start_host_time;
++	int32_t error;
++	uint32_t reserved[9];
++};
++
++#endif /* SWEET_AUDIO_ABI_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 3420454..ff4ebf9 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetVenus.cpp                                  optional iokitcpp
++iokit/Kernel/arm/SweetAudio.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetNetwork.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+diff --git a/osfmk/kern/thread_policy.c b/osfmk/kern/thread_policy.c
+index bb1f51b..00bc725 100644
+--- a/osfmk/kern/thread_policy.c
++++ b/osfmk/kern/thread_policy.c
+@@ -404,6 +404,16 @@ thread_policy_set_internal(
+ 
+ 		info = (thread_time_constraint_with_priority_policy_t)policy_info;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * Apple's frameworks size real-time computations in ticks of a 24 MHz timebase (the HAL in audiomxd asks
++		 * for 1200000 = 50 ms); the Snapdragon counter runs at 19.2 MHz, where that is 62.5 ms and over
++		 * max_rt_quantum, and the audio IO thread failed to start. Clamp instead of refusing.
++		 */
++		if (info->computation > max_rt_quantum && info->constraint >= max_rt_quantum) {
++			info->computation = max_rt_quantum;
++		}
++#endif
+ 
+ 		if (info->constraint < info->computation ||
+ 		    info->computation > max_rt_quantum ||
