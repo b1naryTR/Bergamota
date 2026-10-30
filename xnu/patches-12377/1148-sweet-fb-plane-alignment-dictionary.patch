@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f9e5273..3f21fd2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -937,7 +937,21 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * Patch 1148: a dictionary, as iOS 26 reads it. VideoToolbox (FigGetAlignmentForIOSurfaceOutputToDisplayService) takes
++	 * DisplayPipePlaneBaseAlignment from the display service and looks up PlaneBaseAlignmentLinear in it without checking
++	 * its type: the plain number published until now made CoreFoundation send a dictionary selector to an NSNumber, and
++	 * mediaplaybackd aborted on every video (YouTube in Safari could not create a renderer). QuartzCore reads the same key
++	 * and skipped the number for not being a dictionary.
++	 */
++	OSDictionary *planeAlign = OSDictionary::withCapacity(1);
++	OSNumber *planeAlignLinear = OSNumber::withNumber(64ULL, 32);
++	if (planeAlign != NULL && planeAlignLinear != NULL) {
++		planeAlign->setObject("PlaneBaseAlignmentLinear", planeAlignLinear);
++		setProperty("DisplayPipePlaneBaseAlignment", planeAlign);
++	}
++	OSSafeReleaseNULL(planeAlignLinear);
++	OSSafeReleaseNULL(planeAlign);
+ 	registerService();
+ 	__atomic_store_n(&sweet_fb_shot_fb, this, __ATOMIC_RELEASE);     /* kern.sweet_fb_shot (patch 0224) */
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, vsync %u us, copy every %u, scale %u (pad %d,%d), direct %d early %d\n",
