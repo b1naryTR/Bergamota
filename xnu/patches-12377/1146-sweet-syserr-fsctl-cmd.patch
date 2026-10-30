@@ -1,0 +1,57 @@
+Failed-syscall tracer (sweetsyserr): print the command of a failed ioctl, fsctl and ffsctl and count each command
+once. ffsctl had no name and no detail, and all its failures of one process collapsed into a single "(245) e=25"
+line, so after 1145 the remaining APFS query that HFS answers with ENOTTY in LocalStorageFileProvider's lookup of a
+file (Safari's .download placeholder) could not be named. Also correct the comment: names are matched against
+proc_selfname() (p_name, 31 characters here), not p_comm, so list full names.
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -637,8 +637,10 @@
+  *
+  *   SWEET ERR: containermanagerd[41] mkdir(136) e=45 "/private/var/containers/Data/System/..."
+  *
+- * Names are compared against p_comm (16 characters: containermanagerd_system shows as
+- * "containermanager"). At most SWEET_SYSERR_MAX lines in total.
++ * Names are compared against proc_selfname() (p_name, at most 31 characters here, else p_comm): a listed name
++ * matches exactly, or as a longer name whose first 31 characters are it, so list full names
++ * ("com.apple.DocumentManagerCore.Downloads"). ioctl/fsctl/ffsctl print their command and count once per command.
++ * At most SWEET_SYSERR_MAX lines in total.
+  */
+ #define SWEET_SYSERR_MAX        900
+ #define SWEET_SYSERR_DEFAULT    "containermanagerd,containermanagerd_system,usermanagerd,backboardd," \
+@@ -708,6 +710,8 @@
+ 	case 234: return "getxattr";
+ 	case 236: return "setxattr";
+ 	case 242: return "fsctl";
++	case 245: return "ffsctl";
++	case 54: return "ioctl";
+ 	case 266: return "shm_open";
+ 	case 268: return "sem_open";
+ 	case 277: return "open_extended";
+@@ -868,7 +872,13 @@
+ 		int ce = copyinstr((user_addr_t)arg[pi], path, sizeof(path), &done);
+ 		if (ce == 0 || ce == ENAMETOOLONG) {
+ 			path[sizeof(path) - 1] = '\0';
+-			snprintf(detail, sizeof(detail), " \"%s\"", path);
++			if (code == 242) {
++				/* fsctl(path, cmd, data, options): the command first, a long path may not fit */
++				snprintf(detail, sizeof(detail), " cmd=0x%llx \"%s\"", arg[1], path);
++				key = (key ^ (uint32_t)arg[1]) * 0x100000001b3ULL;
++			} else {
++				snprintf(detail, sizeof(detail), " \"%s\"", path);
++			}
+ 			key = sweet_syserr_hash(key, path);
+ 		} else {
+ 			snprintf(detail, sizeof(detail), " <path %llx e%d>", arg[pi], ce);
+@@ -926,6 +936,10 @@
+ 	} else if (code == 92) {
+ 		snprintf(detail, sizeof(detail), " cmd=%llu", arg[1]);
+ 		key = (key ^ (uint32_t)arg[1]) * 0x100000001b3ULL;
++	} else if (code == 54 || code == 245) {
++		/* ioctl(fd, cmd, ...) and ffsctl(fd, cmd, data, options): ENOTTY names the command a file system lacks */
++		snprintf(detail, sizeof(detail), " cmd=0x%llx", arg[1]);
++		key = (key ^ (uint32_t)arg[1]) * 0x100000001b3ULL;
+ 	} else if (code == 381) {
+ 		char pol[24];
+ 		size_t done = 0;
