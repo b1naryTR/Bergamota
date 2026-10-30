@@ -1,0 +1,1544 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1b3074c..5074559 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_fb.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
++bsd/dev/sweet_venus.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/sweet_80211.c			standard
+ bsd/dev/sweet_wpa.c			standard
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 6ef2a78..cdd7356 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -16,6 +16,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
+ int sweet_rpmh_arc_vote(const char *res, bool max);
+ int sweet_rpmh_rfclk_enable(const char *res);
++int sweet_rpmh_bcm_vote(const char *res, uint64_t ab_kbps, uint64_t ib_kbps, unsigned buswidth);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -59,6 +60,7 @@ int sweet_rpmh_rfclk_enable(const char *res);
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_ARC          3u
+ #define RH_VRM          4u
++#define RH_BCM          5u
+ #define RH_ARC_LEVELS   16u      /* RPMH_ARC_MAX_LEVELS */
+ #define RH_TIMEOUT_US   100000u
+ 
+@@ -206,9 +208,10 @@ rh_lookup_slave(const char *res, unsigned want, uint32_t *address, uint32_t *aux
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != want || (addr >> 16) != want || (addr & 15u) ||
++			/* BCMs are one 32-bit register each (cmd-db stride 4); VRM/ARC resources are 16-byte aligned */
++			if (slave != want || (addr >> 16) != want || (addr & (want == RH_BCM ? 3u : 15u)) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid %s entry for %s\n", want == RH_ARC ? "ARC" : "VRM", res);
++				printf("SWEET RPMH: invalid %s entry for %s\n", want == RH_ARC ? "ARC" : want == RH_BCM ? "BCM" : "VRM", res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -586,4 +589,72 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * BCM bandwidth vote for the video codec (patch 1149): the two mmss_noc BCMs on Venus's path to DDR
++ * that nothing keeps alive (Linux interconnect/qcom/sdm845.c: MM3 = qxm_venus0/1/arm9, MM2 = qns2_mem_noc,
++ * the mnoc_sf -> mem_noc hop; SH0 and MC0 behind it are keepalive). ab/ib are kB/s on one node of
++ * buswidth bytes and become BCM units as in Linux bcm_aggregate(): x = ceil(ceil(ab * width / buswidth)
++ * * 1000 / unit) with the cmd-db aux data {le32 unit, le16 width}, 14 bits each, BCM_TCS_CMD(commit 1,
++ * valid, x, y). Active set only, like the other votes here; 0/0 sends valid=0 (the vote withdrawn).
++ */
++int
++sweet_rpmh_bcm_vote(const char *res, uint64_t ab_kbps, uint64_t ib_kbps, unsigned buswidth)
++{
++	static const char *const allowed[] = { "MM2", "MM3" };
++	unsigned i;
++	if (!sweet_board_beryllium() || !res || buswidth == 0) {
++		return EINVAL;
++	}
++	for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
++		if (!strcmp(res, allowed[i])) {
++			break;
++		}
++	}
++	if (i == sizeof(allowed) / sizeof(allowed[0])) {
++		printf("SWEET RPMH: %s is not an allowed BCM\n", res);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, aux = 0, aux_len = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_slave(res, RH_BCM, &address, &aux, &aux_len);
++	}
++	if (!error) {
++		if (aux_len < 8) {
++			printf("SWEET RPMH: %s aux data is %u bytes\n", res, aux_len);
++			error = EINVAL;
++			goto out;
++		}
++		uint32_t unit = (uint32_t)rh_db16(aux) | (uint32_t)rh_db16(aux + 2) << 16;
++		uint32_t width = rh_db16(aux + 4);
++		if (unit == 0 || width == 0) {
++			printf("SWEET RPMH: %s aux unit %u width %u\n", res, unit, width);
++			error = EINVAL;
++			goto out;
++		}
++		uint64_t x = ((ab_kbps * width + buswidth - 1) / buswidth * 1000 + unit - 1) / unit;
++		uint64_t y = ((ib_kbps * width + buswidth - 1) / buswidth * 1000 + unit - 1) / unit;
++		x = MIN(x, 0x3fffu);
++		y = MIN(y, 0x3fffu);
++		uint32_t data = 1u << 30 | ((x || y) ? 1u << 29 : 0) | (uint32_t)x << 14 | (uint32_t)y;
++		printf("SWEET RPMH: %s BCM %#x unit %u width %u: ab %llu ib %llu kB/s -> x %llu y %llu (%#x)\n", res, address,
++		    unit, width, ab_kbps, ib_kbps, x, y, data);
++		error = rh_cmds(&address, &data, 1);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: %s BCM vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index d7dc290..eb75171 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -38,6 +38,11 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ int sweet_smmu_map_sid(unsigned sid);
+ int sweet_smmu_probe_sid(unsigned sid, unsigned level);
++struct sweet_smmu_pt;
++int sweet_smmu_pt_create(const unsigned *sids, unsigned nsid, struct sweet_smmu_pt **out);
++int sweet_smmu_pt_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t pa, uint32_t len);
++void sweet_smmu_pt_unmap(struct sweet_smmu_pt *pt, uint32_t iova, uint32_t len);
++uint32_t sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uint32_t *fsynr0);
+ 
+ #define SMMU_PA         0x15000000u     /* apps_smmu */
+ #define SMMU_SIZE       0x100000u
+@@ -311,4 +316,269 @@ out:
+ 	__atomic_store_n(&smmu_lock, 0, __ATOMIC_RELEASE);
+ 	return result;
+ }
++
++/*
++ * Private translating banks (patch 1149, Venus): a context bank of its own with a 4 KiB-granule stage-1
++ * table over a 32-bit input space, for a master whose DMA mask ends below xnu's RAM (Venus: 0xdfffffff,
++ * Linux venus core.c sdm845_res_v2; xnu's RAM is above 4 GiB, so the identity bank above cannot serve it).
++ * The caller chooses the IOVAs. Tables: one level-1 table (4 entries, T0SZ 32 starts the walk at level 1)
++ * and the four level-2 tables in one contiguous block, level-3 tables taken as needed, four to an xnu page.
++ * Walks are non-cacheable like the identity bank's, so every table write is cleaned to the PoC. Mapping
++ * into empty entries needs no TLB maintenance (invalid entries are never cached); unmapping ends with
++ * TLBIALL + TLBSYNC on the bank. Callers serialize their own map/unmap calls.
++ */
++#define PT_MAX          2u
++#define PT_L3_PER_PAGE  (PAGE_SIZE / 0x1000u)
++#define PT_PTE          (1ull << 10 | 2ull << 8 | 1ull << 6 | 3ull)    /* AF, outer shareable, RW, page, attr0 */
++
++struct sweet_smmu_pt {
++	int cb;
++	uint32_t bank;                  /* register offset of the bank */
++	vm_offset_t tables;             /* +0 level 1, +(1 + i) * 4 KiB level 2 for 1 GiB block i */
++	uint64_t tables_pa;
++	vm_offset_t pool;               /* xnu page being cut into level-3 tables */
++	uint64_t pool_pa;
++	unsigned pool_used;
++	unsigned l3_count;
++	vm_offset_t l3[4][512];         /* level-3 table VA per level-2 entry, 0 = none */
++};
++
++static struct sweet_smmu_pt smmu_pts[PT_MAX];
++static unsigned smmu_npts;
++
++static void
++smmu_tlb_sync(uint32_t bank)
++{
++	smmu_wr(bank + 0x618, 0);                               /* TLBIALL */
++	smmu_wr(bank + 0x7f0, 0);                               /* TLBSYNC */
++	for (int t = 0; t < 100000 && (smmu_rd(bank + 0x7f4) & 1); t++) {
++		delay(1);
++	}
++}
++
++/* Point stream sid at bank cb: a free SMR, or an existing exact (unmasked) one repointed. */
++static int
++smmu_assign_sid(unsigned sid, int cb)
++{
++	int free_smr = -1, match = -1;
++	for (unsigned i = 0; i < smmu_nsmr && i < 128; i++) {
++		uint32_t smr = smmu_rd(0x800 + 4 * i);
++		if (!(smr & (1u << 31))) {
++			if (free_smr < 0 && (int)i >= smmu_next_smr) {
++				free_smr = (int)i;
++			}
++			continue;
++		}
++		uint32_t mask = (smr >> 16) & 0x7fff;
++		if (((smr ^ sid) & ~mask & 0x7fff) == 0 && match < 0) {
++			match = (int)i;
++		}
++	}
++	int smr_index = match >= 0 ? match : free_smr;
++	if (match >= 0) {
++		uint32_t smr = smmu_rd(0x800 + 4 * (unsigned)match);
++		printf("SWEET SMMU: pt: sid 0x%x already matched by smr %d (smr 0x%x s2cr 0x%x)\n", sid, match, smr,
++		    smmu_rd(0xc00 + 4 * (unsigned)match));
++		if ((smr >> 16) & 0x7fff) {
++			printf("SWEET SMMU: pt: smr %d is masked; leaving it alone\n", match);
++			return EEXIST;
++		}
++		smmu_wr(0xc00 + 4 * (unsigned)match, (uint32_t)cb);
++	} else if (free_smr < 0) {
++		printf("SWEET SMMU: pt: no free SMR for sid 0x%x\n", sid);
++		return ENOSPC;
++	} else {
++		smmu_wr(0xc00 + 4 * (unsigned)free_smr, (uint32_t)cb);
++		smmu_wr(0x800 + 4 * (unsigned)free_smr, 1u << 31 | (sid & 0x7fff));
++		smmu_next_smr = free_smr + 1;
++	}
++	uint32_t s2cr = smmu_rd(0xc00 + 4 * (unsigned)smr_index);
++	bool ok = ((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)cb;
++	printf("SWEET SMMU: pt: sid 0x%x -> smr %d s2cr 0x%x (%s)\n", sid, smr_index, s2cr, ok ? "translate" : "REFUSED");
++	return ok ? 0 : EIO;
++}
++
++int
++sweet_smmu_pt_create(const unsigned *sids, unsigned nsid, struct sweet_smmu_pt **out)
++{
++	int error = EIO;
++
++	if (__atomic_exchange_n(&smmu_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (smmu_base == 0) {
++		smmu_base = ml_io_map(SMMU_PA, SMMU_SIZE);
++	}
++	if (smmu_base == 0 || smmu_npts >= PT_MAX) {
++		printf("SWEET SMMU: pt: %s\n", smmu_base ? "no private bank left" : "map failed");
++		goto out;
++	}
++	uint32_t id0 = smmu_rd(0x20), id1 = smmu_rd(0x24);
++	unsigned pgshift = (id1 >> 31) ? 16 : 12;
++	unsigned ncb = id1 & 0xff, ns2cb = (id1 >> 16) & 0xff;
++	uint32_t gr1 = 1u << pgshift;
++	uint32_t cb0 = (1u << (((id1 >> 28) & 7) + 1)) << pgshift;
++	smmu_nsmr = id0 & 0xff;
++
++	/* a bank no valid stream match group translates into, that is not enabled, and not ours already */
++	uint32_t used[8] = { 0 };
++	for (unsigned i = 0; i < smmu_nsmr && i < 128; i++) {
++		uint32_t smr = smmu_rd(0x800 + 4 * i), s2cr = smmu_rd(0xc00 + 4 * i);
++		if ((smr & (1u << 31)) && ((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 32] |= 1u << ((s2cr & 0xff) % 32);
++		}
++	}
++	int cb = -1;
++	for (unsigned c = ns2cb; c < ncb && cb < 0; c++) {
++		bool ours = (int)c == smmu_cb;
++		for (unsigned p = 0; p < smmu_npts; p++) {
++			ours |= smmu_pts[p].cb == (int)c;
++		}
++		if (!ours && !(used[c / 32] & (1u << (c % 32))) && !(smmu_rd(cb0 + (c << pgshift)) & 1)) {
++			cb = (int)c;
++		}
++	}
++	if (cb < 0) {
++		printf("SWEET SMMU: pt: no free context bank\n");
++		error = ENODEV;
++		goto out;
++	}
++
++	struct sweet_smmu_pt *pt = &smmu_pts[smmu_npts];
++	bzero(pt, sizeof(*pt));
++	vm_size_t tsize = round_page(5 * 0x1000);
++	if (kmem_alloc_contig(kernel_map, &pt->tables, tsize, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET SMMU: pt: no page-table memory\n");
++		error = ENOMEM;
++		goto out;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)pt->tables);
++	if (!pn) {
++		error = ENOMEM;
++		goto out;
++	}
++	for (unsigned i = 1; i < tsize / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(pt->tables + i * PAGE_SIZE)) != pn + i) {
++			printf("SWEET SMMU: pt: table block not contiguous\n");
++			error = ENOMEM;
++			goto out;
++		}
++	}
++	pt->tables_pa = ptoa_64(pn);
++	volatile uint64_t *l1 = (volatile uint64_t *)pt->tables;
++	for (unsigned i = 0; i < 4; i++) {
++		l1[i] = (pt->tables_pa + (1 + i) * 0x1000ull) | 3;     /* table descriptor -> level 2 */
++	}
++	sweet_dma_sync_va((const void *)pt->tables, tsize);
++
++	uint32_t bank = cb0 + ((uint32_t)cb << pgshift);
++	unsigned asid = (unsigned)cb;
++	smmu_wr(bank + 0x0, 0);                                    /* SCTLR off while programming */
++	smmu_wr(bank + 0x58, 0xffffffffu);                         /* FSR clear */
++	smmu_wr(gr1 + 0x800 + 4 * (unsigned)cb, 1);                /* CBA2R VA64 */
++	smmu_wr(gr1 + 4 * (unsigned)cb, 1u << 16 | 0xfu << 12 | 3u << 8); /* CBAR S1+S2 bypass WB NSH */
++	smmu_wr(bank + 0x10, 7u << 15 | 2);                        /* TCR2: SEP upstream, PA 40-bit */
++	smmu_wr(bank + 0x30, 32 | 1u << 23);                       /* TCR: T0SZ 32, 4K, NC walks, EPD1 */
++	smmu_wr(bank + 0x34, asid);                                /* CONTEXTIDR */
++	smmu_wr64(bank + 0x20, pt->tables_pa | (uint64_t)asid << 48); /* TTBR0 */
++	smmu_wr64(bank + 0x28, 0);
++	smmu_wr(bank + 0x38, 0x44);                                /* MAIR0 attr0 Normal NC */
++	smmu_tlb_sync(bank);
++	smmu_wr(bank + 0x0, 1u << 6 | 1u << 5 | 1u << 2 | 1u << 1 | 1); /* CFIE CFRE AFE TRE M */
++	if (!(smmu_rd(bank + 0x0) & 1)) {
++		printf("SWEET SMMU: pt: context bank %d did not enable\n", cb);
++		goto out;
++	}
++	pt->cb = cb;
++	pt->bank = bank;
++	smmu_npts++;
++	printf("SWEET SMMU: pt: context bank %d, 32-bit IOVA, ttbr0 0x%llx\n", cb, pt->tables_pa);
++	error = 0;
++	for (unsigned i = 0; i < nsid && !error; i++) {
++		error = smmu_assign_sid(sids[i], cb);
++	}
++	*out = pt;
++out:
++	__atomic_store_n(&smmu_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++int
++sweet_smmu_pt_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t pa, uint32_t len)
++{
++	if (!pt || ((iova | pa | len) & 0xfff) || (uint64_t)iova + len > 0x100000000ull) {
++		return EINVAL;
++	}
++	for (uint32_t o = 0; o < len; o += 0x1000) {
++		uint32_t va = iova + o;
++		unsigned i1 = va >> 30, i2 = (va >> 21) & 511, i3 = (va >> 12) & 511;
++		if (pt->l3[i1][i2] == 0) {
++			if (pt->pool == 0 || pt->pool_used == PT_L3_PER_PAGE) {
++				vm_offset_t page = 0;
++				if (kmem_alloc_contig(kernel_map, &page, PAGE_SIZE, PAGE_MASK, 0, 0,
++				    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++					return ENOMEM;
++				}
++				ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)page);
++				if (!pn) {
++					return ENOMEM;
++				}
++				sweet_dma_sync_va((const void *)page, PAGE_SIZE);
++				pt->pool = page;
++				pt->pool_pa = ptoa_64(pn);
++				pt->pool_used = 0;
++			}
++			pt->l3[i1][i2] = pt->pool + pt->pool_used * 0x1000u;
++			uint64_t l3pa = pt->pool_pa + pt->pool_used * 0x1000u;
++			pt->pool_used++;
++			pt->l3_count++;
++			vm_offset_t l2e = pt->tables + (1 + i1) * 0x1000u + i2 * sizeof(uint64_t);
++			*(volatile uint64_t *)l2e = l3pa | 3;
++			sweet_dma_sync_va((const void *)l2e, sizeof(uint64_t));
++		}
++		vm_offset_t l3e = pt->l3[i1][i2] + i3 * sizeof(uint64_t);
++		*(volatile uint64_t *)l3e = (pa + o) | PT_PTE;
++		sweet_dma_sync_va((const void *)l3e, sizeof(uint64_t));
++	}
++	return 0;
++}
++
++void
++sweet_smmu_pt_unmap(struct sweet_smmu_pt *pt, uint32_t iova, uint32_t len)
++{
++	if (!pt || ((iova | len) & 0xfff) || (uint64_t)iova + len > 0x100000000ull) {
++		return;
++	}
++	for (uint32_t o = 0; o < len; o += 0x1000) {
++		uint32_t va = iova + o;
++		vm_offset_t t = pt->l3[va >> 30][(va >> 21) & 511];
++		if (t) {
++			vm_offset_t l3e = t + ((va >> 12) & 511) * sizeof(uint64_t);
++			*(volatile uint64_t *)l3e = 0;
++			sweet_dma_sync_va((const void *)l3e, sizeof(uint64_t));
++		}
++	}
++	smmu_tlb_sync(pt->bank);
++}
++
++/* The bank's fault syndrome: FSR (0 = none), FAR and FSYNR0; a reported fault is cleared. */
++uint32_t
++sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uint32_t *fsynr0)
++{
++	if (!pt || smmu_base == 0) {
++		return 0;
++	}
++	uint32_t fsr = smmu_rd(pt->bank + 0x58);
++	if (far) {
++		*far = smmu_rd(pt->bank + 0x60) | (uint64_t)smmu_rd(pt->bank + 0x64) << 32;
++	}
++	if (fsynr0) {
++		*fsynr0 = smmu_rd(pt->bank + 0x68);
++	}
++	if (fsr) {
++		smmu_wr(pt->bank + 0x58, fsr);
++	}
++	return fsr;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+new file mode 100644
+index 0000000..b38c9f0
+--- /dev/null
++++ b/bsd/dev/sweet_venus.c
+@@ -0,0 +1,1134 @@
++/*
++ * SWEET Venus, Poco F1 (SDM845): the Qualcomm video codec (Venus 5.2 / AR50, HFI 4xx). Patch 1149 is
++ * milestone 1: power, signed firmware, HFI handshake. Nothing runs at boot: `sweetsysctl
++ * kern.sweet_venus_ctl=1` runs the bring-up once (2 polls the queues again, 3 pings the firmware) and
++ * kern.sweet_venus reports where it got. Every step logs "SWEET VENUS:".
++ *
++ *   1  power: GCC video AHB/AXI/XO branches, RPMh BCM votes MM3/MM2 (the mnoc_sf path to DDR), the venus
++ *      GDSC (POLL_CFG_GDSCR, memories forced on), venus core/ahb/axi branches. The core clock stays on
++ *      venus_clk_src as found (XO after reset): Linux boots the firmware the same way and raises the rate
++ *      only for sessions (pm_helpers.c core_clks_enable v4, load_scale_v4).
++ *   2  apps_smmu: a private translating bank for Venus's non-secure streams 0x10a0/0x10a8/0x10b0
++ *      (iommus <0x10a0 0x8>, <0x10b0 0>), IOVAs handed out top-down below 0xe0000000 (Linux sdm845
++ *      dma_mask 0xdfffffff); xnu's RAM is above 4 GiB, so the identity bank cannot serve this master.
++ *   3  PAS 9 through TrustZone: INIT_IMAGE (ELF header + hash segment of venus.mbn), MEM_SETUP of the
++ *      carve-out video_region@0x95c00000 (5 MiB), the loadable segments copied in (relocated),
++ *      AUTH_AND_RESET; MP VIDEO_VAR (content protection 0..0x70800000, non-pixel 0x1000000+0x24800000).
++ *   4  HFI: queue table + command/message/debug queues (3 MiB UC region) and the SFR, write-combined;
++ *      SET_REMOTE_STATE resume; UC region, CTRL_INIT, wait for the init status; SYS_INIT, image version,
++ *      debug config, codec power-plane control off; the message and debug queues are polled.
++ *
++ * Firmware: /usr/standalone/firmware/sweet/venus.mbn (the beryllium image of the sdm845-mainline
++ * firmware-xiaomi-beryllium repo, Xiaomi-signed; kept out of git). Sequence and register numbers from
++ * Linux drivers/media/platform/qcom/venus (core.c, pm_helpers.c, firmware.c, hfi_venus.c, hfi_cmds.c,
++ * hfi_msgs.c), drivers/clk/qcom/videocc-sdm845.c, gdsc.c, clk-branch.c, drivers/soc/qcom/mdt_loader.c,
++ * drivers/firmware/qcom/qcom_scm.c (GPL-2.0-only: numbers and sequences only, no code copied) and the
++ * phone's live DT (qcom,vidc@aa00000, qcom,venus@aae0000 pas-id 9, video_region, videocc@ab00000).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <sys/sysctl.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void sweet_log_sync(void);               /* sweet_ufs.c */
++extern vnode_t rootvnode;
++extern int sweet_rpmh_bcm_vote(const char *res, uint64_t ab_kbps, uint64_t ib_kbps, unsigned buswidth);
++extern int sweet_smmu_probe_sid(unsigned sid, unsigned level);
++struct sweet_smmu_pt;
++extern int sweet_smmu_pt_create(const unsigned *sids, unsigned nsid, struct sweet_smmu_pt **out);
++extern int sweet_smmu_pt_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t pa, uint32_t len);
++extern void sweet_smmu_pt_unmap(struct sweet_smmu_pt *pt, uint32_t iova, uint32_t len);
++extern uint32_t sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uint32_t *fsynr0);
++
++/* ---- addresses (live DT) ---- */
++#define VENUS_PA        0x0aa00000u     /* qcom,vidc@aa00000 */
++#define VENUS_SIZE      0x00100000u
++#define VCC_PA          0x0ab00000u     /* qcom,videocc@ab00000 */
++#define VCC_SIZE        0x00010000u
++#define GCC_PA          0x00100000u     /* GCC; the video branches are at +0xb004 (AHB), +0xb01c (AXI), +0xb028 (XO) */
++#define GCC_SIZE        0x00010000u
++#define FW_PA           0x95c00000ull   /* video_region@0x95c00000 (removed-dma-pool, no-map) */
++#define FW_SIZE         0x00500000u
++
++/* ---- videocc (videocc-sdm845.c) ---- */
++#define VCC_VENUS_RCG   0x7f0           /* video_cc_venus_clk_src: +0 CMD, +4 CFG */
++#define VCC_GDSC_VENUS  0x814
++#define VCC_CTL_CORE    0x850           /* "core" */
++#define VCC_CTL_AXI     0x910           /* "bus" */
++#define VCC_AHB         0x9b0           /* "iface" */
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_HW_CONTROL         (1u << 1)
++#define GDSC_SW_OVERRIDE        (1u << 2)
++#define GDSC_WAIT_MASK          (0xfffu << 12)  /* EN_REST [23:20], EN_FEW [19:16], CLK_DIS [15:12] */
++#define GDSC_WAIT_VAL           (2u << 20 | 8u << 16 | 2u << 12)
++#define GDSC_UP_COMPLETE        (1u << 16)      /* in CFG_GDSCR = GDSCR + 4 */
++#define CBCR_RETAIN             (1u << 14 | 1u << 13)   /* RETAIN_MEM, RETAIN_PERIPH */
++#define CBCR_OFF                (1u << 31)
++
++/* ---- Venus 4xx (hfi_venus_io.h) ---- */
++#define CPU_CS          0xd2000u
++#define CPU_IC          0xdf000u
++#define WRAPPER         0xe0000u
++#define CS_A2HSOFTINTCLR 0x1c
++#define CS_CTRL_INIT    0x48
++#define CS_ARG0         0x4c
++#define CS_ARG1         0x50
++#define CS_ARG2         0x54
++#define CS_SFR_ADDR     0x5c
++#define CS_UC_ADDR      0x64
++#define CS_UC_SIZE      0x68
++#define IC_SOFTINT      0x18
++#define IC_SOFTINT_H2A  (1u << 15)
++#define WR_HW_VERSION   0x00
++#define WR_INTR_STATUS  0x0c
++#define WR_INTR_MASK    0x10
++#define WR_INTR_CLEAR   0x14
++#define WR_INTR_MASK_A2HVCODEC 0x8
++#define WR_CPU_STATUS   0x2014
++
++/* ---- HFI (hfi_venus.c, hfi_cmds.h, hfi_msgs.h, hfi_helper.h) ---- */
++#define Q_NUM           3u
++#define Q_CMD           0u
++#define Q_MSG           1u
++#define Q_DBG           2u
++#define Q_SIZE          (1024u * 50u * 16u)             /* IFACEQ_QUEUE_SIZE */
++#define QT_HDR          24u                             /* struct hfi_queue_table_header */
++#define QH_SIZE         56u                             /* struct hfi_queue_header */
++#define QT_SIZE         (QT_HDR + QH_SIZE * Q_NUM)
++#define UC_SIZE         0x300000u                       /* SHARED_QSIZE */
++#define Q_DFLT_TYPE     0x01010000u
++#define PKT_MAX         (12u * 1024u)                   /* IFACEQ_VAR_HUGE_PKT_SIZE */
++#define SFR_BYTES       4096u
++
++#define HFI_CMD_SYS_INIT                0x10001u
++#define HFI_CMD_SYS_SET_PROPERTY        0x10005u
++#define HFI_CMD_SYS_GET_PROPERTY        0x10006u
++#define HFI_CMD_SYS_PING                0x210002u
++#define HFI_MSG_SYS_INIT                0x20001u
++#define HFI_MSG_SYS_DEBUG               0x20004u
++#define HFI_MSG_SYS_IDLE                0x20008u
++#define HFI_MSG_SYS_COV                 0x20009u
++#define HFI_MSG_SYS_PROPERTY_INFO       0x2000au
++#define HFI_MSG_EVENT_NOTIFY            0x21001u
++#define HFI_MSG_SYS_PING_ACK            0x220002u
++#define HFI_PROP_SYS_DEBUG_CONFIG       0x1u
++#define HFI_PROP_SYS_CODEC_POWER_PLANE  0x5u
++#define HFI_PROP_SYS_IMAGE_VERSION      0x6u
++#define HFI_PROP_CODEC_SUPPORTED        0x1009u
++#define HFI_PROP_MAX_SESSIONS           0x1010u
++#define HFI_ARCH_OX                     0x1u
++#define HFI_DEBUG_MODE_QUEUE            0x1u
++#define HFI_DEBUG_LEVELS                0x1eu           /* MEDIUM HIGH ERROR FATAL (not LOW) */
++#define HFI_EVENT_SYS_ERROR             0x1u
++
++/* ---- SCM (qcom_scm.h) ---- */
++#define SCM_64          0x40000000u
++#define SCM_SIP         0x02000000u
++#define SCM_INTERRUPTED 1
++#define SCM_BUSY        (-12)
++#define SCM_FN(svc, cmd) (SCM_64 | SCM_SIP | (svc) << 8 | (cmd))
++#define PAS_VENUS       9u
++
++/* ---- IOVA window ---- */
++#define IOVA_TOP        0xe0000000u
++#define IOVA_FLOOR      0x80000000u
++
++struct vn_buf {
++	vm_offset_t kva;
++	vm_size_t size;
++	uint32_t iova;
++};
++
++struct vn_qhdr {
++	uint32_t status, start_addr, type, q_size, pkt_size, pkt_drop_cnt, rx_wm, tx_wm, rx_req, tx_req,
++	    rx_irq_status, tx_irq_status, read_idx, write_idx;
++};
++
++static struct {
++	volatile uint32_t busy;
++	vm_offset_t venus, vcc, gcc;
++	struct sweet_smmu_pt *pt;
++	uint32_t iova_next;
++	struct vn_buf uc, sfr;
++	unsigned step;                  /* last completed bring-up step, 0..4 */
++	int error;
++	bool powered, fw_running, hfi_up, sys_init_done;
++	uint32_t hw_version, init_status, sys_init_error, dec_codecs, enc_codecs, max_sessions;
++	uint32_t msgs, dbgs, events, last_event, pings;
++	char fw_version[96];
++	char where[48];
++} vn = { .iova_next = IOVA_TOP };
++
++static uint32_t vn_pktw[PKT_MAX / 4];
++#define vn_pkt ((uint8_t *)vn_pktw)
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++vn_fail(const char *where, int error)
++{
++	vn.error = error;
++	strlcpy(vn.where, where, sizeof(vn.where));
++	printf("SWEET VENUS: FAILED at %s (errno %d)\n", where, error);
++	sweet_log_sync();
++}
++
++/* ------------------------------------------------------------------ */
++/* step 1: power                                                       */
++/* ------------------------------------------------------------------ */
++
++static bool
++vn_branch_on(vm_offset_t base, uint32_t cbcr, const char *name)
++{
++	wr(base, cbcr, rd(base, cbcr) | 1);
++	for (unsigned t = 0; t < 500; t++) {
++		if (!(rd(base, cbcr) & CBCR_OFF)) {
++			printf("SWEET VENUS: %s on (cbcr %#x)\n", name, rd(base, cbcr));
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET VENUS: %s did not turn on (cbcr %#x)\n", name, rd(base, cbcr));
++	return false;
++}
++
++/* gdsc_init + gdsc_enable for a POLL_CFG_GDSCR, PWRSTS_OFF_ON domain without HW_CTRL */
++static bool
++vn_gdsc_on(uint32_t gdscr, const uint32_t *cxcs, unsigned ncxc, const char *name)
++{
++	uint32_t v = rd(vn.vcc, gdscr);
++	printf("SWEET VENUS: %s gdscr %#x cfg %#x\n", name, v, rd(vn.vcc, gdscr + 4));
++	v = (v & ~(GDSC_HW_CONTROL | GDSC_SW_OVERRIDE | GDSC_WAIT_MASK)) | GDSC_WAIT_VAL;
++	wr(vn.vcc, gdscr, v);
++	if (!(rd(vn.vcc, gdscr + 4) & GDSC_UP_COMPLETE)) {
++		wr(vn.vcc, gdscr, v & ~GDSC_SW_COLLAPSE);
++		unsigned t;
++		for (t = 0; t < 1500 && !(rd(vn.vcc, gdscr + 4) & GDSC_UP_COMPLETE); t++) {
++			delay(1);
++		}
++		if (!(rd(vn.vcc, gdscr + 4) & GDSC_UP_COMPLETE)) {
++			printf("SWEET VENUS: %s stuck off (gdscr %#x cfg %#x)\n", name, rd(vn.vcc, gdscr), rd(vn.vcc, gdscr + 4));
++			return false;
++		}
++		printf("SWEET VENUS: %s powered up in %u us\n", name, t);
++	} else {
++		printf("SWEET VENUS: %s was already on\n", name);
++	}
++	for (unsigned i = 0; i < ncxc; i++) {
++		wr(vn.vcc, cxcs[i], rd(vn.vcc, cxcs[i]) | CBCR_RETAIN);
++	}
++	delay(1);
++	return true;
++}
++
++static int
++vn_power_on(void)
++{
++	if (!vn.gcc) {
++		vn.gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	}
++	if (!vn.vcc) {
++		vn.vcc = ml_io_map(VCC_PA, VCC_SIZE);
++	}
++	if (!vn.gcc || !vn.vcc) {
++		return ENOMEM;
++	}
++	uint32_t ahb = rd(vn.gcc, 0xb004), axi = rd(vn.gcc, 0xb01c), xo = rd(vn.gcc, 0xb028);
++	printf("SWEET VENUS: GCC video ahb %#x axi %#x xo %#x\n", ahb, axi, xo);
++	sweet_log_sync();
++	/* gcc_video_ahb_clk clocks videocc's own registers: never touch videocc with it off */
++	if ((ahb & CBCR_OFF) && !vn_branch_on(vn.gcc, 0xb004, "gcc_video_ahb_clk")) {
++		return EIO;
++	}
++	if ((xo & CBCR_OFF) && !vn_branch_on(vn.gcc, 0xb028, "gcc_video_xo_clk")) {
++		return EIO;
++	}
++	if (axi & CBCR_OFF) {
++		(void)vn_branch_on(vn.gcc, 0xb01c, "gcc_video_axi_clk");   /* BRANCH_VOTED: may report late */
++	}
++
++	/* Linux venus_runtime_resume votes 20 MB/s on video-mem first; 1 GB/s covers firmware boot and 1080p */
++	int e1 = sweet_rpmh_bcm_vote("MM3", 1000000, 1000000, 32);
++	int e2 = sweet_rpmh_bcm_vote("MM2", 1000000, 1000000, 32);
++	printf("SWEET VENUS: BCM votes MM3 %d MM2 %d\n", e1, e2);
++
++	uint32_t rcg_cfg = rd(vn.vcc, VCC_VENUS_RCG + 4);
++	printf("SWEET VENUS: venus_clk_src cmd %#x cfg %#x; branches core %#x ahb %#x axi %#x\n",
++	    rd(vn.vcc, VCC_VENUS_RCG), rcg_cfg, rd(vn.vcc, VCC_CTL_CORE), rd(vn.vcc, VCC_AHB), rd(vn.vcc, VCC_CTL_AXI));
++	sweet_log_sync();
++	if (rcg_cfg & 0x71fu) {
++		/* not XO undivided (the reset value): park it there, as the shared RCG ops do while it is off */
++		wr(vn.vcc, VCC_VENUS_RCG, rd(vn.vcc, VCC_VENUS_RCG) | 2);      /* ROOT_EN (force on) */
++		for (unsigned t = 0; t < 500 && (rd(vn.vcc, VCC_VENUS_RCG) & CBCR_OFF); t++) {
++			delay(1);
++		}
++		wr(vn.vcc, VCC_VENUS_RCG + 4, rcg_cfg & ~(0x71fu | 3u << 12 | 1u << 20));
++		wr(vn.vcc, VCC_VENUS_RCG, rd(vn.vcc, VCC_VENUS_RCG) | 1);      /* UPDATE */
++		unsigned t;
++		for (t = 0; t < 500 && (rd(vn.vcc, VCC_VENUS_RCG) & 1); t++) {
++			delay(1);
++		}
++		wr(vn.vcc, VCC_VENUS_RCG, rd(vn.vcc, VCC_VENUS_RCG) & ~2u);
++		printf("SWEET VENUS: venus_clk_src parked on XO: cmd %#x cfg %#x (%s)\n", rd(vn.vcc, VCC_VENUS_RCG),
++		    rd(vn.vcc, VCC_VENUS_RCG + 4), t < 500 ? "updated" : "UPDATE STUCK");
++		if (t >= 500) {
++			return EIO;
++		}
++	}
++	static const uint32_t venus_cxcs[] = { VCC_CTL_CORE, VCC_CTL_AXI };
++	if (!vn_gdsc_on(VCC_GDSC_VENUS, venus_cxcs, 2, "venus_gdsc")) {
++		return EIO;
++	}
++	if (!vn_branch_on(vn.vcc, VCC_CTL_CORE, "video_cc_venus_ctl_core_clk") ||
++	    !vn_branch_on(vn.vcc, VCC_AHB, "video_cc_venus_ahb_clk") ||
++	    !vn_branch_on(vn.vcc, VCC_CTL_AXI, "video_cc_venus_ctl_axi_clk")) {
++		return EIO;
++	}
++	if (!vn.venus) {
++		vn.venus = ml_io_map(VENUS_PA, VENUS_SIZE);
++	}
++	if (!vn.venus) {
++		return ENOMEM;
++	}
++	vn.powered = true;
++	vn.hw_version = rd(vn.venus, WRAPPER + WR_HW_VERSION);
++	printf("SWEET VENUS: powered; wrapper hw version %#x (%u.%u.%u), cpu status %#x, intr status %#x\n", vn.hw_version,
++	    (vn.hw_version >> 28) & 0xf, (vn.hw_version >> 16) & 0xfff, vn.hw_version & 0xffff,
++	    rd(vn.venus, WRAPPER + WR_CPU_STATUS), rd(vn.venus, WRAPPER + WR_INTR_STATUS));
++	sweet_log_sync();
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* step 2: DMA memory behind the private SMMU bank                     */
++/* ------------------------------------------------------------------ */
++
++/* Wired kernel memory, write-combined (normal non-cacheable) for CPU and Venus alike, mapped at an IOVA. */
++static int
++vn_buf_alloc(struct vn_buf *b, vm_size_t size, uint32_t align)
++{
++	size = round_page(size);
++	uint32_t iova = (vn.iova_next - (uint32_t)size) & ~(align - 1);
++	if (iova < IOVA_FLOOR || iova > vn.iova_next) {
++		return ENOSPC;
++	}
++	vm_offset_t kva = 0;
++	if (kmem_alloc(kernel_map, &kva, size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	for (vm_size_t o = 0; o < size; o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(kva + o));
++		if (!pn) {
++			return ENOMEM;
++		}
++		pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
++		int error = sweet_smmu_pt_map(vn.pt, iova + (uint32_t)o, ptoa_64(pn), PAGE_SIZE);
++		if (error) {
++			return error;
++		}
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	vn.iova_next = iova;
++	b->kva = kva;
++	b->size = size;
++	b->iova = iova;
++	return 0;
++}
++
++static int
++vn_smmu(void)
++{
++	static const unsigned sids[] = { 0x10a0, 0x10a8, 0x10b0 };
++	for (unsigned i = 0; i < sizeof(sids) / sizeof(sids[0]); i++) {
++		(void)sweet_smmu_probe_sid(sids[i], 1);
++	}
++	return sweet_smmu_pt_create(sids, sizeof(sids) / sizeof(sids[0]), &vn.pt);
++}
++
++static void
++vn_smmu_report(const char *when)
++{
++	uint64_t far = 0;
++	uint32_t fsynr = 0, fsr = sweet_smmu_pt_fault(vn.pt, &far, &fsynr);
++	if (fsr) {
++		printf("SWEET VENUS: SMMU FAULT %s: fsr %#x far %#llx fsynr0 %#x\n", when, fsr, far, fsynr);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* step 3: firmware through TrustZone PAS                              */
++/* ------------------------------------------------------------------ */
++
++struct scm_regs {
++	uint64_t a[7];
++};
++
++static void
++scm_smccc(struct scm_regs *r)
++{
++	register uint64_t x0 __asm__("x0") = r->a[0];
++	register uint64_t x1 __asm__("x1") = r->a[1];
++	register uint64_t x2 __asm__("x2") = r->a[2];
++	register uint64_t x3 __asm__("x3") = r->a[3];
++	register uint64_t x4 __asm__("x4") = r->a[4];
++	register uint64_t x5 __asm__("x5") = r->a[5];
++	register uint64_t x6 __asm__("x6") = r->a[6];
++	register uint64_t x7 __asm__("x7") = 0;
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++	    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	*r = (struct scm_regs) { { x0, x1, x2, x3, x4, x5, x6 } };
++}
++
++/* As sweet_a630_pas.c: interrupted calls resumed with the original x1..x5 and TZ's token, busy retried. */
++static bool
++scm_call(const char *name, uint32_t fn, uint32_t arginfo, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
++    int32_t *status, int32_t *result)
++{
++	const struct scm_regs initial = { { fn, arginfo, a1, a2, a3, a4, 0 } };
++	struct scm_regs r;
++	bool done = false;
++
++	printf("SWEET VENUS: SCM %s fn=%#x info=%#x args=%#llx/%#llx/%#llx/%#llx\n", name, fn, arginfo, a1, a2, a3, a4);
++	sweet_log_sync();
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (unsigned busy = 0; busy <= 3 && !done; busy++) {
++		r = initial;
++		unsigned resume;
++		for (resume = 0; resume <= 64; resume++) {
++			scm_smccc(&r);
++			if ((int32_t)r.a[0] != SCM_INTERRUPTED) {
++				break;
++			}
++			uint64_t token = r.a[6];
++			r = initial;
++			r.a[0] = SCM_INTERRUPTED;
++			r.a[6] = token;
++		}
++		if (resume > 64) {
++			printf("SWEET VENUS: SCM %s interrupted call did not complete\n", name);
++			return false;
++		}
++		if ((int32_t)r.a[0] != SCM_BUSY) {
++			done = true;
++		} else {
++			delay(30000);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*status = (int32_t)r.a[0];
++	*result = (int32_t)r.a[1];
++	printf("SWEET VENUS: SCM %s completed=%u status=%d result=%d\n", name, done, *status, *result);
++	sweet_log_sync();
++	return done;
++}
++
++static bool
++pas_call(const char *name, uint32_t cmd, uint32_t arginfo, uint64_t a2, uint64_t a3)
++{
++	int32_t status = -1, result = -1;
++	return scm_call(name, SCM_FN(2, cmd), arginfo, PAS_VENUS, a2, a3, 0, &status, &result) && status == 0 && result == 0;
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++#define FW_MAX          (8u << 20)
++
++static const char *const fw_paths[] = {
++	"/usr/standalone/firmware/sweet/venus.mbn", "/usr/local/share/firmware/venus.mbn",
++};
++
++static bool
++vn_fw_read(void **buf, size_t *len)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++
++	if (rootvnode == NULLVP) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(fw_paths) / sizeof(fw_paths[0]); i++) {
++		vnode_t vp = NULLVP;
++		off_t size = 0;
++		if (vnode_lookup(fw_paths[i], 0, &vp, ctx) != 0 || vp == NULLVP) {
++			continue;
++		}
++		if (vnode_size(vp, &size, ctx) != 0 || size <= 0 || size > FW_MAX) {
++			vnode_put(vp);
++			continue;
++		}
++		void *copy = kalloc_data((vm_size_t)size, Z_WAITOK | Z_ZERO);
++		if (!copy) {
++			vnode_put(vp);
++			return false;
++		}
++		int resid = 0;
++		int error = vn_rdwr(UIO_READ, vp, (caddr_t)copy, (int)size, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		vnode_put(vp);
++		if (error || resid) {
++			kfree_data(copy, (vm_size_t)size);
++			continue;
++		}
++		printf("SWEET VENUS: firmware %s, %lld bytes\n", fw_paths[i], (long long)size);
++		*buf = copy;
++		*len = (size_t)size;
++		return true;
++	}
++	return false;
++}
++
++static int
++vn_fw_boot(void)
++{
++	void *fw = NULL;
++	size_t fw_len = 0;
++	int error = EINVAL;
++	vm_offset_t meta = 0;
++	vm_size_t meta_size = 0;
++
++	if (!vn_fw_read(&fw, &fw_len)) {
++		printf("SWEET VENUS: no venus.mbn in %s or %s\n", fw_paths[0], fw_paths[1]);
++		return ENOENT;
++	}
++	const uint8_t *e = fw;
++	if (fw_len < 52 || le32(e) != 0x464c457f || e[4] != 1 || e[5] != 1 || le16(e + 42) != 32) {
++		printf("SWEET VENUS: venus.mbn is not an ELF32 image\n");
++		goto out;
++	}
++	uint32_t phoff = le32(e + 28);
++	unsigned phnum = le16(e + 44);
++	if (phnum < 2 || phnum > 32 || phoff < 52 || (uint64_t)phoff + 32u * phnum > fw_len) {
++		printf("SWEET VENUS: venus.mbn program headers out of range (%u at %#x)\n", phnum, phoff);
++		goto out;
++	}
++	/* qcom_mdt_read_metadata: phdr 0 is the header block, phdr 1 the hash segment (type 2 in p_flags[26:24]) */
++	const uint8_t *p0 = e + phoff, *p1 = e + phoff + 32;
++	uint32_t ehdr_size = le32(p0 + 16), hash_off = le32(p1 + 4), hash_size = le32(p1 + 16);
++	if (le32(p0) == 1 || (le32(p1 + 24) & (7u << 24)) != (2u << 24) || ehdr_size > fw_len ||
++	    (uint64_t)hash_off + hash_size > fw_len || ehdr_size + hash_size > 0x10000) {
++		printf("SWEET VENUS: venus.mbn has no header block + hash segment (%#x, %#x+%#x)\n", ehdr_size, hash_off,
++		    hash_size);
++		goto out;
++	}
++	uint64_t min_addr = ~0ull, max_addr = 0;
++	bool relocate = false;
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint8_t *p = e + phoff + 32 * i;
++		uint32_t type = le32(p), off = le32(p + 4), paddr = le32(p + 12), filesz = le32(p + 16), memsz = le32(p + 20),
++		    flags = le32(p + 24);
++		printf("SWEET VENUS: phdr %u: type %u off %#x paddr %#x filesz %#x memsz %#x flags %#x\n", i, type, off, paddr,
++		    filesz, memsz, flags);
++		if (type != 1 || (flags & (7u << 24)) == (2u << 24) || memsz == 0) {
++			continue;
++		}
++		if (filesz > memsz || (uint64_t)off + filesz > fw_len) {
++			printf("SWEET VENUS: segment %u outside the file\n", i);
++			goto out;
++		}
++		relocate |= !!(flags & (1u << 27));
++		min_addr = MIN(min_addr, paddr);
++		max_addr = MAX(max_addr, ((uint64_t)paddr + memsz + 0xfff) & ~0xfffull);
++	}
++	if (min_addr == ~0ull || max_addr - min_addr > FW_SIZE || (!relocate && min_addr != FW_PA)) {
++		printf("SWEET VENUS: image %#llx-%#llx (%s) does not fit the carve-out\n", min_addr, max_addr,
++		    relocate ? "relocatable" : "fixed");
++		goto out;
++	}
++	uint32_t mem_size = (uint32_t)(max_addr - min_addr);
++	printf("SWEET VENUS: %s image, %#x bytes -> carve-out %#llx\n", relocate ? "relocatable" : "fixed", mem_size, FW_PA);
++
++	/* metadata: header block + hash segment, physically contiguous and write-combined (dma_alloc_coherent) */
++	meta_size = round_page(ehdr_size + hash_size);
++	if (kmem_alloc_contig(kernel_map, &meta, meta_size, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		error = ENOMEM;
++		goto out;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)meta);
++	for (unsigned i = 1; pn && i < meta_size / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(meta + i * PAGE_SIZE)) != pn + i) {
++			pn = 0;
++		}
++	}
++	if (!pn) {
++		printf("SWEET VENUS: metadata not physically contiguous\n");
++		error = ENOMEM;
++		goto out;
++	}
++	memcpy((void *)meta, e, ehdr_size);
++	memcpy((void *)(meta + ehdr_size), e + hash_off, hash_size);
++	sweet_dma_sync_va((const void *)meta, meta_size);
++	for (unsigned i = 0; i < meta_size / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	sweet_dma_sync_va((const void *)meta, meta_size);
++
++	error = EIO;
++	/* SCM_ARGS(2, VAL, RW) = 0x82 */
++	if (!pas_call("PAS INIT_IMAGE", 1, 0x82, ptoa_64(pn), 0)) {
++		goto out;
++	}
++	if (!pas_call("PAS MEM_SETUP", 2, 3, FW_PA, mem_size)) {
++		goto out_shutdown;
++	}
++	vm_offset_t region = ml_io_map_unmappable((vm_offset_t)FW_PA, FW_SIZE, VM_WIMG_WCOMB);
++	if (!region) {
++		printf("SWEET VENUS: carve-out map failed\n");
++		goto out_shutdown;
++	}
++	bzero((void *)region, mem_size);
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint8_t *p = e + phoff + 32 * i;
++		uint32_t type = le32(p), off = le32(p + 4), paddr = le32(p + 12), filesz = le32(p + 16), memsz = le32(p + 20),
++		    flags = le32(p + 24);
++		if (type != 1 || (flags & (7u << 24)) == (2u << 24) || memsz == 0 || filesz == 0) {
++			continue;
++		}
++		uint64_t dst = relocate ? (uint64_t)paddr - min_addr : (uint64_t)paddr - FW_PA;
++		if (dst + memsz > mem_size) {
++			printf("SWEET VENUS: segment %u outside the image\n", i);
++			goto out_shutdown;
++		}
++		memcpy((void *)(region + dst), e + off, filesz);
++		printf("SWEET VENUS: segment %u: %#x bytes -> carve-out +%#llx\n", i, filesz, dst);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (!pas_call("PAS AUTH_AND_RESET", 5, 1, 0, 0)) {
++		goto out_shutdown;
++	}
++	vn.fw_running = true;
++	printf("SWEET VENUS: firmware authenticated and started\n");
++	int32_t status = -1, result = -1;
++	if (!scm_call("MP VIDEO_VAR", SCM_FN(0x0c, 0x08), 4, 0, 0x70800000, 0x1000000, 0x24800000, &status, &result) ||
++	    status != 0 || result != 0) {
++		printf("SWEET VENUS: VIDEO_VAR refused (status %d result %d); continuing\n", status, result);
++	}
++	error = 0;
++	goto out;
++
++out_shutdown:
++	(void)pas_call("PAS SHUTDOWN", 6, 1, 0, 0);
++out:
++	kfree_data(fw, (vm_size_t)fw_len);
++	return error;
++}
++
++/* ------------------------------------------------------------------ */
++/* step 4: HFI                                                         */
++/* ------------------------------------------------------------------ */
++
++static volatile struct vn_qhdr *
++vn_qhdr(unsigned q)
++{
++	return (volatile struct vn_qhdr *)(vn.uc.kva + QT_HDR + QH_SIZE * q);
++}
++
++static vm_offset_t
++vn_qmem(unsigned q)
++{
++	return vn.uc.kva + QT_SIZE + Q_SIZE * q;
++}
++
++static void
++vn_queues_init(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)vn.uc.kva;
++	for (unsigned q = 0; q < Q_NUM; q++) {
++		volatile struct vn_qhdr *h = vn_qhdr(q);
++		h->status = 1;
++		h->start_addr = vn.uc.iova + QT_SIZE + Q_SIZE * q;
++		h->type = Q_DFLT_TYPE | q;              /* HOST_TO_CTRL_CMD 0, CTRL_TO_HOST_MSG 1, DBG 2 */
++		h->q_size = Q_SIZE / 4;
++		h->pkt_size = 0;
++		h->pkt_drop_cnt = 0;
++		h->rx_wm = 1;
++		h->tx_wm = 1;
++		h->rx_req = q == Q_DBG ? 0 : 1;         /* no interrupt for debug messages */
++		h->tx_req = 0;
++		h->rx_irq_status = 0;
++		h->tx_irq_status = 0;
++		h->read_idx = 0;
++		h->write_idx = 0;
++	}
++	t[0] = 0;                                       /* version */
++	t[1] = QT_SIZE;
++	t[2] = QT_HDR;                                  /* qhdr0_offset */
++	t[3] = QH_SIZE;
++	t[4] = Q_NUM;
++	t[5] = Q_NUM;                                   /* num_active_q */
++	*(volatile uint32_t *)vn.sfr.kva = SFR_BYTES;   /* hfi_sfr.buf_size */
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* venus_write_queue + venus_iface_cmdq_write_nolock */
++static int
++vn_cmd(const void *pkt)
++{
++	volatile struct vn_qhdr *h = vn_qhdr(Q_CMD);
++	vm_offset_t mem = vn_qmem(Q_CMD);
++	uint32_t dwords = (*(const uint32_t *)pkt) >> 2;
++	uint32_t rd_idx = h->read_idx, wr_idx = h->write_idx, qsize = h->q_size;
++	__asm__ volatile ("dmb sy" ::: "memory");
++	uint32_t space = wr_idx >= rd_idx ? qsize - (wr_idx - rd_idx) : rd_idx - wr_idx;
++	if (dwords == 0 || dwords > PKT_MAX / 4 || wr_idx >= qsize) {
++		return EINVAL;
++	}
++	if (space <= dwords) {
++		h->tx_req = 1;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return ENOSPC;
++	}
++	h->tx_req = 0;
++	uint32_t new_wr = wr_idx + dwords;
++	if (new_wr < qsize) {
++		memcpy((void *)(mem + wr_idx * 4), pkt, dwords * 4);
++	} else {
++		new_wr -= qsize;
++		uint32_t first = (dwords - new_wr) * 4;
++		memcpy((void *)(mem + wr_idx * 4), pkt, first);
++		memcpy((void *)mem, (const uint8_t *)pkt + first, new_wr * 4);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	h->write_idx = new_wr;
++	bool rx_req = h->rx_req != 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (rx_req) {
++		wr(vn.venus, CPU_IC + IC_SOFTINT, IC_SOFTINT_H2A);
++	}
++	return 0;
++}
++
++/* venus_read_queue; 0 = a packet in vn_pkt, ENODATA = empty */
++static int
++vn_read(unsigned q)
++{
++	volatile struct vn_qhdr *h = vn_qhdr(q);
++	vm_offset_t mem = vn_qmem(q);
++	uint32_t rd_idx = h->read_idx, wr_idx = h->write_idx, qsize = h->q_size;
++	uint32_t want_rx = q == Q_MSG ? 1 : 0;
++	__asm__ volatile ("dmb sy" ::: "memory");
++	if (rd_idx == wr_idx) {
++		h->rx_req = want_rx;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return ENODATA;
++	}
++	if (rd_idx >= qsize) {
++		return EINVAL;
++	}
++	uint32_t dwords = *(volatile uint32_t *)(mem + rd_idx * 4) >> 2;
++	uint32_t new_rd = rd_idx + dwords;
++	int error = 0;
++	if (dwords != 0 && dwords * 4 <= PKT_MAX) {
++		if (new_rd < qsize) {
++			memcpy(vn_pkt, (const void *)(mem + rd_idx * 4), dwords * 4);
++		} else {
++			new_rd -= qsize;
++			uint32_t first = (dwords - new_rd) * 4;
++			memcpy(vn_pkt, (const void *)(mem + rd_idx * 4), first);
++			memcpy(vn_pkt + first, (const void *)mem, new_rd * 4);
++		}
++	} else {
++		new_rd = h->write_idx;          /* bad packet: drop everything */
++		error = EBADMSG;
++	}
++	__asm__ volatile ("dmb sy" ::: "memory");
++	h->read_idx = new_rd;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	h->rx_req = h->read_idx != h->write_idx ? 0 : want_rx;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return error;
++}
++
++static void
++vn_sfr_print(void)
++{
++	char s[160];
++	const uint8_t *d = (const uint8_t *)vn.sfr.kva + 4;
++	unsigned i;
++	for (i = 0; i < sizeof(s) - 1 && d[i]; i++) {
++		s[i] = (char)((d[i] >= 0x20 && d[i] < 0x7f) ? d[i] : '.');
++	}
++	s[i] = 0;
++	printf("SWEET VENUS: SFR: \"%s\"\n", s);
++}
++
++static void
++vn_handle_msg(void)
++{
++	const uint32_t *w = vn_pktw;
++	uint32_t size = w[0], type = w[1];
++	vn.msgs++;
++	switch (type) {
++	case HFI_MSG_SYS_INIT: {
++		uint32_t err = size >= 16 ? w[2] : ~0u, nprop = size >= 16 ? w[3] : 0;
++		vn.sys_init_error = err;
++		vn.sys_init_done = true;
++		printf("SWEET VENUS: SYS_INIT done: error %#x, %u properties, %u bytes\n", err, nprop, size);
++		/* the property list as dwords, enough to see codec masks and limits */
++		for (uint32_t o = 16; o + 4 <= size && o < 16 + 4 * 48; o += 4 * 8) {
++			printf("SWEET VENUS:  +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", o - 16,
++			    o + 4 <= size ? w[o / 4] : 0, o + 8 <= size ? w[o / 4 + 1] : 0, o + 12 <= size ? w[o / 4 + 2] : 0,
++			    o + 16 <= size ? w[o / 4 + 3] : 0, o + 20 <= size ? w[o / 4 + 4] : 0, o + 24 <= size ? w[o / 4 + 5] : 0,
++			    o + 28 <= size ? w[o / 4 + 6] : 0, o + 32 <= size ? w[o / 4 + 7] : 0);
++		}
++		for (uint32_t o = 16; o + 12 <= size; o += 4) {
++			if (w[o / 4] == HFI_PROP_CODEC_SUPPORTED) {
++				vn.dec_codecs = w[o / 4 + 1];
++				vn.enc_codecs = w[o / 4 + 2];
++				printf("SWEET VENUS: codecs: decode %#x encode %#x\n", vn.dec_codecs, vn.enc_codecs);
++				break;
++			}
++		}
++		for (uint32_t o = 16; o + 8 <= size; o += 4) {
++			if (w[o / 4] == HFI_PROP_MAX_SESSIONS) {
++				vn.max_sessions = w[o / 4 + 1];
++				break;
++			}
++		}
++		break;
++	}
++	case HFI_MSG_SYS_PROPERTY_INFO:
++		if (size >= 16 && w[3] == HFI_PROP_SYS_IMAGE_VERSION) {
++			const uint8_t *s = vn_pkt + 16;
++			unsigned i, n = MIN(size - 16, (uint32_t)sizeof(vn.fw_version) - 1);
++			for (i = 0; i < n; i++) {
++				vn.fw_version[i] = (char)((s[i] >= 0x20 && s[i] < 0x7f) ? s[i] : (s[i] ? '.' : ' '));
++			}
++			vn.fw_version[i] = 0;
++			printf("SWEET VENUS: firmware version \"%s\"\n", vn.fw_version);
++		} else {
++			printf("SWEET VENUS: property info %u bytes, property %#x\n", size, size >= 16 ? w[3] : 0);
++		}
++		break;
++	case HFI_MSG_EVENT_NOTIFY:
++		vn.events++;
++		vn.last_event = size >= 16 ? w[3] : 0;
++		printf("SWEET VENUS: event %#x data %#x %#x (session %#x)\n", vn.last_event, size >= 20 ? w[4] : 0,
++		    size >= 24 ? w[5] : 0, size >= 12 ? w[2] : 0);
++		if (vn.last_event == HFI_EVENT_SYS_ERROR) {
++			vn_sfr_print();
++		}
++		break;
++	case HFI_MSG_SYS_PING_ACK:
++		vn.pings++;
++		printf("SWEET VENUS: ping ack, cookie %#x\n", size >= 12 ? w[2] : 0);
++		break;
++	case HFI_MSG_SYS_IDLE:
++		printf("SWEET VENUS: firmware idle\n");
++		break;
++	default:
++		printf("SWEET VENUS: message %#x, %u bytes\n", type, size);
++		break;
++	}
++}
++
++static void
++vn_handle_dbg(void)
++{
++	const uint32_t *w = vn_pktw;
++	uint32_t size = w[0], type = w[1];
++	vn.dbgs++;
++	if (type == HFI_MSG_SYS_DEBUG && size > 24) {
++		char s[200];
++		const uint8_t *d = vn_pkt + 24;
++		unsigned i, n = MIN(size - 24, (uint32_t)sizeof(s) - 1);
++		for (i = 0; i < n && d[i]; i++) {
++			s[i] = (char)((d[i] >= 0x20 && d[i] < 0x7f) ? d[i] : ' ');
++		}
++		while (i > 0 && s[i - 1] == ' ') {
++			i--;
++		}
++		s[i] = 0;
++		printf("SWEET VENUS: fw: %s\n", s);
++	} else if (type != HFI_MSG_SYS_COV) {
++		printf("SWEET VENUS: debug packet %#x, %u bytes\n", type, size);
++	}
++}
++
++/* Drain both queues for up to ms milliseconds, or until done() says so. */
++static void
++vn_poll(unsigned ms, bool (*done)(void))
++{
++	bool unsynced = false;
++	for (unsigned t = 0; t <= ms; t++) {
++		bool any = false;
++		uint32_t st = rd(vn.venus, WRAPPER + WR_INTR_STATUS);
++		if (st) {
++			wr(vn.venus, CPU_CS + CS_A2HSOFTINTCLR, 1);
++			wr(vn.venus, WRAPPER + WR_INTR_CLEAR, st);
++		}
++		for (unsigned k = 0; k < 64; k++) {
++			int e = vn_read(Q_MSG);
++			if (e == ENODATA) {
++				break;
++			}
++			any = true;
++			if (e == 0) {
++				vn_handle_msg();
++			} else {
++				printf("SWEET VENUS: bad message packet (%d)\n", e);
++			}
++		}
++		for (unsigned k = 0; k < 64; k++) {
++			int e = vn_read(Q_DBG);
++			if (e == ENODATA) {
++				break;
++			}
++			any = true;
++			if (e == 0) {
++				vn_handle_dbg();
++			}
++		}
++		unsynced |= any;
++		if (unsynced && (t % 100 == 0 || (done && done()))) {
++			sweet_log_sync();
++			unsynced = false;
++		}
++		if (done && done()) {
++			return;
++		}
++		delay(1000);
++	}
++	if (unsynced) {
++		sweet_log_sync();
++	}
++}
++
++static bool
++vn_sys_init_seen(void)
++{
++	return vn.sys_init_done && vn.fw_version[0];
++}
++
++static int
++vn_hfi_up(void)
++{
++	int error = vn_buf_alloc(&vn.uc, UC_SIZE, 0x400000);
++	if (!error) {
++		error = vn_buf_alloc(&vn.sfr, SFR_BYTES, PAGE_SIZE);
++	}
++	if (error) {
++		printf("SWEET VENUS: HFI memory: errno %d\n", error);
++		return error;
++	}
++	printf("SWEET VENUS: UC region %#x (%u bytes), SFR %#x\n", vn.uc.iova, UC_SIZE, vn.sfr.iova);
++	vn_queues_init();
++
++	int32_t status = -1, result = -1;
++	(void)scm_call("BOOT SET_REMOTE_STATE resume", SCM_FN(1, 0x0a), 2, 1, 0, 0, 0, &status, &result);
++
++	/* venus_run */
++	wr(vn.venus, CPU_CS + CS_UC_ADDR, vn.uc.iova);
++	wr(vn.venus, CPU_CS + CS_UC_SIZE, UC_SIZE);
++	wr(vn.venus, CPU_CS + CS_ARG2, vn.uc.iova);
++	wr(vn.venus, CPU_CS + CS_ARG1, 1);
++	wr(vn.venus, CPU_CS + CS_SFR_ADDR, vn.sfr.iova);
++	/* venus_boot_core */
++	wr(vn.venus, WRAPPER + WR_INTR_MASK, WR_INTR_MASK_A2HVCODEC);
++	printf("SWEET VENUS: CTRL_INIT; arg0 %#x cpu status %#x\n", rd(vn.venus, CPU_CS + CS_ARG0),
++	    rd(vn.venus, WRAPPER + WR_CPU_STATUS));
++	sweet_log_sync();
++	wr(vn.venus, CPU_CS + CS_CTRL_INIT, 1);
++	unsigned t;
++	uint32_t st = 0;
++	for (t = 0; t < 2000; t++) {
++		st = rd(vn.venus, CPU_CS + CS_ARG0);
++		if (st) {
++			break;
++		}
++		delay(1000);
++	}
++	vn.init_status = st;
++	printf("SWEET VENUS: init status %#x after %u ms (cpu status %#x, intr status %#x)\n", st, t,
++	    rd(vn.venus, WRAPPER + WR_CPU_STATUS), rd(vn.venus, WRAPPER + WR_INTR_STATUS));
++	vn_smmu_report("after CTRL_INIT");
++	if (!st || (st & 0xfe) == 4) {
++		printf("SWEET VENUS: %s\n", st ? "firmware: invalid UC region setting" : "firmware did not answer CTRL_INIT");
++		vn_sfr_print();
++		return ETIMEDOUT;
++	}
++
++	/* venus_core_init: SYS_INIT, image version, default properties */
++	const uint32_t sys_init[3] = { 12, HFI_CMD_SYS_INIT, HFI_ARCH_OX };
++	const uint32_t version[4] = { 16, HFI_CMD_SYS_GET_PROPERTY, 1, HFI_PROP_SYS_IMAGE_VERSION };
++	const uint32_t debug[6] = { 24, HFI_CMD_SYS_SET_PROPERTY, 1, HFI_PROP_SYS_DEBUG_CONFIG, HFI_DEBUG_LEVELS,
++		                    HFI_DEBUG_MODE_QUEUE };
++	const uint32_t power[5] = { 20, HFI_CMD_SYS_SET_PROPERTY, 1, HFI_PROP_SYS_CODEC_POWER_PLANE, 0 };
++	error = vn_cmd(sys_init);
++	if (!error) {
++		error = vn_cmd(version);
++	}
++	if (!error) {
++		error = vn_cmd(debug);
++	}
++	if (!error) {
++		error = vn_cmd(power);
++	}
++	if (error) {
++		printf("SWEET VENUS: command queue write failed (%d)\n", error);
++		return error;
++	}
++	vn_poll(2000, vn_sys_init_seen);
++	vn_smmu_report("after SYS_INIT");
++	if (!vn.sys_init_done) {
++		printf("SWEET VENUS: no SYS_INIT done in 2 s (cmd rd %u wr %u, msg rd %u wr %u)\n", vn_qhdr(Q_CMD)->read_idx,
++		    vn_qhdr(Q_CMD)->write_idx, vn_qhdr(Q_MSG)->read_idx, vn_qhdr(Q_MSG)->write_idx);
++		vn_sfr_print();
++		return ETIMEDOUT;
++	}
++	vn.hfi_up = vn.sys_init_error == 0;
++	return vn.hfi_up ? 0 : EIO;
++}
++
++/* ------------------------------------------------------------------ */
++/* control                                                             */
++/* ------------------------------------------------------------------ */
++
++static void
++vn_bring_up(void)
++{
++	int error;
++
++	if (vn.step != 0) {
++		printf("SWEET VENUS: bring-up already ran (step %u, %s); reboot to retry\n", vn.step,
++		    vn.error ? vn.where : "ok");
++		return;
++	}
++	if (!sweet_board_beryllium()) {
++		vn_fail("board", ENODEV);
++		return;
++	}
++	printf("SWEET VENUS: bring-up\n");
++	error = vn_power_on();
++	if (error) {
++		vn_fail("power", error);
++		return;
++	}
++	vn.step = 1;
++	error = vn_smmu();
++	if (error) {
++		vn_fail("smmu", error);
++		return;
++	}
++	vn.step = 2;
++	error = vn_fw_boot();
++	if (error) {
++		vn_fail("firmware", error);
++		return;
++	}
++	vn.step = 3;
++	error = vn_hfi_up();
++	if (error) {
++		vn_fail("hfi", error);
++		return;
++	}
++	vn.step = 4;
++	printf("SWEET VENUS: HFI up: firmware \"%s\", decode %#x encode %#x, max sessions %u\n", vn.fw_version,
++	    vn.dec_codecs, vn.enc_codecs, vn.max_sessions);
++	sweet_log_sync();
++}
++
++static int
++sweet_venus_ctl_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = (int)vn.step;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (__atomic_exchange_n(&vn.busy, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	switch (value) {
++	case 1:
++		vn_bring_up();
++		break;
++	case 2:
++		if (vn.step >= 3) {
++			vn_poll(100, NULL);
++			vn_smmu_report("poll");
++		}
++		break;
++	case 3:
++		if (vn.step >= 4) {
++			const uint32_t ping[3] = { 12, HFI_CMD_SYS_PING, 0xbe11 + vn.pings };
++			error = vn_cmd(ping);
++			vn_poll(500, NULL);
++		} else {
++			error = ENXIO;
++		}
++		break;
++	default:
++		error = EINVAL;
++		break;
++	}
++	__atomic_store_n(&vn.busy, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_venus_ctl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_venus_ctl_sysctl,
++    "I", "Venus: 1 bring-up (power, firmware, HFI), 2 poll the queues, 3 ping");
++
++static int
++sweet_venus_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[512];
++	uint32_t cs = vn.powered ? rd(vn.venus, CPU_CS + CS_ARG0) : 0;
++	snprintf(buf, sizeof(buf),
++	    "step=%u error=%d where=%s powered=%u fw=%u hfi=%u hw=%#x init_status=%#x arg0=%#x sys_init=%u/%#x "
++	    "dec=%#x enc=%#x max_sessions=%u msgs=%u dbgs=%u events=%u last_event=%#x pings=%u uc=%#x fw_version=%s",
++	    vn.step, vn.error, vn.where[0] ? vn.where : "-", vn.powered, vn.fw_running, vn.hfi_up, vn.hw_version,
++	    vn.init_status, cs, vn.sys_init_done, vn.sys_init_error, vn.dec_codecs, vn.enc_codecs, vn.max_sessions, vn.msgs,
++	    vn.dbgs, vn.events, vn.last_event, vn.pings, vn.uc.iova, vn.fw_version[0] ? vn.fw_version : "-");
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_venus, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_venus_sysctl, "A",
++    "Venus video codec state (bsd/dev/sweet_venus.c)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
