@@ -1,0 +1,133 @@
+diff --git a/bsd/dev/sweet_venus.c b/bsd/dev/sweet_venus.c
+index 2e90484..135bee1 100644
+--- a/bsd/dev/sweet_venus.c
++++ b/bsd/dev/sweet_venus.c
+@@ -54,6 +54,7 @@ extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void sweet_log_sync(void);               /* sweet_ufs.c */
++extern kern_return_t thread_terminate(thread_t); /* not in the BSD view of kern/thread.h */
+ extern vnode_t rootvnode;
+ extern int sweet_rpmh_bcm_vote(const char *res, uint64_t ab_kbps, uint64_t ib_kbps, unsigned buswidth);
+ extern int sweet_rpmh_arc_vote(const char *res, bool max);
+@@ -1796,7 +1797,7 @@ static void vs_close(struct vn_sess *s);
+ 
+ /* Up to START; the output side waits for the stream (vs_capture_setup). */
+ static int
+-vs_open(struct vn_sess **out, uint32_t codec, uint32_t width, uint32_t height)
++vs_open(struct vn_sess **out, uint32_t codec, uint32_t width, uint32_t height, bool decode_order)
+ {
+ 	struct vn_sess *s = NULL;
+ 	if (vn.step < 4) {
+@@ -1831,6 +1832,10 @@ vs_open(struct vn_sess **out, uint32_t codec, uint32_t width, uint32_t height)
+ 	}
+ 	e = vs_prop(s, HFI_PROP_FRAME_SIZE, HFI_BUF_INPUT, width, height, 3);
+ 	e = e ? e : vs_prop(s, HFI_PROP_VIDEOCORES_USAGE, 1, 0, 0, 1);
++	if (!e && decode_order) {
++		/* vdec_set_properties' display_delay 0: every picture comes back as soon as it is decoded, unreordered */
++		e = vs_prop(s, 0x1203005u /* VDEC_OUTPUT_ORDER */, 0x1000002u /* DECODE */, 0, 0, 1);
++	}
+ 	e = e ? e : vs_output_conf(s);
+ 	if (!e) {
+ 		const uint32_t *ri = vs_bufreq(s, HFI_BUF_INPUT);
+@@ -2200,7 +2205,7 @@ vn_test_decode(void)
+ 		printf("SWEET VENUS: test: %s, %lld bytes, %u access units\n", VT_FILE, (long long)size, nau);
+ 		uint64_t t0 = mach_absolute_time();
+ 		vt_frames = 0;
+-		e = vs_open(&s, HFI_CODEC_H264, 1280, 720);
++		e = vs_open(&s, HFI_CODEC_H264, 1280, 720, false);
+ 		for (unsigned i = 0; !e && i < nau; i++) {
+ 			e = vs_decode(s, data + off[i], alen[i], (uint64_t)i * 33333, false);
+ 			vn_poll(0, NULL, NULL);
+@@ -2251,7 +2256,7 @@ static void vn_bring_up(void);
+ void sweet_venus_lock(void);
+ void sweet_venus_unlock(void);
+ int sweet_venus_up(void);
+-int sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, void **sess);
++int sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, uint32_t flags, void **sess);
+ int sweet_venus_decode(void *sess, int (*fill)(void *ctx, void *dst, uint32_t len), void *ctx, uint32_t len, uint64_t ts,
+     uint32_t flags);
+ int sweet_venus_take(void *sess, struct sweet_venus_frame *f);
+@@ -2284,7 +2289,7 @@ sweet_venus_up(void)
+ }
+ 
+ int
+-sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, void **sess)
++sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, uint32_t flags, void **sess)
+ {
+ 	uint32_t codec;
+ 	switch (fourcc) {
+@@ -2298,7 +2303,7 @@ sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, void **sess)
+ 		return EINVAL;          /* hfi_platform_v4.c: 96..4096 each way */
+ 	}
+ 	struct vn_sess *s = NULL;
+-	int e = vs_open(&s, codec, width, height);
++	int e = vs_open(&s, codec, width, height, (flags & 1u) != 0);       /* SWEET_VENUS_OPEN_DECODE_ORDER */
+ 	if (!e) {
+ 		*sess = s;
+ 	}
+@@ -2359,7 +2364,7 @@ vn_publish_thread(void *arg, wait_result_t wr)
+ #pragma unused(arg, wr)
+ 	delay(15 * 1000 * 1000);
+ 	SweetVenusPublish();
+-	thread_terminate(current_thread());
++	(void)thread_terminate(current_thread());
+ }
+ 
+ void
+@@ -2371,7 +2376,7 @@ sweet_venus_init(void)
+ 		return;
+ 	}
+ 	thread_t t;
+-	if (kernel_thread_start(vn_publish_thread, NULL, &t) == KERN_SUCCESS) {
++	if (kernel_thread_start((thread_continue_t)vn_publish_thread, NULL, &t) == KERN_SUCCESS) {
+ 		thread_deallocate(t);
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/SweetVenus.cpp b/iokit/Kernel/arm/SweetVenus.cpp
+index 4461247..735cb92 100644
+--- a/iokit/Kernel/arm/SweetVenus.cpp
++++ b/iokit/Kernel/arm/SweetVenus.cpp
+@@ -33,7 +33,7 @@ extern "C" {
+ void sweet_venus_lock(void);
+ void sweet_venus_unlock(void);
+ int sweet_venus_up(void);
+-int sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, void **sess);
++int sweet_venus_open(uint32_t fourcc, uint32_t width, uint32_t height, uint32_t flags, void **sess);
+ int sweet_venus_decode(void *sess, int (*fill)(void *ctx, void *dst, uint32_t len), void *ctx, uint32_t len, uint64_t ts,
+     uint32_t flags);
+ int sweet_venus_take(void *sess, struct sweet_venus_frame *f);
+@@ -254,7 +254,8 @@ SweetVenusUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 			e = sweet_venus_up();
+ 			if (!e) {
+ 				e = sweet_venus_open((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1],
+-				    (uint32_t)args->scalarInput[2], &fSess);
++				    (uint32_t)args->scalarInput[2], args->scalarInputCount >= 4 ? (uint32_t)args->scalarInput[3] : 0,
++				    &fSess);
+ 			}
+ 		}
+ 		sweet_venus_unlock();
+diff --git a/iokit/Kernel/arm/SweetVenusABI.h b/iokit/Kernel/arm/SweetVenusABI.h
+index 65b59c7..9e7c2a4 100644
+--- a/iokit/Kernel/arm/SweetVenusABI.h
++++ b/iokit/Kernel/arm/SweetVenusABI.h
+@@ -1,8 +1,9 @@
+ /*
+  * SweetVenus user-client ABI (iokit/Kernel/arm/SweetVenus.cpp, bsd/dev/sweet_venus.c), shared with the
+- * VideoToolbox decoder plug-in (apps/venus-vt). Version 1.
++ * VideoToolbox decoder plug-in (video/venus-vt in the Bergamota repo). Version 1.
+  *
+- *   OPEN     scalars in: codec FourCC ('avc1'), coded width, height. Powers Venus on first use.
++ *   OPEN     scalars in: codec FourCC ('avc1'), coded width, height[, flags (SWEET_VENUS_OPEN_DECODE_ORDER: pictures
++ *            come back unreordered, as soon as they are decoded; xnu 1154+)]. Powers Venus on first use.
+  *   DECODE   scalars in: timestamp (returned with the picture), flags (SWEET_VENUS_FLAG_EOS: end of stream,
+  *            no data); struct input: one access unit in Annex-B form (start codes), inline or out of line.
+  *   TAKE     scalar in: timeout in ms (at most 2000). 13 scalars out, in sweet_venus_frame order below;
+@@ -31,6 +32,7 @@ enum {
+ };
+ 
+ #define SWEET_VENUS_FLAG_EOS            0x1u
++#define SWEET_VENUS_OPEN_DECODE_ORDER   0x1u
+ #define SWEET_VENUS_MEM_OUTPUT          0x100u
+ #define SWEET_VENUS_OUTPUTS_MAX         32u
+ #define SWEET_VENUS_FRAME_SCALARS       13u
