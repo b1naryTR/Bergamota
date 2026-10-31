@@ -1,0 +1,143 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 04b32b1..474fec1 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -868,6 +868,9 @@ gpu_power_cx(void)
+ #define CBA2R_RW64_64BIT        1u
+ #define CBAR_S1_BYPASS_S2       ((1u << 16) | (3u << 8) | (0xfu << 12))
+ #define TTBCR_CB                ((2u << 12) | (0u << 10) | (0u << 8) | (0u << 14) | (1u << 23) | 32u)
++/* 1163: the CP's context bank takes 36-bit input addresses (T0SZ 28: 64 first-level entries of 1 GiB) for the bigger client
++ * window below; the GMU's keeps 32 bits. Under 4 GiB both walk the same tables as before. */
++#define TTBCR_CB_CP             ((TTBCR_CB & ~0x3fu) | 28u)
+ #define TTBCR2_CB               (1u | (7u << 15) | (1u << 4))
+ #define MAIR0_CB                0x0004ff44u     /* 0 NC, 1 WBRWA, 2 device */
+ #define ACTLR_QCOM              ((1u << 28) | (1u << 29) | (1u << 30))
+@@ -1039,7 +1042,7 @@ smmu_context_bank(unsigned cb, unsigned asid, uint64_t l1_pa)
+ 	gpu_wr(smmu, SMMU_GR1 + SMMU_CBA2R(cb), CBA2R_RW64_64BIT);
+ 	gpu_wr(smmu, SMMU_GR1 + SMMU_CBAR(cb), CBAR_S1_BYPASS_S2);
+ 	gpu_wr(b, SMMU_CB_TTBCR2, TTBCR2_CB);
+-	gpu_wr(b, SMMU_CB_TCR, TTBCR_CB);
++	gpu_wr(b, SMMU_CB_TCR, cb == CP_CB ? TTBCR_CB_CP : TTBCR_CB);
+ 	{
+ 		uintptr_t p = (uintptr_t)b + SMMU_CB_TTBR0;    /* 0236: fixed addressing mode, as gpu_wr */
+ 		__asm__ volatile ("dmb oshst\n\tstr %0, [%1]\n\tdsb osh" :: "r"(ttbr), "r"(p) : "memory");
+@@ -2491,14 +2494,21 @@ gpu_cp_fill_test(void)
+  * what Linux msm exposes to Mesa freedreno (msm_gem_get_iova, MSM_INFO_GET_IOVA);
+  * the code is ours.
+  *
+- * Client buffers live in the GPU address space [GVM_BASE, 4 GiB) of context
++ * Client buffers live in the GPU address space [GVM_BASE, GVM_END) of context
+  * bank 1 (the same one the CP uses for ring/SQE/scratch at 0x40000000, which
+  * stays out of the allocatable range): 4 KiB pages, tables taken on demand
+  * from a pool of normal-non-cacheable pages (ptp) so the SMMU walker sees what
+- * the CPU wrote. The static L1 table of gpu_cp_memory gets entries 2 and 3.
++ * the CPU wrote. The static L1 table of gpu_cp_memory gets entries 2 to 9.
++ *
++ * 1163: 8 GiB instead of 2. Every process shares this one window (Turnip takes
++ * the kernel's addresses), and with Safari, WebKit's GPU process, the wallpaper
++ * and CoreAnimation's per-frame offscreen targets (memoryless RGBA16F attachments
++ * get real memory here) it filled: "no GPU address space for 14467072 bytes",
++ * then CoreAnimation took the missing texture and backboardd died (SIGSEGV at 0),
++ * twice in 10 min (2026-10-31). The A630 and its UCHE ranges take 49-bit addresses.
+  */
+ #define GVM_BASE                0x80000000ull
+-#define GVM_END                 0x100000000ull
++#define GVM_END                 0x280000000ull
+ #define GVM_GUARD               0x1000ull       /* unmapped page after every kernel-placed buffer */
+ #define GVM_MAXFREE             4096            /* 0237: was 512; a full list drops freed ranges (address space lost) */
+ #define PTP_TABLE               0x1000ull       /* a GPU table is 4 KiB; xnu's PAGE_SIZE is 16 KiB: never use PAGE_SIZE for GPU pages */
+@@ -2508,8 +2518,9 @@ gpu_cp_fill_test(void)
+  * touched) ran out a while into every boot: small buffers still fitted in regions that had tables, while every
+  * full-screen render target (10-24 MB) needed fresh ones and GEM_NEW failed (Control Center without its backdrop,
+  * a flat wallpaper). 2 L2 + 1024 L3 cover 0x80000000-0x100000000; 1028 keeps the pool a whole number of 16 KiB pages.
++ * 1163: 8 L2 + 4096 L3 cover the 8 GiB window; 4108 = 16 MiB + 48 KiB, contiguous, taken once at GPU bring-up.
+  */
+-#define PTP_PAGES               1028            /* 4 MiB of tables: 2 L2 + 1024 L3 (2 MiB each) + 2 spare */
++#define PTP_PAGES               4108            /* 8 L2 + 4096 L3 (2 MiB each) + 4 spare */
+ 
+ static struct {
+ 	bool     ready;         /* GPU up and the interface usable */
+@@ -2579,7 +2590,7 @@ gvm_slot(uint64_t iova, bool create)
+ {
+ 	volatile uint64_t *l1 = (volatile uint64_t *)(cp_memory + CP_L1), *tab;
+ 	uint64_t e, pa;
+-	unsigned i1 = (unsigned)(iova >> 30) & 3, i2 = (unsigned)(iova >> 21) & 0x1ff, i3 = (unsigned)(iova >> 12) & 0x1ff;
++	unsigned i1 = (unsigned)(iova >> 30) & 63, i2 = (unsigned)(iova >> 21) & 0x1ff, i3 = (unsigned)(iova >> 12) & 0x1ff;
+ 
+ 	if (iova < GVM_BASE || iova >= GVM_END) {
+ 		return NULL;
+@@ -2643,6 +2654,23 @@ sweet_gpu_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken)
+ 	return false;
+ }
+ 
++/* 1163: free client address space, its largest range and the number of free ranges (lock held, or for a report). */
++void sweet_gpu_iova_stats(uint64_t *free_bytes, uint64_t *largest, unsigned *ranges);
++void
++sweet_gpu_iova_stats(uint64_t *free_bytes, uint64_t *largest, unsigned *ranges)
++{
++	uint64_t f = 0, l = 0;
++	unsigned n = MIN(gvm_nfree, (unsigned)GVM_MAXFREE);
++
++	for (unsigned i = 0; i < n; i++) {
++		f += gvm_free[i].size;
++		l = MAX(l, gvm_free[i].size);
++	}
++	*free_bytes = f;
++	*largest = l;
++	*ranges = n;
++}
++
+ /* Take exactly [iova, iova+size) out of the free list (MSM_INFO_SET_IOVA). */
+ bool
+ sweet_gpu_iova_reserve(uint64_t iova, uint64_t size)
+@@ -3816,6 +3844,10 @@ sweet_gpu_sysctl SYSCTL_HANDLER_ARGS
+ 
+ 	pids[0] = 0;
+ 	SweetAdrenoClients(pids, sizeof(pids), &clients);
++	uint64_t gvm_free_b = 0, gvm_largest_b = 0;
++	unsigned gvm_ranges = 0;
++	sweet_gpu_iova_stats(&gvm_free_b, &gvm_largest_b, &gvm_ranges);
++	(void)gvm_ranges;
+ 	if (a630_dev.ready) {
+ 		now_in = 0;
+ 	}
+@@ -3824,11 +3856,12 @@ sweet_gpu_sysctl SYSCTL_HANDLER_ARGS
+ 	}
+ 	n = snprintf(buf, sizeof(buf),
+ 	    "state=%s level=%u mhz=%u max_level=%u freq=%s busy_pct=%llu clients=%u pids=%s submitted=%u completed=%u "
+-	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u dcvs_sets=%u dcvs_errors=%u input_level=%u input_ms=%u input_boosts=%u input_boosted=%u input_votes=%u gvm_tables=%u/%u gvm_free_ranges=%u total_ms=%llu res_ms=",
++	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u dcvs_sets=%u dcvs_errors=%u input_level=%u input_ms=%u input_boosts=%u input_boosted=%u input_votes=%u gvm_tables=%u/%u gvm_free_ranges=%u gvm_free_mb=%llu gvm_largest_mb=%llu gvm_mb=%llu total_ms=%llu res_ms=",
+ 	    state, lvl, lvl ? gpu_levels[lvl].mhz : 0, a630_level_max, a630_gov ? "gov" : "fixed", gov_busy_pct, clients, pids,
+ 	    a630_dev.seqno, a630_dev.ready && cp_memory ? *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) : 0,
+ 	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, a630_boost_level, (unsigned)(a630_boost_level && mach_absolute_time() < gov_boost_until), gov_rate, a630_level_sets, a630_dcvs_errors,
+-	    a630_input_level, a630_input_ms, a630_input_events, (unsigned)(a630_input_level && mach_absolute_time() < a630_input_until), a630_input_votes, ptp_used, (unsigned)PTP_PAGES, gvm_nfree, tot / NSEC_PER_MSEC);
++	    a630_input_level, a630_input_ms, a630_input_events, (unsigned)(a630_input_level && mach_absolute_time() < a630_input_until), a630_input_votes, ptp_used, (unsigned)PTP_PAGES, gvm_nfree,
++	    gvm_free_b >> 20, gvm_largest_b >> 20, (GVM_END - GVM_BASE) >> 20, tot / NSEC_PER_MSEC);
+ 	(void)now_in;
+ 	for (unsigned i = 0; i < 8 && n > 0 && (size_t)n < sizeof(buf); i++) {
+ 		if (i) {
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index 2fc64a8..eb80963 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -43,6 +43,7 @@ extern "C" {
+ bool sweet_gpu_ready(void);
+ bool sweet_gpu_param(uint32_t which, uint64_t *value);
+ bool sweet_gpu_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken);
++void sweet_gpu_iova_stats(uint64_t *free_bytes, uint64_t *largest, unsigned *ranges);
+ bool sweet_gpu_iova_reserve(uint64_t iova, uint64_t size);
+ void sweet_gpu_iova_free(uint64_t iova, uint64_t size);
+ bool sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly);
+@@ -499,7 +500,11 @@ SweetAdrenoUserClient::mapGem(struct sweet_gem *slot, uint32_t flags, uint32_t *
+ 		iova = setIova;
+ 		taken = size;
+ 	} else if (!sweet_gpu_iova_alloc(size + tail, &iova, &taken)) {
+-		IOLog("SWEET GPU: no GPU address space for %llu bytes\n", size);
++		uint64_t freeb = 0, largest = 0;
++		unsigned ranges = 0;
++		sweet_gpu_iova_stats(&freeb, &largest, &ranges);   /* 1163: full, or fragmented? */
++		IOLog("SWEET GPU: no GPU address space for %llu bytes (free %llu MiB in %u ranges, largest %llu KiB)\n",
++		    size, freeb >> 20, ranges, largest >> 10);
+ 		return kIOReturnNoSpace;
+ 	}
+ 	bool ok = true;
