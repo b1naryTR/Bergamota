@@ -1,0 +1,41 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+index 227678c..14e9fe2 100644
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -402,7 +402,7 @@ retry_copy:
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	{
+ 		/*
+-		 * boot-arg sweetdenypath=SUFFIX: any lookup of a path ending in SUFFIX fails with ENOENT. Recovery tool: a
++		 * boot-arg sweetdenypath=SUFFIX[:SUFFIX...]: any lookup of a path ending in a SUFFIX fails with ENOENT. Recovery tool: a
+ 		 * debug dylib weakly linked into a system daemon that crash-loops before SSH is up can be switched off
+ 		 * from the boot image without touching the root filesystem.
+ 		 */
+@@ -412,10 +412,23 @@ retry_copy:
+ 			deny_state = PE_parse_boot_argn("sweetdenypath", deny, sizeof(deny)) && deny[0] ? 2 : 1;
+ 		}
+ 		if (deny_state == 2) {
+-			size_t pl = strnlen(cnp->cn_pnbuf, cnp->cn_pnlen), dl = strlen(deny);
+-			if (pl >= dl && strcmp(cnp->cn_pnbuf + pl - dl, deny) == 0) {
+-				error = ENOENT;
+-				goto error_out;
++			/*
++			 * 1164: SUFFIX[:SUFFIX...]. One suffix could not switch the GPU inject off everywhere: backboardd loads
++			 * /usr/local/lib/bgmtl/bgmtl-inject.dylib, SpringBoard the symlink /usr/local/bgi.dylib (only the
++			 * path as given is checked, not a symlink's target), and both crash-looping reboot the phone.
++			 */
++			size_t pl = strnlen(cnp->cn_pnbuf, cnp->cn_pnlen), i = 0;
++			while (deny[i]) {
++				size_t j = i;
++				while (deny[j] && deny[j] != ':') {
++					j++;
++				}
++				size_t dl = j - i;
++				if (dl && pl >= dl && memcmp(cnp->cn_pnbuf + pl - dl, deny + i, dl) == 0) {
++					error = ENOENT;
++					goto error_out;
++				}
++				i = deny[j] ? j + 1 : j;
+ 			}
+ 		}
+ 	}
