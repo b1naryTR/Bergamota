@@ -1,0 +1,93 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index cf37fa4..04b32b1 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -3609,6 +3609,11 @@ gpu_hfi_start_dcvs(bool gx_on)
+ 
+ static uint64_t gov_win_ns, gov_win_busy_ns, gov_busy_pct, res_ns[8];
+ static unsigned gov_low_windows, gov_prev_submits, gov_rate;
++static uint64_t gov_frames[3];                  /* 1162: starts of the last three frames (submission clusters), newest first */
++static uint64_t gov_last_sub;                   /* 1162: the last PM tick that saw a new submission */
++static uint32_t gov_tick_subs;                  /* 1162: a630_dev.submissions at that tick */
++static uint32_t a630_early = 1;                 /* sweetgpuearly=0: the interactive boost only at a window's end (before 1162) */
++static uint32_t a630_early_boosts;              /* 1162: boosts started by gpu_gov_early() */
+ 
+ /*
+  * Input boost (patch 0217). sweet_gpu_input_boost() is called by the touch thread (through sweet_input_boost(), at most
+@@ -3692,9 +3697,53 @@ gpu_busy_collect(void)
+  * drawing frames) raises the floor to the boost level for 400 ms after the last such window; the load-based part
+  * (>= 80% up one level, >= 90% two, >= 95% to the cap; < 30% twice in a row one down) never goes below the floor.
+  */
++/*
++ * 1162: the first frames of an animation. The window decides every 100 ms, so an animation that starts after a quiet
++ * spell ran its first ~6 frames at the level the quiet spell left (257 MHz held 94 % of the time, 2026-10-31). Every PM
++ * tick (4 ms) looks for new submissions; one more than 10 ms after the previous one starts a frame (closer ones are more
++ * command buffers of the same frame: backboardd's and an app's). Three frames within 70 ms (30 fps or more) start the
++ * interactive boost at once, as a busy window would at its end. sweetgpuearly=0 turns it off.
++ */
++static void
++gpu_gov_early(uint64_t now)
++{
++	uint32_t subs = a630_dev.submissions;
++	uint64_t gap = UINT64_MAX, span, hold;
++
++	if (subs == gov_tick_subs) {
++		return;
++	}
++	gov_tick_subs = subs;
++	if (gov_last_sub) {
++		absolutetime_to_nanoseconds(now - gov_last_sub, &gap);
++	}
++	gov_last_sub = now;
++	if (gap < 10 * NSEC_PER_MSEC) {
++		return;
++	}
++	gov_frames[2] = gov_frames[1];
++	gov_frames[1] = gov_frames[0];
++	gov_frames[0] = now;
++	if (!a630_gov || !a630_boost_level || !a630_early || !gov_frames[2]) {
++		return;
++	}
++	absolutetime_to_nanoseconds(now - gov_frames[2], &span);
++	if (span > 70 * NSEC_PER_MSEC) {
++		return;
++	}
++	nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &hold);
++	bool fresh = now >= gov_boost_until;
++	gov_boost_until = now + hold;
++	unsigned lvl = MIN(a630_boost_level, a630_level_max);
++	if (a630_level < lvl && gpu_set_level(lvl) && fresh) {
++		a630_early_boosts++;
++	}
++}
++
+ static void
+ gpu_gov_tick(uint64_t dt)
+ {
++	gpu_gov_early(mach_absolute_time());
+ 	if (!sweet_gpu_fence_done(a630_dev.seqno)) {
+ 		gov_win_busy_ns += dt;
+ 	}
+@@ -3847,10 +3896,10 @@ a630_pm_thread(void *arg, wait_result_t wr)
+ 				tot += res_ns[i];
+ 			}
+ 			summary = now;
+-			printf("SWEET GPU: pm: %s level %u busy %llu%% (%u submits/100ms) | time in level (%%): slumber %llu, 257 %llu, 342 %llu, 414 %llu, 520 %llu, 596 %llu, 675 %llu, 710 %llu | suspends %u resumes %u recoveries %u submits %u faults continued %u\n",
++			printf("SWEET GPU: pm: %s level %u busy %llu%% (%u submits/100ms) | time in level (%%): slumber %llu, 257 %llu, 342 %llu, 414 %llu, 520 %llu, 596 %llu, 675 %llu, 710 %llu | suspends %u resumes %u recoveries %u submits %u faults continued %u early boosts %u\n",
+ 			    a630_awake ? "on" : "slumber", a630_level, gov_busy_pct, gov_rate, res_ns[0] * 100 / tot, res_ns[1] * 100 / tot, res_ns[2] * 100 / tot,
+ 			    res_ns[3] * 100 / tot, res_ns[4] * 100 / tot, res_ns[5] * 100 / tot, res_ns[6] * 100 / tot, res_ns[7] * 100 / tot,
+-			    a630_suspends, a630_resumes, a630_recoveries, a630_dev.submissions, a630_faults_continued);
++			    a630_suspends, a630_resumes, a630_recoveries, a630_dev.submissions, a630_faults_continued, a630_early_boosts);
+ 		}
+ 		if (a630_hb_s && gcc && ns_since(hb) >= (uint64_t)a630_hb_s * NSEC_PER_SEC) {
+ 			hb = now;
+@@ -4070,6 +4119,9 @@ sweet_a630_probe(void)
+ 		if (PE_parse_boot_argn("sweetgpuboost", &v, sizeof(v)) && v >= 0) {
+ 			a630_boost_level = (uint32_t)MIN(v, 7);
+ 		}
++		if (PE_parse_boot_argn("sweetgpuearly", &v, sizeof(v)) && v >= 0) {
++			a630_early = v != 0;
++		}
+ 		if (PE_parse_boot_argn("sweetgpuinput", &v, sizeof(v)) && v >= 0) {
+ 			a630_input_level = (uint32_t)MIN(v, 7);
+ 		}
