@@ -216,6 +216,29 @@ jobs:
           sudo mkdir -p "$K" && sudo tar xzf kdk-subset.tgz -C "$K"
           ls "$K" "$K/System/Library"
 
+      # On a cache miss build.sh downloads the KDK from the release's github.com/.../releases/download URL, which answered
+      # 504 for every release asset on 2026-11-08 (runs 42467936285, 42468243969) while the API's asset URL worked: fetch
+      # the same dmg through the API and install it at build.sh's KDKROOT, so build.sh finds it and skips its own download.
+      - name: Download the KDK through the API (cache miss)
+        if: steps.kdkcache.outcome == 'success' && steps.kdkcache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          N=$(grep -A4 "'${MACOS_VERSION}')" dxb/build.sh | sed -n "s/.*KDK_NAME='\([^']*\)'.*/\1/p" | head -1)
+          K=$(grep -A4 "'${MACOS_VERSION}')" dxb/build.sh | sed -n "s/.*KDKROOT='\([^']*\)'.*/\1/p" | head -1)
+          [ -n "$N" ] && [ -n "$K" ] || { echo "no KDK for ${MACOS_VERSION} in build.sh"; exit 1; }
+          [ -d "$K" ] && { echo "$K exists"; exit 0; }
+          B="${N##* build }"
+          A=$(gh api "repos/dortania/KdkSupportPkg/releases/tags/$B" -q '.assets[] | select(.name|endswith(".dmg")) | .url')
+          [ -n "$A" ] || { echo "no dmg in dortania/KdkSupportPkg release $B"; exit 1; }
+          curl -fL --retry 3 --max-time 900 -H "Accept: application/octet-stream" -H "Authorization: Bearer $GH_TOKEN" -o /tmp/KDK.dmg "$A"
+          hdiutil attach /tmp/KDK.dmg
+          sudo mkdir -p /Library/Developer/KDKs && sudo chmod 755 /Library/Developer/KDKs
+          sudo installer -pkg '/Volumes/Kernel Debug Kit/KernelDebugKit.pkg' -target /
+          hdiutil detach '/Volumes/Kernel Debug Kit'
+          rm -f /tmp/KDK.dmg
+          ls -lah /Library/Developer/KDKs
+
       - name: Build
         id: build
         working-directory: dxb
