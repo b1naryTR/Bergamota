@@ -1,0 +1,1647 @@
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 1f99ae8a3008138e653f0b953b8dfe137616faaf..c28ca048d83bc89969de74ceb0cef255971dd703 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -13,6 +13,17 @@
+  *                             0x07400000 (the DT's camera "io" region) in an SMMU context of the IFE stream IDs
+  *   fill BYTE / save PATH [N] fill the buffer (a write test), or write its first N bytes (all) to a file
+  *   publish                   register the AppleH16CamIn service CMCapture probes for (SweetCamera.cpp)
++ *   stream N | stop           step C3 (1167) without a client: N kernel frame slots, sensor 0 streaming into them
++ *   stream exp LINES AGAIN [DGAIN] / stream pattern P / stream save PATH: exposure, test pattern, the newest frame
++ *
++ * Step C3 (1167): continuous capture. Sensor 0 (IMX363, 1920x1080 RAW10 at 30 fps) -> CSIPHY0 -> CSID0 RDI0 -> IFE0
++ * write master 0 -> a ring of frame slots: the H16ISP plug-in's IOSurfaces (AppleH16CamInUserClient, SweetCamera.cpp,
++ * SweetCameraABI.h), mapped page by page into the IFE's SMMU context at CAM_SLOT_IOVA(i). The bring-up is
++ * tools/camera/camclk.sh + camcap.sh sensor + camregs.sh of the Bergamota repo moved into the kernel. The write
++ * master's image address register is a queue (measured: each written address takes one frame, at least three can
++ * wait, a write needs no REG_UPDATE once the master runs, and the master stops when the queue is empty), so a poll
++ * thread (2 ms) keeps two slots queued and pushes the next one at each buf-done. Each finished frame gets a sparse
++ * statistics sample (zone means, histogram) for the plug-in's exposure and white balance.
+  *
+  * Board (downstream device tree, dtb/beryllium): four qcom,cam-sensor nodes on qcom,cci@ac4a000 (CCI masters 0/1, pins
+  * 17/18 and 19/20, function cci_i2c, pull-up), each with a 24 MHz MCLK (pins 13-16, function cam_mclk), a reset pin, a
+@@ -37,8 +48,13 @@
+ #include <vm/vm_kern.h>
+ #include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
+ #include "sweet_board.h"
+ #include "sweet_spmi.h"
++#include "../../iokit/Kernel/arm/SweetCameraABI.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_log_sync(void);               /* sweet_ufs.c */
+@@ -49,6 +65,8 @@ struct sweet_smmu_pt;
+ extern int sweet_smmu_pt_create(const unsigned *sids, unsigned nsid, struct sweet_smmu_pt **out);
+ extern int sweet_smmu_pt_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t pa, uint32_t len);
+ extern uint32_t sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uint32_t *fsynr0);
++extern void sweet_smmu_pt_unmap(struct sweet_smmu_pt *pt, uint32_t iova, uint32_t len);
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, int, thread_t *);
+ 
+ /* ---- addresses (live DT) ---- */
+ #define GCC_PA          0x00100000u
+@@ -623,16 +641,11 @@ cam_buf_alloc(unsigned mb)
+ 	return 0;
+ }
+ 
++/* len bytes at va (memory the IFE wrote: stale lines are dropped first) to a file */
+ static int
+-cam_buf_save(const char *path, vm_size_t len)
++cam_file_save(const char *path, const void *va, vm_size_t len)
+ {
+-	if (!cam.buf) {
+-		return ENOENT;
+-	}
+-	if (!len || len > cam.buf_size) {
+-		len = cam.buf_size;
+-	}
+-	sweet_dma_sync_va((const void *)cam.buf, len);  /* what the IFE wrote, not stale lines */
++	sweet_dma_sync_va(va, len);
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+ 	int e = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
+@@ -640,7 +653,7 @@ cam_buf_save(const char *path, vm_size_t len)
+ 		return e;
+ 	}
+ 	int resid = 0;
+-	e = vn_rdwr(UIO_WRITE, vp, (caddr_t)cam.buf, (int)len, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++	e = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)va, (int)len, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
+ 	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+ 	(void)vnode_close(vp, FWRITE, ctx);
+ 	if (!e && resid) {
+@@ -650,6 +663,1130 @@ cam_buf_save(const char *path, vm_size_t len)
+ 	return e;
+ }
+ 
++static int
++cam_buf_save(const char *path, vm_size_t len)
++{
++	if (!cam.buf) {
++		return ENOENT;
++	}
++	if (!len || len > cam.buf_size) {
++		len = cam.buf_size;
++	}
++	return cam_file_save(path, (const void *)cam.buf, len);
++}
++
++/* a file name under /private/var/tmp/ without ".." */
++static bool
++cam_path_ok(const char *path)
++{
++	if (strncmp(path, "/private/var/tmp/", 17)) {
++		return false;
++	}
++	for (unsigned k = 0; path[k] && path[k + 1]; k++) {
++		if (path[k] == '.' && path[k + 1] == '.') {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ---- streaming (step C3, 1167) ---- */
++static bool next_num(char **p, uint64_t *v);
++#define CAM_PHY         0x00065000u             /* CSIPHY0 in the Titan window */
++#define CAM_VFE         0x000af000u             /* IFE0 (VFE 170) */
++#define CAM_CSID        0x000b3000u             /* CSID0 */
++#define CAM_SLOT_IOVA(i) (CAM_IOVA + 0x02000000u + (uint32_t)(i) * CAM_SLOT_MAX)
++#define CAM_SLOT_MAX    0x01000000u             /* 16 MiB of IOVA a slot */
++#define CAM_SYSCTL_OWNER ((void *)&cs)          /* the slots and the stream belong to kern.sweet_cam_ctl "stream" */
++
++/* IFE0 (Linux camss-vfe-17x.c) */
++#define VFE_GLOBAL_RESET        0x018u
++#define VFE_IRQ_CMD             0x058u
++#define VFE_IRQ_MASK(n)         (0x05cu + 4u * (n))
++#define VFE_IRQ_CLEAR(n)        (0x064u + 4u * (n))
++#define VFE_IRQ_STATUS(n)       (0x06cu + 4u * (n))
++#define VFE_REG_UPDATE          0x4acu
++#define VFE_BUS_IRQ_MASK(n)     (0x2044u + 4u * (n))
++#define VFE_BUS_IRQ_CLEAR(n)    (0x2050u + 4u * (n))
++#define VFE_BUS_IRQ_STATUS(n)   (0x205cu + 4u * (n))
++#define VFE_BUS_IRQ_CLEAR_GLOBAL 0x2068u
++#define VFE_BUS_ERRORS          (0xfu << 11)    /* status 0: comp error, overwrite, overflow, violation */
++#define VFE_WM_STATUS0          0x2200u         /* image address of the frame the write master last started */
++#define VFE_WM_CFG              0x2208u
++#define VFE_WM_IMAGE_ADDR       0x2214u         /* a queue, one address a frame (see the top of the file) */
++#define VFE_WM_FRAME_INC        0x2258u
++/* CSID0 (Linux camss-csid-gen2.c) */
++#define CSID_RST_STROBES        0x010u
++#define CSID_RX_IRQ_STATUS      0x020u
++#define CSID_RX_IRQ_MASK        0x024u
++#define CSID_RX_IRQ_CLEAR       0x028u
++#define CSID_RDI0_IRQ_MASK      0x044u
++#define CSID_TOP_IRQ_STATUS     0x070u
++#define CSID_TOP_IRQ_MASK       0x074u
++#define CSID_TOP_IRQ_CLEAR      0x078u
++#define CSID_IRQ_CMD            0x080u
++#define CSID_RX_CFG0            0x100u
++#define CSID_RX_CFG1            0x104u
++#define CSID_RDI0_CFG0          0x300u
++#define CSID_RDI0_CFG1          0x304u
++#define CSID_RDI0_CTRL          0x308u          /* 0 halt, 1 resume, at a frame boundary */
++#define CSID_TPG_CTRL           0x600u
++#define CSID_RX_ERRORS          (0xfu << 15 | 1u << 19 | 1u << 20 | 1u << 24)   /* FIFO overflow, CRC, ECC, unbounded */
++
++struct cam_reg {
++	uint16_t reg;                   /* 0xffff: delay val ms */
++	uint8_t len;
++	uint16_t val;
++};
++
++/* tools/camera/imx363-1920x1080.regs (Linux sdm845-mainline imx363.c, GPL-2.0, tables taken from downstream) */
++static const struct cam_reg imx363_1080p_regs[] = {
++	{ 0x0103, 1, 0x01 }, { 0xffff, 0, 12 }, { 0x0136, 2, 0x1800 }, { 0x0301, 1, 0x5 }, { 0x0303, 1, 0x2 },
++	{ 0x0305, 1, 0x4 }, { 0x0306, 2, 0x6b }, { 0x0309, 1, 0xa }, { 0x030b, 1, 0x1 }, { 0x030d, 1, 0x2 },
++	{ 0x030e, 2, 0xd8 }, { 0x0310, 1, 0x0 }, { 0x0114, 1, 0x3 }, { 0x0822, 2, 0x0 }, { 0x31a3, 1, 0x0 },
++	{ 0x64d4, 1, 0x1 }, { 0x64d5, 1, 0xaa }, { 0x64d6, 1, 0x1 }, { 0x64d7, 1, 0xa9 }, { 0x64d8, 1, 0x1 },
++	{ 0x64d9, 1, 0xa5 }, { 0x64da, 1, 0x1 }, { 0x64db, 1, 0xa1 }, { 0x720a, 1, 0x24 }, { 0x720b, 1, 0x89 },
++	{ 0x720c, 1, 0x85 }, { 0x720d, 1, 0xa1 }, { 0x720e, 1, 0x6e }, { 0x729c, 1, 0x59 }, { 0x817c, 1, 0xff },
++	{ 0x817d, 1, 0x80 }, { 0x9348, 1, 0x96 }, { 0x934b, 1, 0x8c }, { 0x934c, 1, 0x82 }, { 0x9353, 1, 0xaa },
++	{ 0x9354, 1, 0xaa }, { 0x30f4, 1, 0x2 }, { 0x30f5, 1, 0x80 }, { 0x31a5, 1, 0x0 }, { 0x31a6, 1, 0x0 },
++	{ 0x560f, 1, 0xbe }, { 0x5856, 1, 0x8 }, { 0x58d0, 1, 0x10 }, { 0x734a, 1, 0x1 }, { 0x734f, 1, 0x2b },
++	{ 0x7441, 1, 0x55 }, { 0x7914, 1, 0x3 }, { 0x7928, 1, 0x4 }, { 0x7929, 1, 0x4 }, { 0x793f, 1, 0x3 },
++	{ 0x3038, 1, 0x0 }, { 0x303a, 2, 0x10 }, { 0x300d, 1, 0x1 }, { 0x0350, 1, 0x0 }, { 0x0204, 2, 0x0 },
++	{ 0x020e, 2, 0x100 }, { 0x0210, 2, 0x100 }, { 0x0212, 2, 0x100 }, { 0x0214, 2, 0x100 }, { 0x7bcd, 1, 0x0 },
++	{ 0x3030, 1, 0x0 }, { 0x3032, 1, 0x0 }, { 0x0220, 1, 0x0 }, { 0x0112, 2, 0xa0a }, { 0x0342, 2, 0x2280 },
++	{ 0x0136, 1, 0x18 }, { 0x0137, 1, 0x0 }, { 0x31a3, 1, 0x0 }, { 0x64d4, 1, 0x1 }, { 0x64d5, 1, 0xaa },
++	{ 0x64d6, 1, 0x1 }, { 0x64d7, 1, 0xa9 }, { 0x64d8, 1, 0x1 }, { 0x64d9, 1, 0xa5 }, { 0x64da, 1, 0x1 },
++	{ 0x64db, 1, 0xa1 }, { 0x720a, 1, 0x24 }, { 0x720b, 1, 0x89 }, { 0x720c, 1, 0x85 }, { 0x720d, 1, 0xa1 },
++	{ 0x720e, 1, 0x6e }, { 0x729c, 1, 0x59 }, { 0x817c, 1, 0xff }, { 0x817d, 1, 0x80 }, { 0x9348, 1, 0x96 },
++	{ 0x934b, 1, 0x8c }, { 0x934c, 1, 0x82 }, { 0x9353, 1, 0xaa }, { 0x9354, 1, 0xaa }, { 0x4073, 1, 0x30 },
++	{ 0x4040, 1, 0x00 }, { 0x0900, 1, 0x1 }, { 0x0901, 1, 0x42 }, { 0x0401, 1, 0x1 }, { 0x0404, 2, 0x40 },
++	{ 0x0344, 2, 0x0 }, { 0x0346, 2, 0x0 }, { 0x0348, 2, 0xfbf }, { 0x034a, 2, 0xbcf }, { 0x0381, 1, 0x1 },
++	{ 0x0383, 1, 0x1 }, { 0x0385, 1, 0x1 }, { 0x0387, 1, 0x1 }, { 0x0408, 2, 0x0 }, { 0x040a, 2, 0x0 },
++	{ 0x040c, 2, 0x780 }, { 0x040e, 2, 0x438 }, { 0x034c, 2, 0x780 }, { 0x034e, 2, 0x438 }, { 0x0340, 2, 0x510 },
++};
++struct cam_mode {
++	uint32_t width, height, bpl, fll;
++	unsigned bayer;                 /* SWEET_CAM_BAYER_* without flips */
++	const struct cam_reg *regs;
++	unsigned nregs;
++};
++
++static const struct cam_mode cam_modes[] = {
++	[SWEET_CAM_MODE_1080P30] = { 1920, 1080, 2400, 1296, SWEET_CAM_BAYER_RGGB, imx363_1080p_regs,
++		                     sizeof(imx363_1080p_regs) / sizeof(imx363_1080p_regs[0]) },
++};
++
++struct cam_slot {
++	uint32_t size;                  /* bytes mapped at CAM_SLOT_IOVA(i) */
++	uint32_t data;                  /* offset of the first pixel */
++	vm_offset_t kva;                /* kernel address of byte 0 */
++	bool mapped, valid, kernel;     /* kernel: kmem pages of "stream N", freed when unmapped */
++	uint64_t done_seq;              /* seq of the frame it holds, 0 none (or being written) */
++};
++
++static struct {
++	struct cam_slot slot[SWEET_CAM_MAX_SLOTS];
++	unsigned nslot;
++	void *owner;                    /* the user client (or CAM_SYSCTL_OWNER) the slots and the stream belong to */
++	const struct cam_mode *mode;
++	bool streaming, thread;
++	unsigned q[SWEET_CAM_MAX_SLOTS], qn;    /* slots in the write master's queue, oldest first */
++	int held, ready;                /* slot the client holds / newest finished frame, -1 none */
++	uint64_t seq, last_done, empty_since;
++	uint32_t frame_ns;              /* smoothed frame period */
++	uint32_t dropped, errors, missed, stalls, csid_rx, bus0;
++	uint32_t orientation;
++	struct {
++		uint64_t from;          /* first frame (seq) these values are in effect for */
++		uint32_t lines, again, dgain;
++	} exp[4];                       /* [0] newest */
++	bool exp_pending;
++	uint32_t req_lines, req_again, req_dgain;
++	struct sweet_cam_frame rec[SWEET_CAM_MAX_SLOTS];
++} cs = { .held = -1, .ready = -1 };
++
++static uint32_t
++vfe_rd(uint32_t off)
++{
++	return rd(cam.titan, CAM_VFE + off);
++}
++
++static void
++vfe_wr(uint32_t off, uint32_t v)
++{
++	wr(cam.titan, CAM_VFE + off, v);
++}
++
++static uint32_t
++csid_rd(uint32_t off)
++{
++	return rd(cam.titan, CAM_CSID + off);
++}
++
++static void
++csid_wr(uint32_t off, uint32_t v)
++{
++	wr(cam.titan, CAM_CSID + off, v);
++}
++
++static void
++phy_wr(uint32_t off, uint32_t v)
++{
++	wr(cam.titan, CAM_PHY + off, v);
++}
++
++static uint64_t
++cam_ns(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns;
++}
++
++/* A Fabia PLL to L/alpha and its even divider (camclk.sh's sequence; the other words keep their reset values) */
++static bool
++cam_pll(unsigned n, uint32_t l, uint32_t alpha, unsigned evendiv)
++{
++	uint32_t b = n * 0x1000u, mode = rd(cam.cc, b);
++	if ((mode & 0x80000000u) && (mode & 1u)) {
++		return true;                            /* locked and on */
++	}
++	wr(cam.cc, b + 0x04, l);
++	if (alpha) {
++		wr(cam.cc, b + 0x38, alpha);
++	}
++	wr(cam.cc, b + 0x0c, (rd(cam.cc, b + 0x0c) & ~0xf00u) | evendiv << 8);   /* USER_CTL post_div_even */
++	wr(cam.cc, b, mode | 0x800000u);                /* UPDATE_BYPASS */
++	wr(cam.cc, b, mode | 0x800000u | 4u);           /* RESET_N */
++	uint32_t m = rd(cam.cc, b);
++	wr(cam.cc, b, m & ~1u);                         /* OUTCTRL off */
++	wr(cam.cc, b + 0x2c, 0);                        /* OPMODE standby */
++	wr(cam.cc, b, (m & ~1u) | 4u);
++	wr(cam.cc, b + 0x2c, 1);                        /* OPMODE run */
++	unsigned t;
++	for (t = 0; t < 1000 && !(rd(cam.cc, b) & 0x80000000u); t++) {
++		delay(10);
++	}
++	wr(cam.cc, b + 0x0c, rd(cam.cc, b + 0x0c) | 7u);        /* main, even and odd outputs */
++	wr(cam.cc, b, rd(cam.cc, b) | 1u);                      /* OUTCTRL */
++	if (t >= 1000) {
++		say("cam_cc_pll%u did not lock (mode %#x)", n, rd(cam.cc, b));
++		return false;
++	}
++	return true;
++}
++
++/* an RCG: optional M/N/D (written before CFG), CFG, UPDATE */
++static bool
++cam_rcg(uint32_t rcg, uint32_t cfg, const uint32_t *mnd, const char *name)
++{
++	if (mnd) {
++		wr(cam.cc, rcg + 8, mnd[0]);
++		wr(cam.cc, rcg + 12, mnd[1]);
++		wr(cam.cc, rcg + 16, mnd[2]);
++	}
++	wr(cam.cc, rcg + 4, cfg);
++	wr(cam.cc, rcg, rd(cam.cc, rcg) | 1);
++	for (unsigned t = 0; t < 500; t++) {
++		if (!(rd(cam.cc, rcg) & 1)) {
++			return true;
++		}
++		delay(1);
++	}
++	say("%s: UPDATE stuck (cmd %#x cfg %#x)", name, rd(cam.cc, rcg), rd(cam.cc, rcg + 4));
++	return false;
++}
++
++/* a GDSC whose GDSCR bit 31 reports power (ife_0_gdsc) */
++static bool
++cam_gdsc_pwr(uint32_t gdscr, const char *name)
++{
++	uint32_t v = rd(cam.cc, gdscr);
++	if (v & 0x80000000u) {
++		return true;
++	}
++	wr(cam.cc, gdscr, (v & ~0xfff007u) | GDSC_WAIT_VAL);
++	for (unsigned t = 0; t < 1500; t++) {
++		if (rd(cam.cc, gdscr) & 0x80000000u) {
++			return true;
++		}
++		delay(1);
++	}
++	say("%s stuck off (gdscr %#x)", name, rd(cam.cc, gdscr));
++	return false;
++}
++
++/*
++ * camclk.sh: PLL0 600 MHz, PLL1 808 MHz, PLL2 960 MHz (even /2 = 480), PLL3 384 MHz; mclk0 24 MHz = PLL2 even / 10 *
++ * M/N 1/2; cphy_rx 384, csi0phytimer 240, ife_0 320, ife_0_csid 384 MHz; ife_0_gdsc; the CSIPHY0/IFE0 branches.
++ * RCG CFG: src [10:8] (1 PLL2 even, 5 PLL3 even), div [4:0] = 2 * div - 1, mode [13:12] = 2 with M/N.
++ */
++static int
++cam_stream_clocks(void)
++{
++	static const struct {
++		uint32_t cbcr;
++		const char *name;
++	} br[] = {
++		{ 0x401c, "cam_cc_mclk0_clk" }, { 0x5020, "cam_cc_csiphy0_clk" }, { 0x501c, "cam_cc_csi0phytimer_clk" },
++		{ 0x9024, "cam_cc_ife_0_clk" }, { 0x9050, "cam_cc_ife_0_csid_clk" }, { 0x9078, "cam_cc_ife_0_cphy_rx_clk" },
++		{ 0x907c, "cam_cc_ife_0_axi_clk" }, { 0xb124, "cam_cc_camnoc_axi_clk" },
++	};
++	static const uint32_t mclk_mnd[3] = { 1, ~1u & 0xff, ~2u & 0xff };     /* M 1, N reg ~(N - M), D reg ~N */
++
++	if (!cam_pll(0, 0x1f, 0x4000, 0) || !cam_pll(1, 0x2a, 0x1556, 0) || !cam_pll(2, 0x32, 0, 1) ||
++	    !cam_pll(3, 0x14, 0, 0)) {
++		return EIO;
++	}
++	if (!cam_rcg(0x4004, 2u << 12 | 1u << 8 | 19u, mclk_mnd, "mclk0_src") ||
++	    !cam_rcg(0x9060, 5u << 8 | 1u, NULL, "cphy_rx_src") || !cam_rcg(0x5004, 1u << 8 | 3u, NULL, "csi0phytimer_src") ||
++	    !cam_rcg(0x900c, 1u << 8 | 2u, NULL, "ife_0_src") || !cam_rcg(0x9038, 5u << 8 | 1u, NULL, "ife_0_csid_src")) {
++		return EIO;
++	}
++	if (!cam_gdsc_pwr(0x9004, "ife_0_gdsc")) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < sizeof(br) / sizeof(br[0]); i++) {
++		if (!branch_on(cam.cc, br[i].cbcr, br[i].name)) {
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++/* camcap.sh sensor: IFE0 and CSID0 reset, CSIPHY0 (4 lanes), write master 0 (MIPI raw, frame mode), CSID0 RDI0 */
++static int
++cam_stream_path(const struct cam_mode *md)
++{
++	static const uint8_t dl[][2] = {        /* data lanes: Linux camss-csiphy-3ph-1-0 lane_regs_sdm845 */
++		{ 0x04, 0x0c }, { 0x2c, 0x01 }, { 0x34, 0x0f }, { 0x1c, 0x0a }, { 0x14, 0x60 }, { 0x3c, 0xb8 },
++		{ 0x00, 0x91 }, { 0x08, 0x10 }, { 0x10, 0x52 }, { 0x38, 0xfe }, { 0x60, 0x00 }, { 0x64, 0x7f },
++	};
++	static const uint8_t cl[][2] = {        /* clock lane */
++		{ 0x04, 0x0c }, { 0x2c, 0x01 }, { 0x34, 0x0f }, { 0x1c, 0x0a }, { 0x14, 0x60 }, { 0x28, 0x04 },
++		{ 0x3c, 0xb8 }, { 0x00, 0x80 }, { 0x08, 0x10 }, { 0x0c, 0xa5 }, { 0x10, 0x52 }, { 0x38, 0x1f },
++		{ 0x60, 0x00 }, { 0x64, 0x7f },
++	};
++	unsigned t, i;
++
++	vfe_wr(VFE_IRQ_MASK(0), 0x80000000u);           /* only RESET_ACK */
++	vfe_wr(VFE_GLOBAL_RESET, 0x3fdfu);              /* core, CAMIF, bus, bus bridge, registers, TPG, DSP, CGC, RDI0-3 */
++	for (t = 0; t < 1000 && !(vfe_rd(VFE_IRQ_STATUS(0)) & 0x80000000u); t++) {
++		delay(10);
++	}
++	if (t >= 1000) {
++		say("IFE0 reset not acknowledged (irq status0 %#x)", vfe_rd(VFE_IRQ_STATUS(0)));
++		return EIO;
++	}
++	vfe_wr(VFE_IRQ_CLEAR(0), ~0u);
++	vfe_wr(VFE_IRQ_CLEAR(1), ~0u);
++	vfe_wr(VFE_IRQ_CMD, 1);
++
++	csid_wr(CSID_TOP_IRQ_CLEAR, 1);
++	csid_wr(CSID_IRQ_CMD, 1);
++	csid_wr(CSID_TOP_IRQ_MASK, 1);
++	csid_wr(CSID_IRQ_CMD, 1);
++	csid_wr(CSID_RST_STROBES, 0x1e);                /* everything but the registers */
++	for (t = 0; t < 1000 && !(csid_rd(CSID_TOP_IRQ_STATUS) & 1u); t++) {
++		delay(10);
++	}
++	if (t >= 1000) {
++		say("CSID0 reset not acknowledged (top irq status %#x)", csid_rd(CSID_TOP_IRQ_STATUS));
++		return EIO;
++	}
++	csid_wr(CSID_TOP_IRQ_CLEAR, ~0u);
++	csid_wr(CSID_IRQ_CMD, 1);
++
++	phy_wr(0x800, 1);                               /* common CTRL0: reset */
++	delay(6000);
++	phy_wr(0x800, 0);
++	phy_wr(0x814, 0x80u | 0x01u | 0x04u | 0x10u | 0x40u);  /* CTRL5: clock lane + data lanes 0-3 */
++	phy_wr(0x818, 1);                               /* CTRL6: COMMON_PWRDN_B */
++	phy_wr(0x81c, 2);
++	phy_wr(0x800, 0);
++	for (unsigned l = 0; l < 4; l++) {
++		for (i = 0; i < sizeof(dl) / sizeof(dl[0]); i++) {
++			phy_wr(l * 0x200u + dl[i][0], dl[i][1]);
++		}
++	}
++	for (i = 0; i < sizeof(cl) / sizeof(cl[0]); i++) {
++		phy_wr(0x700u + cl[i][0], cl[i][1]);
++	}
++	for (i = 11; i < 22; i++) {
++		phy_wr(0x800u + 4u * i, 0);             /* IRQ masks */
++	}
++
++	vfe_wr(0x226c, 1u << 1 | 1u << 7);              /* write master debug status cfg */
++	vfe_wr(0x2080, 0);                              /* ADDR_SYNC_FRAME_HEADER */
++	vfe_wr(0x200c, 0xfffff);                        /* no clock gating at the bus input */
++	vfe_wr(0x211c, 0);
++	vfe_wr(0x2084, 0xffffff);                       /* ADDR_SYNC_NO_SYNC */
++	vfe_wr(0x225c, 0xf);                            /* burst limit */
++	vfe_wr(0x221c, 0xff01);                         /* buffer width: default (frame mode) */
++	vfe_wr(0x2220, 0);
++	vfe_wr(0x2224, 0);                              /* packer */
++	vfe_wr(0x2228, 0xff01);                         /* stride: default */
++	vfe_wr(VFE_WM_CFG, 1u | 1u << 1);               /* enable, MIPI raw */
++	vfe_wr(VFE_WM_FRAME_INC, md->bpl * md->height);
++	vfe_wr(VFE_IRQ_MASK(0), ~0u);
++	vfe_wr(VFE_IRQ_MASK(1), ~0u);
++	for (i = 0; i < 3; i++) {
++		vfe_wr(VFE_BUS_IRQ_MASK(i), ~0u);
++		vfe_wr(VFE_BUS_IRQ_CLEAR(i), ~0u);
++	}
++	vfe_wr(VFE_BUS_IRQ_CLEAR_GLOBAL, 1);
++
++	csid_wr(CSID_TPG_CTRL, 0);
++	csid_wr(CSID_RDI0_CFG0, 1u | 1u << 1 | 1u << 2 | 0xfu << 12 | 0x2bu << 16);    /* payload only, RAW10, VC 0 */
++	csid_wr(CSID_RDI0_CFG1, 2);
++	csid_wr(0x310, 1);                              /* frame drop pattern/period, IRQ subsample: none */
++	csid_wr(0x30c, 0);
++	csid_wr(0x318, 1);
++	csid_wr(0x314, 0);
++	csid_wr(0x328, 1);
++	csid_wr(0x324, 0);
++	csid_wr(0x330, 1);
++	csid_wr(0x32c, 0);
++	csid_wr(CSID_RDI0_CTRL, 0);
++	csid_wr(CSID_RDI0_CFG0, csid_rd(CSID_RDI0_CFG0) | 1u << 31);
++	csid_wr(CSID_RX_CFG0, 3u | 0x3210u << 4);       /* 4 lanes, 0..3 in order, CSIPHY 0 */
++	csid_wr(CSID_RX_CFG1, 1u | 1u << 6);            /* ECC correction, MISR */
++	csid_wr(CSID_RDI0_IRQ_MASK, ~0u);
++	csid_wr(CSID_RX_IRQ_MASK, ~0u);
++	csid_wr(CSID_RX_IRQ_CLEAR, ~0u);
++	csid_wr(CSID_IRQ_CMD, 1);
++	return 0;
++}
++
++static int
++cam_sensor_write(uint16_t reg, unsigned len, uint32_t val)
++{
++	uint8_t b[6] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++	for (unsigned i = 0; i < len && i < 4; i++) {
++		b[2 + i] = (uint8_t)(val >> (8 * (len - 1 - i)));
++	}
++	return cci_write(0, 0x10, b, 2 + len);
++}
++
++/* coarse integration time, analog gain and the four digital gains, applied together at a frame boundary */
++static int
++cam_exposure_write(uint32_t lines, uint32_t again, uint32_t dgain)
++{
++	uint8_t dg[10] = { 0x02, 0x0e };
++	for (unsigned i = 0; i < 4; i++) {
++		dg[2 + 2 * i] = (uint8_t)(dgain >> 8);
++		dg[3 + 2 * i] = (uint8_t)dgain;
++	}
++	int e = cam_sensor_write(0x0104, 1, 1);         /* grouped parameter hold */
++	if (!e) {
++		e = cam_sensor_write(0x0202, 2, lines);
++	}
++	if (!e) {
++		e = cam_sensor_write(0x0204, 2, again);
++	}
++	if (!e) {
++		e = cci_write(0, 0x10, dg, sizeof(dg)); /* 0x020e-0x0215: Gr, R, B, Gb */
++	}
++	int e2 = cam_sensor_write(0x0104, 1, 0);
++	return e ? e : e2;
++}
++
++static void
++cam_exposure_clamp(uint32_t *lines, uint32_t *again, uint32_t *dgain)
++{
++	uint32_t fll = cs.mode ? cs.mode->fll : 1296;
++	*lines = *lines < 4 ? 4 : *lines > fll - 10 ? fll - 10 : *lines;
++	*again = *again > 448 ? 448 : *again;           /* 8x */
++	*dgain = *dgain < 256 ? 256 : *dgain > 0xfff ? 0xfff : *dgain;
++}
++
++static void
++cam_exposure_record(uint64_t from, uint32_t lines, uint32_t again, uint32_t dgain)
++{
++	for (unsigned k = 3; k > 0; k--) {
++		cs.exp[k] = cs.exp[k - 1];
++	}
++	cs.exp[0].from = from;
++	cs.exp[0].lines = lines;
++	cs.exp[0].again = again;
++	cs.exp[0].dgain = dgain;
++}
++
++static int
++cam_sensor_program(const struct cam_mode *md)
++{
++	for (unsigned i = 0; i < md->nregs; i++) {
++		const struct cam_reg *r = &md->regs[i];
++		if (r->reg == 0xffff) {
++			delay(r->val * 1000u);
++			continue;
++		}
++		int e = cam_sensor_write(r->reg, r->len, r->val);
++		if (e) {
++			say("IMX363 register %#x: error %d", r->reg, e);
++			return e;
++		}
++	}
++	return cam_sensor_write(0x0101, 1, cs.orientation);    /* image orientation: mirror, flip */
++}
++
++static int
++cam_smmu(void)
++{
++	if (cam.pt) {
++		return 0;
++	}
++	/* msm_cam_smmu_ife: iommus 0x808 (mask 0), 0x810 (mask 8), 0xc08 (mask 0), 0xc10 (mask 8) */
++	static const unsigned sids[] = { 0x808, 0x810, 0x818, 0xc08, 0xc10, 0xc18 };
++	for (unsigned i = 0; i < sizeof(sids) / sizeof(sids[0]); i++) {
++		(void)sweet_smmu_probe_sid(sids[i], 1);
++	}
++	int e = sweet_smmu_pt_create(sids, sizeof(sids) / sizeof(sids[0]), &cam.pt);
++	if (e) {
++		say("IFE SMMU context: error %d", e);
++	}
++	return e;
++}
++
++/* ---- the slot ring; everything below runs with cam.lock held ---- */
++static uint32_t
++cam_slot_addr(unsigned i)
++{
++	return CAM_SLOT_IOVA(i) + cs.slot[i].data;
++}
++
++static bool
++cam_queued(unsigned i)
++{
++	for (unsigned k = 0; k < cs.qn; k++) {
++		if (cs.q[k] == i) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++cam_push(unsigned i)
++{
++	cs.slot[i].done_seq = 0;
++	if (cs.ready == (int)i) {
++		cs.ready = -1;
++	}
++	vfe_wr(VFE_WM_IMAGE_ADDR, cam_slot_addr(i));
++	cs.q[cs.qn++] = i;
++}
++
++static unsigned
++cam_pop(void)
++{
++	unsigned d = cs.q[0];
++	for (unsigned k = 1; k < cs.qn; k++) {
++		cs.q[k - 1] = cs.q[k];
++	}
++	cs.qn--;
++	return d;
++}
++
++/*
++ * Keep two slots queued: the oldest frames go first, the newest finished frame only when nothing else is free, the
++ * held slot never. While the queue is empty the IFE drops frames; the drops are counted from the frame period.
++ */
++static void
++cam_refill(void)
++{
++	while (cs.streaming && cs.qn < 2) {
++		int best = -1;
++		for (unsigned i = 0; i < cs.nslot; i++) {
++			if (!cs.slot[i].valid || (int)i == cs.held || (int)i == cs.ready || cam_queued(i)) {
++				continue;
++			}
++			if (best < 0 || cs.slot[i].done_seq < cs.slot[best].done_seq) {
++				best = (int)i;
++			}
++		}
++		if (best < 0 && cs.ready >= 0 && cs.ready != cs.held && !cam_queued((unsigned)cs.ready)) {
++			best = cs.ready;
++		}
++		if (best < 0) {
++			break;
++		}
++		if (cs.qn == 0 && cs.empty_since) {
++			uint64_t gap = cam_ns(mach_absolute_time() - cs.empty_since);
++			cs.dropped += (uint32_t)(gap / (cs.frame_ns ? cs.frame_ns : 33333333u));
++			cs.empty_since = 0;
++		}
++		cam_push((unsigned)best);
++	}
++	if (cs.streaming && cs.qn == 0 && !cs.empty_since) {
++		cs.empty_since = mach_absolute_time();
++	}
++}
++
++/* sparse statistics of a finished frame: per zone a 3x3 grid of 2x2 quads, each line invalidated before it is read */
++static void
++cam_stats(unsigned i, struct sweet_cam_frame *f)
++{
++	const struct cam_mode *md = cs.mode;
++	const uint8_t *base = (const uint8_t *)(cs.slot[i].kva + cs.slot[i].data);
++	uint32_t zw = md->width / SWEET_CAM_ZONES_X, zh = md->height / SWEET_CAM_ZONES_Y;
++
++	bzero(f->hist, sizeof(f->hist));
++	for (unsigned zy = 0; zy < SWEET_CAM_ZONES_Y; zy++) {
++		for (unsigned zx = 0; zx < SWEET_CAM_ZONES_X; zx++) {
++			uint32_t sum[4] = { 0, 0, 0, 0 };
++			for (unsigned sy = 0; sy < 3; sy++) {
++				for (unsigned sx = 0; sx < 3; sx++) {
++					uint32_t x = (zx * zw + (2 * sx + 1) * zw / 6) & ~3u;
++					uint32_t y = (zy * zh + (2 * sy + 1) * zh / 6) & ~1u;
++					const uint8_t *p0 = base + y * md->bpl + x / 4 * 5, *p1 = p0 + md->bpl;
++					sweet_dma_sync_va(p0, 5);
++					sweet_dma_sync_va(p1, 5);
++					uint32_t v[4] = {
++						(uint32_t)p0[0] << 2 | (p0[4] & 3u), (uint32_t)p0[1] << 2 | (p0[4] >> 2 & 3u),
++						(uint32_t)p1[0] << 2 | (p1[4] & 3u), (uint32_t)p1[1] << 2 | (p1[4] >> 2 & 3u),
++					};
++					uint32_t mx = 0;
++					for (unsigned k = 0; k < 4; k++) {
++						sum[k] += v[k];
++						mx = v[k] > mx ? v[k] : mx;
++					}
++					f->hist[mx >> 4]++;
++				}
++			}
++			for (unsigned k = 0; k < 4; k++) {
++				f->zone[zy][zx][k] = (uint16_t)(sum[k] / 9);
++			}
++		}
++	}
++	f->zones_x = SWEET_CAM_ZONES_X;
++	f->zones_y = SWEET_CAM_ZONES_Y;
++	f->samples = SWEET_CAM_ZONES_X * SWEET_CAM_ZONES_Y * 9;
++}
++
++static void
++cam_frame_done(uint64_t now)
++{
++	if (cs.qn == 0) {
++		return;
++	}
++	unsigned d = cam_pop();
++	/* the poll missed a buf-done when the write master has already started the slot after the next one */
++	while (cs.qn >= 2 && vfe_rd(VFE_WM_STATUS0) == cam_slot_addr(cs.q[1])) {
++		cs.missed++;
++		d = cam_pop();
++	}
++	cs.seq++;
++	if (cs.last_done) {
++		uint64_t dt = cam_ns(now - cs.last_done);
++		if (dt > 10000000ull && dt < 200000000ull) {
++			cs.frame_ns = (uint32_t)(((uint64_t)cs.frame_ns * 7 + dt) / 8);
++		}
++	}
++	cs.last_done = now;
++
++	const struct cam_mode *md = cs.mode;
++	struct sweet_cam_frame *f = &cs.rec[d];
++	unsigned k;
++	for (k = 0; k < 3 && cs.exp[k].from > cs.seq; k++) {
++	}
++	f->version = SWEET_CAM_ABI_VERSION;
++	f->slot = d;
++	f->seq = cs.seq;
++	f->host_time = now;
++	f->width = md->width;
++	f->height = md->height;
++	f->bytes_per_row = md->bpl;
++	f->bayer = md->bayer ^ (cs.orientation & 3u);  /* the R position (row * 2 + column) moves with mirror/flip */
++	f->black_level = 64;
++	f->white_level = 1023;
++	f->exposure_lines = cs.exp[k].lines;
++	f->analog_gain = cs.exp[k].again;
++	f->digital_gain = cs.exp[k].dgain;
++	f->frame_length_lines = md->fll;
++	f->frame_time_ns = cs.frame_ns;
++	f->line_time_ns = cs.frame_ns / md->fll;
++	f->dropped = cs.dropped;
++	f->errors = cs.errors;
++	cam_stats(d, f);
++	cs.slot[d].done_seq = cs.seq;
++	cs.ready = (int)d;
++	thread_wakeup((event_t)&cs.seq);
++}
++
++static void
++cam_poll(void)
++{
++	uint32_t b[3], rx = csid_rd(CSID_RX_IRQ_STATUS);
++	for (unsigned i = 0; i < 3; i++) {
++		b[i] = vfe_rd(VFE_BUS_IRQ_STATUS(i));
++	}
++	if (b[0] | b[1] | b[2]) {
++		for (unsigned i = 0; i < 3; i++) {
++			vfe_wr(VFE_BUS_IRQ_CLEAR(i), b[i]);
++		}
++		vfe_wr(VFE_BUS_IRQ_CLEAR_GLOBAL, 1);
++	}
++	if (rx) {
++		csid_wr(CSID_RX_IRQ_CLEAR, rx);
++		csid_wr(CSID_IRQ_CMD, 1);
++	}
++	if (rx & CSID_RX_ERRORS) {
++		cs.errors++;
++		cs.csid_rx = rx;
++	}
++	if (b[0] & VFE_BUS_ERRORS) {
++		cs.errors++;
++		cs.bus0 = b[0];
++	}
++	uint64_t now = mach_absolute_time();
++	bool done = (b[1] & 1u) != 0;                   /* write master 0 buf done */
++	if (done) {
++		cam_frame_done(now);
++	} else if (cs.qn && cs.last_done && cam_ns(now - cs.last_done) > 500000000ull) {
++		cs.stalls++;
++		cs.last_done = now;
++		printf("SWEET CAM: no frame for 500 ms (queue %u, csid rx %#x, bus0 %#x, wm status %#x)\n", cs.qn, rx, b[0],
++		    vfe_rd(VFE_WM_STATUS0));
++	}
++	if (done && cs.exp_pending) {
++		/* written just after a frame ended: in effect for the frame after the one now starting */
++		if (cam_exposure_write(cs.req_lines, cs.req_again, cs.req_dgain) == 0) {
++			cam_exposure_record(cs.seq + 2, cs.req_lines, cs.req_again, cs.req_dgain);
++		}
++		cs.exp_pending = false;
++	}
++	cam_refill();
++}
++
++static void
++cam_thread(void *arg, wait_result_t wres)
++{
++#pragma unused(arg, wres)
++	lck_mtx_lock(cam.lock);
++	for (;;) {
++		while (!cs.streaming) {
++			(void)lck_mtx_sleep(cam.lock, LCK_SLEEP_DEFAULT, (event_t)&cs.thread, THREAD_UNINT);
++		}
++		cam_poll();
++		lck_mtx_unlock(cam.lock);
++		delay(2000);
++		lck_mtx_lock(cam.lock);
++	}
++}
++
++static void
++cam_stream_stop(void)
++{
++	if (!cs.streaming) {
++		return;
++	}
++	(void)cam_sensor_write(0x0100, 1, 0);           /* standby */
++	csid_wr(CSID_RDI0_CTRL, 0);                     /* halt at the frame boundary */
++	vfe_wr(VFE_WM_CFG, 0);
++	cs.streaming = false;
++	cs.qn = 0;
++	cs.held = -1;
++	cs.ready = -1;
++	thread_wakeup((event_t)&cs.seq);
++	say("stream stopped after %llu frames (%u dropped, %u missed, %u errors)", cs.seq, cs.dropped, cs.missed, cs.errors);
++}
++
++static void
++cam_slot_unmap(unsigned i)
++{
++	struct cam_slot *s = &cs.slot[i];
++	if (s->mapped && cam.pt) {
++		sweet_smmu_pt_unmap(cam.pt, CAM_SLOT_IOVA(i), (uint32_t)round_page(s->size));
++	}
++	if (s->kernel && s->kva) {
++		kmem_free(kernel_map, s->kva, round_page(s->size));
++	}
++	bzero(s, sizeof(*s));
++}
++
++static void
++cam_slots_unmap(void)
++{
++	for (unsigned i = 0; i < SWEET_CAM_MAX_SLOTS; i++) {
++		cam_slot_unmap(i);
++	}
++	cs.nslot = 0;
++}
++
++static int
++cam_stream_start(uint32_t mode, uint32_t orientation)
++{
++	if (mode >= sizeof(cam_modes) / sizeof(cam_modes[0])) {
++		return EINVAL;
++	}
++	const struct cam_mode *md = &cam_modes[mode];
++	if (cs.streaming) {
++		if (cs.mode == md && cs.orientation == (orientation & 3u)) {
++			return 0;
++		}
++		cam_stream_stop();
++	}
++	unsigned n = 0;
++	for (unsigned i = 0; i < cs.nslot; i++) {
++		struct cam_slot *s = &cs.slot[i];
++		if (!s->valid || s->size < s->data || s->size - s->data < md->bpl * md->height) {
++			say("slot %u cannot hold a %ux%u frame (%u bytes from %u)", i, md->width, md->height, s->size, s->data);
++			return EINVAL;
++		}
++		n++;
++	}
++	if (n < 3) {
++		say("streaming needs at least 3 slots (%u)", n);
++		return EINVAL;
++	}
++	cs.orientation = orientation & 3u;
++	int e = cam_sensor_on(0);
++	if (!e) {
++		e = cam_stream_clocks();
++	}
++	if (!e) {
++		e = cam_stream_path(md);
++	}
++	if (e) {
++		return e;
++	}
++	cs.mode = md;
++	cs.qn = 0;
++	cs.held = -1;
++	cs.ready = -1;
++	cs.seq = 0;
++	cs.last_done = 0;
++	cs.empty_since = 0;
++	cs.frame_ns = 33333333u;
++	cs.dropped = cs.errors = cs.missed = cs.stalls = cs.csid_rx = cs.bus0 = 0;
++	for (unsigned i = 0; i < cs.nslot; i++) {
++		cs.slot[i].done_seq = 0;
++	}
++	cs.streaming = true;                            /* for cam_refill; the thread is not woken before the end */
++	cam_refill();
++	vfe_wr(VFE_REG_UPDATE, 2);                      /* RDI0 */
++	csid_wr(CSID_RDI0_CTRL, 1);                     /* resume at a frame boundary */
++	e = cam_sensor_program(md);
++	uint32_t lines = 1000, again = 0, dgain = 256;
++	cam_exposure_clamp(&lines, &again, &dgain);
++	if (!e) {
++		e = cam_exposure_write(lines, again, dgain);
++	}
++	if (!e) {
++		e = cam_sensor_write(0x0100, 1, 1);     /* streaming */
++	}
++	if (e) {
++		cs.streaming = false;
++		vfe_wr(VFE_WM_CFG, 0);
++		return e;
++	}
++	for (unsigned k = 0; k < 4; k++) {
++		cs.exp[k].from = 0;
++		cs.exp[k].lines = lines;
++		cs.exp[k].again = again;
++		cs.exp[k].dgain = dgain;
++	}
++	cs.exp_pending = false;
++	if (!cs.thread) {
++		thread_t th;
++		if (kernel_thread_start_priority((thread_continue_t)cam_thread, NULL, 81, &th) != KERN_SUCCESS) {
++			cam_stream_stop();
++			return ENOMEM;
++		}
++		thread_deallocate(th);
++		cs.thread = true;
++	}
++	thread_wakeup((event_t)&cs.thread);
++	say("streaming %ux%u into %u slots (orientation %u)", md->width, md->height, cs.nslot, cs.orientation);
++	return 0;
++}
++
++/* "stream N": N kernel slots for a test without the plug-in */
++static int
++cam_stream_kernel_slots(unsigned n)
++{
++	const struct cam_mode *md = &cam_modes[SWEET_CAM_MODE_1080P30];
++	vm_size_t size = round_page((vm_size_t)md->bpl * md->height);
++	int e = cam_smmu();
++	if (e) {
++		return e;
++	}
++	cam_slots_unmap();
++	for (unsigned i = 0; i < n; i++) {
++		vm_offset_t kva = 0;
++		if (kmem_alloc(kernel_map, &kva, size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			cam_slots_unmap();
++			return ENOMEM;
++		}
++		struct cam_slot *s = &cs.slot[i];
++		s->kva = kva;
++		s->kernel = true;
++		s->size = (uint32_t)size;
++		sweet_dma_sync_va((const void *)kva, size);
++		for (vm_size_t o = 0; o < size; o += PAGE_SIZE) {
++			ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(kva + o));
++			e = pn ? sweet_smmu_pt_map(cam.pt, CAM_SLOT_IOVA(i) + (uint32_t)o, ptoa_64(pn), PAGE_SIZE) : ENOMEM;
++			s->mapped = true;
++			if (e) {
++				cam_slots_unmap();
++				return e;
++			}
++		}
++		s->valid = true;
++		cs.nslot = i + 1;
++	}
++	return 0;
++}
++
++/* ---- the user client's entry points (SweetCamera.cpp); all with sweet_cam_lock() held ---- */
++static void
++cam_lock_init(void)
++{
++	if (!cam.lock) {
++		lck_grp_t *g = lck_grp_alloc_init("sweet_cam", LCK_GRP_ATTR_NULL);
++		lck_mtx_t *l = lck_mtx_alloc_init(g, LCK_ATTR_NULL);
++		if (!__atomic_compare_exchange_n(&cam.lock, &(lck_mtx_t *){ NULL }, l, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++			lck_mtx_free(l, g);
++		}
++	}
++}
++
++void sweet_cam_lock(void);
++void sweet_cam_unlock(void);
++int sweet_cam_slots_reset(void *owner);
++int sweet_cam_slot_map(void *owner, unsigned i, uint32_t off, uint64_t pa, uint32_t len);
++int sweet_cam_slot_commit(void *owner, unsigned i, uint32_t data, vm_offset_t kva);
++void sweet_cam_release(void *owner);
++int sweet_cam_start(void *owner, uint32_t mode, uint32_t orientation);
++int sweet_cam_stop(void *owner);
++int sweet_cam_wait(void *owner, uint64_t after, uint32_t timeout_ms, struct sweet_cam_frame *out);
++int sweet_cam_exposure(void *owner, uint32_t lines, uint32_t again, uint32_t dgain);
++int sweet_cam_pattern(void *owner, uint32_t pattern);
++int sweet_cam_release_slot(void *owner);
++
++void
++sweet_cam_lock(void)
++{
++	cam_lock_init();
++	lck_mtx_lock(cam.lock);
++}
++
++void
++sweet_cam_unlock(void)
++{
++	lck_mtx_unlock(cam.lock);
++}
++
++/* take the camera for owner (a "stream" test gives way to a client), stop it and unmap every slot */
++int
++sweet_cam_slots_reset(void *owner)
++{
++	if (!sweet_board_beryllium()) {
++		return ENODEV;
++	}
++	if (cs.owner && cs.owner != owner && cs.owner != CAM_SYSCTL_OWNER) {
++		return EBUSY;
++	}
++	int e = cam_map();
++	if (!e) {
++		e = cam_smmu();
++	}
++	if (e) {
++		return e;
++	}
++	cs.owner = owner;
++	cam_stream_stop();
++	cam_slots_unmap();
++	return 0;
++}
++
++int
++sweet_cam_slot_map(void *owner, unsigned i, uint32_t off, uint64_t pa, uint32_t len)
++{
++	if (cs.owner != owner || cs.streaming || i >= SWEET_CAM_MAX_SLOTS || !cam.pt || (off | len) & PAGE_MASK ||
++	    off >= CAM_SLOT_MAX || len > CAM_SLOT_MAX - off) {
++		return EINVAL;
++	}
++	struct cam_slot *s = &cs.slot[i];
++	int e = sweet_smmu_pt_map(cam.pt, CAM_SLOT_IOVA(i) + off, pa, len);
++	if (!e) {
++		s->mapped = true;
++		s->size = off + len > s->size ? off + len : s->size;
++	}
++	return e;
++}
++
++int
++sweet_cam_slot_commit(void *owner, unsigned i, uint32_t data, vm_offset_t kva)
++{
++	if (cs.owner != owner || cs.streaming || i >= SWEET_CAM_MAX_SLOTS || !cs.slot[i].mapped || (data & 0xff) ||
++	    data >= cs.slot[i].size || !kva) {
++		return EINVAL;
++	}
++	struct cam_slot *s = &cs.slot[i];
++	s->data = data;
++	s->kva = kva;
++	s->valid = true;
++	sweet_dma_sync_va((const void *)kva, s->size);  /* no dirty line may land on a frame later */
++	cs.nslot = i + 1 > cs.nslot ? i + 1 : cs.nslot;
++	return 0;
++}
++
++void
++sweet_cam_release(void *owner)
++{
++	if (cs.owner != owner) {
++		return;
++	}
++	cam_stream_stop();
++	cam_slots_unmap();
++	cs.owner = NULL;
++}
++
++int
++sweet_cam_start(void *owner, uint32_t mode, uint32_t orientation)
++{
++	return cs.owner != owner ? EBUSY : cam_stream_start(mode, orientation);
++}
++
++int
++sweet_cam_stop(void *owner)
++{
++	if (cs.owner != owner) {
++		return EBUSY;
++	}
++	cam_stream_stop();
++	return 0;
++}
++
++int
++sweet_cam_wait(void *owner, uint64_t after, uint32_t timeout_ms, struct sweet_cam_frame *out)
++{
++	if (cs.owner != owner) {
++		return EBUSY;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(timeout_ms > 1000 ? 1000 : timeout_ms, NSEC_PER_MSEC, &deadline);
++	while (cs.streaming && !(cs.ready >= 0 && cs.slot[cs.ready].done_seq > after)) {
++		wait_result_t w = lck_mtx_sleep_deadline(cam.lock, LCK_SLEEP_DEFAULT, (event_t)&cs.seq, THREAD_ABORTSAFE, deadline);
++		if (w != THREAD_AWAKENED) {
++			break;
++		}
++	}
++	if (!cs.streaming) {
++		return ENXIO;
++	}
++	if (!(cs.ready >= 0 && cs.slot[cs.ready].done_seq > after)) {
++		return ETIMEDOUT;
++	}
++	cs.held = cs.ready;
++	memcpy(out, &cs.rec[cs.held], sizeof(*out));
++	cam_refill();
++	return 0;
++}
++
++int
++sweet_cam_exposure(void *owner, uint32_t lines, uint32_t again, uint32_t dgain)
++{
++	if (cs.owner != owner) {
++		return EBUSY;
++	}
++	cam_exposure_clamp(&lines, &again, &dgain);
++	cs.req_lines = lines;
++	cs.req_again = again;
++	cs.req_dgain = dgain;
++	cs.exp_pending = true;
++	return 0;
++}
++
++int
++sweet_cam_pattern(void *owner, uint32_t pattern)
++{
++	if (cs.owner != owner) {
++		return EBUSY;
++	}
++	return cam.core_on ? cam_sensor_write(0x0600, 2, pattern & 0xffff) : ENXIO;
++}
++
++int
++sweet_cam_release_slot(void *owner)
++{
++	if (cs.owner != owner) {
++		return EBUSY;
++	}
++	cs.held = -1;
++	cam_refill();
++	return 0;
++}
++
++/* "stream ..." of kern.sweet_cam_ctl */
++static void
++cam_stream_command(char *p)
++{
++	uint64_t a[3] = { 0, 0, 256 };
++	while (*p == ' ') {
++		p++;
++	}
++	if (cs.owner && cs.owner != CAM_SYSCTL_OWNER) {
++		say("the camera belongs to a client");
++		return;
++	}
++	if (!strncmp(p, "stop", 4)) {
++		cam_stream_stop();
++		return;
++	}
++	if (!strncmp(p, "exp ", 4)) {
++		p += 4;
++		if (!next_num(&p, &a[0]) || !next_num(&p, &a[1])) {
++			say("usage: stream exp LINES AGAIN [DGAIN]");
++			return;
++		}
++		(void)next_num(&p, &a[2]);
++		say("exposure: %d", sweet_cam_exposure(CAM_SYSCTL_OWNER, (uint32_t)a[0], (uint32_t)a[1], (uint32_t)a[2]));
++		return;
++	}
++	if (!strncmp(p, "pattern ", 8)) {
++		p += 8;
++		if (!next_num(&p, &a[0])) {
++			say("usage: stream pattern N");
++			return;
++		}
++		say("pattern: %d", sweet_cam_pattern(CAM_SYSCTL_OWNER, (uint32_t)a[0]));
++		return;
++	}
++	if (!strncmp(p, "save ", 5)) {
++		p += 5;
++		while (*p == ' ') {
++			p++;
++		}
++		if (!cam_path_ok(p) || cs.ready < 0) {
++			say("usage: stream save /private/var/tmp/NAME (while frames arrive)");
++			return;
++		}
++		cs.held = cs.ready;
++		struct cam_slot *s = &cs.slot[cs.held];
++		(void)cam_file_save(p, (const void *)(s->kva + s->data), (vm_size_t)cs.mode->bpl * cs.mode->height);
++		cs.held = -1;
++		return;
++	}
++	if (!next_num(&p, &a[0]) || a[0] < 3 || a[0] > SWEET_CAM_MAX_SLOTS) {
++		say("usage: stream N (3-8 kernel slots) | stop | exp LINES AGAIN [DGAIN] | pattern N | save PATH");
++		return;
++	}
++	(void)next_num(&p, &a[1]);
++	int e = sweet_cam_slots_reset(CAM_SYSCTL_OWNER);
++	if (!e) {
++		e = cam_stream_kernel_slots((unsigned)a[0]);
++	}
++	if (!e) {
++		e = cam_stream_start(SWEET_CAM_MODE_1080P30, (uint32_t)a[1]);
++	}
++	if (e) {
++		say("stream: error %d", e);
++	}
++}
++
+ /* ---- commands ---- */
+ static bool
+ next_num(char **p, uint64_t *v)
+@@ -704,6 +1841,10 @@ cam_command(char *c)
+ 		}
+ 		return;
+ 	}
++	if (!strncmp(c, "stream ", 7)) {
++		cam_stream_command(c + 7);
++		return;
++	}
+ 	if (!strncmp(c, "publish", 7)) {
+ 		say("AppleH16CamIn: %d", sweet_camera_publish());
+ 		return;
+@@ -742,11 +1883,7 @@ cam_command(char *c)
+ 			path[i++] = *p++;
+ 		}
+ 		(void)next_num(&p, &a[0]);
+-		bool dots = false;
+-		for (unsigned k = 0; path[k] && path[k + 1]; k++) {
+-			dots |= path[k] == '.' && path[k + 1] == '.';
+-		}
+-		if (strncmp(path, "/private/var/tmp/", 17) || dots) {
++		if (!cam_path_ok(path)) {
+ 			say("usage: save /private/var/tmp/NAME [BYTES]");
+ 			return;
+ 		}
+@@ -879,13 +2016,7 @@ sweet_cam_ctl_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!sweet_board_beryllium()) {
+ 		return ENODEV;
+ 	}
+-	if (!cam.lock) {
+-		lck_grp_t *g = lck_grp_alloc_init("sweet_cam", LCK_GRP_ATTR_NULL);
+-		lck_mtx_t *l = lck_mtx_alloc_init(g, LCK_ATTR_NULL);
+-		if (!__atomic_compare_exchange_n(&cam.lock, &(lck_mtx_t *){ NULL }, l, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+-			lck_mtx_free(l, g);
+-		}
+-	}
++	cam_lock_init();
+ 	lck_mtx_lock(cam.lock);
+ 	cam.outlen = 0;
+ 	cam.out[0] = 0;
+@@ -896,17 +2027,25 @@ sweet_cam_ctl_sysctl SYSCTL_HANDLER_ARGS
+ }
+ 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_ctl, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_cam_ctl_sysctl, "A",
+-    "camera: on N, off N, rd M ADDR REG RLEN N, wr M ADDR REG RLEN V VLEN, scan M, peek PA [N], poke PA V, cc ..., publish");
++    "camera: on N, off N, rd M ADDR REG RLEN N, wr M ADDR REG RLEN V VLEN, scan M, peek PA [N], poke PA V, cc ..., publish, stream ...");
+ 
+ static int
+ sweet_cam_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(arg1, arg2)
+-	char buf[sizeof(cam.out) + 96];
++	char buf[sizeof(cam.out) + 512];
+ 	uint64_t far = 0;
+ 	uint32_t fsynr = 0, fsr = cam.pt ? sweet_smmu_pt_fault(cam.pt, &far, &fsynr) : 0;
+-	snprintf(buf, sizeof(buf), "sweet_cam v2 core=%d powered=%#x buf=%luK smmu_fsr=%#x far=%#llx fsynr0=%#x\n%s", cam.core_on,
+-	    cam.powered, (unsigned long)(cam.buf_size >> 10), fsr, far, fsynr, cam.out);
++	/* without cam.lock: a snapshot that may be torn, for reading only */
++	const struct sweet_cam_frame *f = cs.ready >= 0 ? &cs.rec[cs.ready] : NULL;
++	snprintf(buf, sizeof(buf), "sweet_cam v3 core=%d powered=%#x buf=%luK smmu_fsr=%#x far=%#llx fsynr0=%#x\n"
++	    "stream=%d owner=%s slots=%u seq=%llu frame_ns=%u queued=%u held=%d ready=%d dropped=%u missed=%u errors=%u "
++	    "stalls=%u csid_rx=%#x bus0=%#x exp=%u/%u/%u centre=%u,%u,%u,%u\n%s", cam.core_on,
++	    cam.powered, (unsigned long)(cam.buf_size >> 10), fsr, far, fsynr, cs.streaming,
++	    cs.owner == NULL ? "none" : cs.owner == CAM_SYSCTL_OWNER ? "sysctl" : "client", cs.nslot, cs.seq, cs.frame_ns,
++	    cs.qn, cs.held, cs.ready, cs.dropped, cs.missed, cs.errors, cs.stalls, cs.csid_rx, cs.bus0,
++	    f ? f->exposure_lines : 0, f ? f->analog_gain : 0, f ? f->digital_gain : 0,
++	    f ? f->zone[6][8][0] : 0, f ? f->zone[6][8][1] : 0, f ? f->zone[6][8][2] : 0, f ? f->zone[6][8][3] : 0, cam.out);
+ 	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetCamera.cpp b/iokit/Kernel/arm/SweetCamera.cpp
+index 3d0acba2b608084f2dfbe490ea04d8142558c021..e7fbea25fd3cfa1ee54772566c21de7c3a541d12 100644
+--- a/iokit/Kernel/arm/SweetCamera.cpp
++++ b/iokit/Kernel/arm/SweetCamera.cpp
+@@ -8,12 +8,39 @@
+  * load H16ISP.mediacapture from disk instead: Bergamota's own capture plug-in. The service is published on command
+  * (kern.sweet_cam_ctl publish), not at boot, while that plug-in does not exist yet; cameracaptured's matching
+  * notification picks it up whenever it appears.
++ *
++ * Step C3 (1167): the user client, AppleH16CamInUserClient (a class name cameracaptured's
++ * com.apple.security.exception.iokit-user-client-class list admits), through which the plug-in hands its IOSurfaces
++ * to the IFE as frame slots and waits for frames (SweetCameraABI.h). Only the open type SWEET_CAM_OPEN_TYPE gets one.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <sys/errno.h>
++
++#include "SweetSurface.h"
++#include "SweetCameraABI.h"
++
++extern "C" {
++/* bsd/dev/sweet_cam.c; every call but lock/unlock with sweet_cam_lock() held */
++void sweet_cam_lock(void);
++void sweet_cam_unlock(void);
++int sweet_cam_slots_reset(void *owner);
++int sweet_cam_slot_map(void *owner, unsigned i, uint32_t off, uint64_t pa, uint32_t len);
++int sweet_cam_slot_commit(void *owner, unsigned i, uint32_t data, vm_offset_t kva);
++void sweet_cam_release(void *owner);
++int sweet_cam_start(void *owner, uint32_t mode, uint32_t orientation);
++int sweet_cam_stop(void *owner);
++int sweet_cam_wait(void *owner, uint64_t after, uint32_t timeout_ms, struct sweet_cam_frame *out);
++int sweet_cam_exposure(void *owner, uint32_t lines, uint32_t again, uint32_t dgain);
++int sweet_cam_pattern(void *owner, uint32_t pattern);
++int sweet_cam_release_slot(void *owner);
++}
+ 
+ class AppleH16CamIn : public IOService {
+ 	OSDeclareDefaultStructors(AppleH16CamIn);
+@@ -23,6 +50,230 @@ OSDefineMetaClassAndStructors(AppleH16CamIn, IOService);
+ 
+ static AppleH16CamIn *gSweetCamera;
+ 
++class AppleH16CamInUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleH16CamInUserClient);
++
++	SweetSurface *fSurf[SWEET_CAM_MAX_SLOTS];
++	bool          fPrepared[SWEET_CAM_MAX_SLOTS];
++	bool          fClosed;
++
++	void dropSurfaces(void);
++	IOReturn setBuffers(const uint64_t *ids, uint32_t n);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleH16CamInUserClient, IOUserClient);
++
++static IOReturn
++cam_ret(int e)
++{
++	switch (e) {
++	case 0:
++		return kIOReturnSuccess;
++	case EINVAL:
++		return kIOReturnBadArgument;
++	case ENOMEM:
++		return kIOReturnNoMemory;
++	case ETIMEDOUT:
++		return kIOReturnTimeout;
++	case EBUSY:
++		return kIOReturnExclusiveAccess;
++	case ENXIO:
++	case ENODEV:
++		return kIOReturnNotReady;
++	default:
++		return kIOReturnIOError;
++	}
++}
++
++bool
++AppleH16CamInUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (type != SWEET_CAM_OPEN_TYPE || !IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;           /* Apple's own probes of the service keep failing as before */
++	}
++	bzero(fSurf, sizeof(fSurf));
++	bzero(fPrepared, sizeof(fPrepared));
++	fClosed = false;
++	return true;
++}
++
++void
++AppleH16CamInUserClient::dropSurfaces(void)
++{
++	for (unsigned i = 0; i < SWEET_CAM_MAX_SLOTS; i++) {
++		if (fSurf[i] != NULL) {
++			if (fPrepared[i]) {
++				fSurf[i]->memory->complete();
++			}
++			fSurf[i]->release();
++		}
++		fSurf[i] = NULL;
++		fPrepared[i] = false;
++	}
++}
++
++/* the surfaces' pages are wired and entered into the IFE's SMMU context; on any failure nothing stays mapped */
++IOReturn
++AppleH16CamInUserClient::setBuffers(const uint64_t *ids, uint32_t n)
++{
++	if (n < 1 || n > SWEET_CAM_MAX_SLOTS) {
++		return kIOReturnBadArgument;
++	}
++	sweet_cam_lock();
++	int e = sweet_cam_slots_reset(this);
++	sweet_cam_unlock();
++	if (e) {
++		return cam_ret(e);
++	}
++	dropSurfaces();
++	IOReturn ret = kIOReturnSuccess;
++	for (uint32_t i = 0; i < n && ret == kIOReturnSuccess; i++) {
++		SweetSurface *s = sweet_surface_copy((uint32_t)ids[i]);
++		if (s == NULL) {
++			ret = kIOReturnNotFound;
++			break;
++		}
++		fSurf[i] = s;
++		if (s->memory == NULL || s->wrapped) {
++			ret = kIOReturnUnsupported;     /* client memory is pageable */
++			break;
++		}
++		uint64_t len = round_page_64(s->memory->getLength());
++		if (len == 0 || len > 0x01000000ull) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (s->memory->prepare() != kIOReturnSuccess) {
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		fPrepared[i] = true;
++		uintptr_t kva = s->kernelAddress();     /* byte 0 of the memory (not wrapped) */
++		if (kva == 0) {
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		sweet_cam_lock();
++		e = 0;
++		for (uint64_t off = 0; off < len && !e; off += PAGE_SIZE) {
++			IOByteCount seg = 0;
++			addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++			e = pa != 0 && (pa & PAGE_MASK) == 0 && seg >= PAGE_SIZE ?
++			    sweet_cam_slot_map(this, i, (uint32_t)off, pa, PAGE_SIZE) : ENOMEM;
++		}
++		if (!e) {
++			e = sweet_cam_slot_commit(this, i, s->offset, (vm_offset_t)kva);
++		}
++		sweet_cam_unlock();
++		ret = cam_ret(e);
++	}
++	if (ret != kIOReturnSuccess) {
++		sweet_cam_lock();
++		(void)sweet_cam_slots_reset(this);
++		sweet_cam_unlock();
++		dropSurfaces();
++	}
++	return ret;
++}
++
++IOReturn
++AppleH16CamInUserClient::clientClose(void)
++{
++	sweet_cam_lock();
++	if (!fClosed) {
++		fClosed = true;
++		sweet_cam_release(this);
++	}
++	sweet_cam_unlock();
++	dropSurfaces();
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++AppleH16CamInUserClient::free(void)
++{
++	sweet_cam_lock();
++	sweet_cam_release(this);        /* no-op unless the client vanished without clientClose */
++	sweet_cam_unlock();
++	dropSurfaces();
++	IOUserClient::free();
++}
++
++IOReturn
++AppleH16CamInUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	const uint64_t *in = args->scalarInput;
++	uint32_t nin = args->scalarInputCount;
++	int e;
++
++	if (fClosed) {
++		return kIOReturnNotOpen;
++	}
++	switch (selector) {
++	case SWEET_CAM_SEL_BUFFERS:
++		if (nin < 2 || in[0] != nin - 1) {
++			return kIOReturnBadArgument;
++		}
++		return setBuffers(in + 1, (uint32_t)in[0]);
++	case SWEET_CAM_SEL_START:
++		if (nin < 2) {
++			return kIOReturnBadArgument;
++		}
++		sweet_cam_lock();
++		e = sweet_cam_start(this, (uint32_t)in[0], (uint32_t)in[1]);
++		sweet_cam_unlock();
++		return cam_ret(e);
++	case SWEET_CAM_SEL_STOP:
++		sweet_cam_lock();
++		e = sweet_cam_stop(this);
++		sweet_cam_unlock();
++		return cam_ret(e);
++	case SWEET_CAM_SEL_WAIT:
++		if (nin < 2 || args->structureOutput == NULL || args->structureOutputSize < sizeof(struct sweet_cam_frame)) {
++			return kIOReturnBadArgument;
++		}
++		sweet_cam_lock();
++		e = sweet_cam_wait(this, in[0], (uint32_t)in[1], (struct sweet_cam_frame *)args->structureOutput);
++		sweet_cam_unlock();
++		if (!e) {
++			args->structureOutputSize = sizeof(struct sweet_cam_frame);
++		}
++		return cam_ret(e);
++	case SWEET_CAM_SEL_EXPOSURE:
++		if (nin < 3) {
++			return kIOReturnBadArgument;
++		}
++		sweet_cam_lock();
++		e = sweet_cam_exposure(this, (uint32_t)in[0], (uint32_t)in[1], (uint32_t)in[2]);
++		sweet_cam_unlock();
++		return cam_ret(e);
++	case SWEET_CAM_SEL_PATTERN:
++		if (nin < 1) {
++			return kIOReturnBadArgument;
++		}
++		sweet_cam_lock();
++		e = sweet_cam_pattern(this, (uint32_t)in[0]);
++		sweet_cam_unlock();
++		return cam_ret(e);
++	case SWEET_CAM_SEL_RELEASE:
++		sweet_cam_lock();
++		e = sweet_cam_release_slot(this);
++		sweet_cam_unlock();
++		return cam_ret(e);
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++
+ extern "C" int sweet_camera_publish(void);
+ 
+ extern "C" int
+@@ -47,6 +298,8 @@ sweet_camera_publish(void)
+ 		return 5;
+ 	}
+ 	s->setProperty("Bergamota", true);
++	s->setProperty(kIOUserClientClassKey, "AppleH16CamInUserClient");
++	s->setProperty("SweetCameraABIVersion", (uint64_t)SWEET_CAM_ABI_VERSION, 32);
+ 	s->registerService();
+ 	gSweetCamera = s;
+ 	IOLog("SWEET CAM: AppleH16CamIn published\n");
+diff --git a/iokit/Kernel/arm/SweetCameraABI.h b/iokit/Kernel/arm/SweetCameraABI.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b62d1bda44f95c0e3165d7c13df42cbda9d64e8
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetCameraABI.h
+@@ -0,0 +1,83 @@
++/*
++ * AppleH16CamIn user-client ABI (iokit/Kernel/arm/SweetCamera.cpp, bsd/dev/sweet_cam.c), shared with the H16ISP
++ * capture plug-in (tools/camera/h16isp.c in the Bergamota repo). Version 1.
++ *
++ * Open: IOServiceOpen(AppleH16CamIn, mach_task_self(), SWEET_CAM_OPEN_TYPE, &c); any other type is refused, so
++ * Apple code that probes the service keeps failing the way it did before the user client existed. One client at a time
++ * owns the camera (the first to call BUFFERS); the others get kIOReturnExclusiveAccess.
++ *
++ *   BUFFERS   scalar in: n (1..SWEET_CAM_MAX_SLOTS), then n IOSurface IDs. The surfaces become the frame slots: their
++ *             pages are wired and mapped into the IFE's SMMU context; the IFE writes each frame contiguously from the
++ *             first byte of the surface (RAW10 MIPI-packed, bytes_per_row of the mode, no padding), so a surface needs
++ *             at least width * 5 / 4 * height bytes, whatever its own geometry. Only while stopped.
++ *   START     scalar in: mode (SWEET_CAM_MODE_*), orientation (sensor register 0x0101: bit 0 mirror, bit 1 flip).
++ *             Powers sensor 0 (IMX363) and the capture path, programs the sensor and streams.
++ *   STOP      the sensor leaves streaming, the write master is disabled; the slots stay mapped.
++ *   WAIT      scalar in: the last seq the client has seen, timeout in ms (<= 1000). Struct out: struct
++ *             sweet_cam_frame of the newest frame with a larger seq. The client then holds that slot (the IFE does not
++ *             write it) until its next WAIT or RELEASE; a slot not held may be rewritten by the IFE at any time.
++ *   EXPOSURE  scalar in: coarse integration lines, analog gain code (gain = 512 / (512 - code)), digital gain (x256,
++ *             256 = 1x). Written to the sensor under grouped parameter hold right after the next frame; the frame
++ *             records say which values were in effect (two frames later, see sweet_cam_frame).
++ *   PATTERN   scalar in: sensor test pattern (register 0x0600: 0 off, 1 solid, 2 colour bars, 3 fade, 4 PN9).
++ *   RELEASE   gives the held slot back.
++ */
++#ifndef SWEET_CAMERA_ABI_H
++#define SWEET_CAMERA_ABI_H
++
++#include <stdint.h>
++
++#define SWEET_CAM_ABI_VERSION           1
++#define SWEET_CAM_OPEN_TYPE             0x53434d31u     /* 'SCM1' */
++
++enum {
++	SWEET_CAM_SEL_BUFFERS = 0,
++	SWEET_CAM_SEL_START = 1,
++	SWEET_CAM_SEL_STOP = 2,
++	SWEET_CAM_SEL_WAIT = 3,
++	SWEET_CAM_SEL_EXPOSURE = 4,
++	SWEET_CAM_SEL_PATTERN = 5,
++	SWEET_CAM_SEL_RELEASE = 6,
++};
++
++enum {
++	SWEET_CAM_MODE_1080P30 = 0,     /* 1920x1080 RAW10, 30 fps (IMX363 binned + digital crop) */
++};
++
++enum {
++	SWEET_CAM_BAYER_RGGB = 0,
++	SWEET_CAM_BAYER_GRBG = 1,
++	SWEET_CAM_BAYER_GBRG = 2,
++	SWEET_CAM_BAYER_BGGR = 3,
++};
++
++#define SWEET_CAM_MAX_SLOTS             8
++#define SWEET_CAM_ZONES_X               16
++#define SWEET_CAM_ZONES_Y               12
++#define SWEET_CAM_HIST_BINS             64
++
++/*
++ * One frame. Statistics come from a sparse sample of the frame (a 3x3 grid of 2x2 Bayer quads in each zone): zone
++ * holds the mean of each quad position, [0] top-left, [1] top-right, [2] bottom-left, [3] bottom-right, 10-bit with
++ * the black level included; bayer names the colours of those positions. hist counts the sampled quads by their
++ * largest value (bin = value / 16).
++ */
++struct sweet_cam_frame {
++	uint32_t version;
++	uint32_t slot;                  /* index into the BUFFERS list */
++	uint64_t seq;                   /* frames completed since START, from 1 */
++	uint64_t host_time;             /* mach_absolute_time() when the write master finished (polled, <= 2 ms late) */
++	uint32_t width, height, bytes_per_row, bayer;
++	uint32_t black_level, white_level;
++	uint32_t exposure_lines, analog_gain, digital_gain, frame_length_lines;  /* in effect for this frame */
++	uint32_t line_time_ns, frame_time_ns;   /* measured from the frame rate */
++	uint32_t dropped;               /* frames the IFE could not write since START (no free slot) */
++	uint32_t errors;                /* CSI receiver / write master errors since START */
++	uint32_t zones_x, zones_y, samples;
++	uint32_t reserved0;
++	uint16_t zone[SWEET_CAM_ZONES_Y][SWEET_CAM_ZONES_X][4];
++	uint32_t hist[SWEET_CAM_HIST_BINS];
++	uint32_t reserved[8];
++};
++
++#endif /* SWEET_CAMERA_ABI_H */
