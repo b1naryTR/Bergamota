@@ -1,0 +1,277 @@
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 1bc453d..1f99ae8 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -9,6 +9,9 @@
+  *   peek PA [N] / poke PA V   32-bit camera registers (Titan 0xac00000-0xacfffff, CAMCC 0xad00000-0xad0ffff), only
+  *                             while the camera core is on; a block whose own clocks are off can stall the bus
+  *   cc RCG|CBCR ...           CAMCC clock work for later steps: "cc branch OFF 1|0", "cc rcg OFF CFG"
++ *   buf MB                    a frame buffer of MB MiB (up to 32) the IFE can write: kernel pages mapped at IOVA
++ *                             0x07400000 (the DT's camera "io" region) in an SMMU context of the IFE stream IDs
++ *   fill BYTE / save PATH [N] fill the buffer (a write test), or write its first N bytes (all) to a file
+  *   publish                   register the AppleH16CamIn service CMCapture probes for (SweetCamera.cpp)
+  *
+  * Board (downstream device tree, dtb/beryllium): four qcom,cam-sensor nodes on qcom,cci@ac4a000 (CCI masters 0/1, pins
+@@ -26,8 +29,13 @@
+ #include <sys/sysctl.h>
+ #include <libkern/libkern.h>
+ #include <stdarg.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
+ #include "sweet_spmi.h"
+@@ -35,6 +43,12 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_log_sync(void);               /* sweet_ufs.c */
+ extern int sweet_camera_publish(void);          /* SweetCamera.cpp */
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int sweet_smmu_probe_sid(unsigned sid, unsigned level);
++struct sweet_smmu_pt;
++extern int sweet_smmu_pt_create(const unsigned *sids, unsigned nsid, struct sweet_smmu_pt **out);
++extern int sweet_smmu_pt_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t pa, uint32_t len);
++extern uint32_t sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uint32_t *fsynr0);
+ 
+ /* ---- addresses (live DT) ---- */
+ #define GCC_PA          0x00100000u
+@@ -49,6 +63,8 @@ extern int sweet_camera_publish(void);          /* SweetCamera.cpp */
+ #define TLMM_EAST_PA    0x03500000u
+ #define PM8998_SID      0
+ #define PM8998_GPIO(n)  (0xc000u + ((n) - 1u) * 0x100u)
++#define CAM_IOVA        0x07400000u             /* msm_cam_smmu_ife "io" region start (len 0xd8c00000) */
++#define CAM_BUF_MAX     (32u << 20)
+ 
+ /* ---- GCC / CAMCC ---- */
+ #define GCC_CAMERA_AHB  0xb008u                 /* clocks CAMCC's own registers: nothing in CAMCC before it is on */
+@@ -123,6 +139,9 @@ static struct {
+ 	bool core_on;
+ 	unsigned powered;               /* bit n: sensor n */
+ 	unsigned vio_users;
++	struct sweet_smmu_pt *pt;       /* the IFE's SMMU context (msm_cam_smmu_ife stream IDs) */
++	vm_offset_t buf;                /* the frame buffer: kernel pages at CAM_IOVA */
++	vm_size_t buf_size;
+ 	lck_mtx_t *lock;
+ 	char out[4096];
+ 	size_t outlen;
+@@ -145,6 +164,8 @@ wr(vm_offset_t base, uint32_t off, uint32_t val)
+ }
+ 
+ /* everything printed goes to the kernel log and to kern.sweet_cam */
++static void say(const char *fmt, ...) __printflike(1, 2);
++
+ static void
+ say(const char *fmt, ...)
+ {
+@@ -200,7 +221,10 @@ pmic_gpio_out(unsigned n, int level)
+ {
+ 	uint8_t sub = 0, v;
+ 	unsigned base = PM8998_GPIO(n);
+-	int e = sweet_spmi_read(PM8998_SID, base + 0x05, &sub);
++	int e = sweet_spmi_init();
++	if (!e) {
++		e = sweet_spmi_read(PM8998_SID, base + 0x05, &sub);
++	}
+ 	if (e) {
+ 		return e;
+ 	}
+@@ -513,9 +537,9 @@ cam_sensor_on(unsigned n)
+ 		pin_out(s->vdig, 1);
+ 	}
+ 	delay(1000);
+-	if (n == 1) {
+-		pin_cfg(8, 0, 1, true, 0);              /* cam_sensor_rear2_oesel: low, pull-down */
+-		pin_cfg(36, 0, 1, true, 0);
++	if (n == 1 || n == 3) {                         /* the CSIPHY1 switch (Xiaomi beryllium-p0-pinctrl.dtsi): 8 enables */
++		pin_cfg(8, 0, 1, true, 0);              /* (low), 36 selects: low rear2 (S5K5E8), high front2 (OV7251) */
++		pin_cfg(36, 0, n == 3 ? 0 : 1, true, n == 3);
+ 	}
+ 	if (!rcg_xo(CC_MCLK_RCG(n), "mclk_src") || !branch_on(cam.cc, CC_MCLK(n), "mclk")) {
+ 		return EIO;
+@@ -556,6 +580,76 @@ cam_sensor_off(unsigned n)
+ 	say("sensor %u (%s) off", n, s->name);
+ }
+ 
++/* ---- the frame buffer ---- */
++static int
++cam_buf_alloc(unsigned mb)
++{
++	if (cam.buf) {
++		say("a %lu KiB buffer is already at IOVA %#x", (unsigned long)(cam.buf_size >> 10), CAM_IOVA);
++		return EEXIST;
++	}
++	vm_size_t size = round_page((vm_size_t)mb << 20);
++	if (!size || size > CAM_BUF_MAX) {
++		return EINVAL;
++	}
++	if (!cam.pt) {
++		/* msm_cam_smmu_ife: iommus 0x808 (mask 0), 0x810 (mask 8), 0xc08 (mask 0), 0xc10 (mask 8) */
++		static const unsigned sids[] = { 0x808, 0x810, 0x818, 0xc08, 0xc10, 0xc18 };
++		for (unsigned i = 0; i < sizeof(sids) / sizeof(sids[0]); i++) {
++			(void)sweet_smmu_probe_sid(sids[i], 1);
++		}
++		int e = sweet_smmu_pt_create(sids, sizeof(sids) / sizeof(sids[0]), &cam.pt);
++		if (e) {
++			say("IFE SMMU context: error %d", e);
++			return e;
++		}
++	}
++	vm_offset_t kva = 0;
++	if (kmem_alloc(kernel_map, &kva, size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	for (vm_size_t o = 0; o < size; o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(kva + o));
++		int e = pn ? sweet_smmu_pt_map(cam.pt, CAM_IOVA + (uint32_t)o, ptoa_64(pn), PAGE_SIZE) : ENOMEM;
++		if (e) {
++			say("mapping page %lu: error %d", (unsigned long)(o / PAGE_SIZE), e);
++			return e;                       /* the pages stay allocated and mapped: a retry needs a reboot */
++		}
++	}
++	cam.buf = kva;
++	cam.buf_size = size;
++	say("buffer: %lu KiB at IOVA %#x (kva %#lx)", (unsigned long)(size >> 10), CAM_IOVA, (unsigned long)kva);
++	return 0;
++}
++
++static int
++cam_buf_save(const char *path, vm_size_t len)
++{
++	if (!cam.buf) {
++		return ENOENT;
++	}
++	if (!len || len > cam.buf_size) {
++		len = cam.buf_size;
++	}
++	sweet_dma_sync_va((const void *)cam.buf, len);  /* what the IFE wrote, not stale lines */
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int e = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
++	if (e) {
++		return e;
++	}
++	int resid = 0;
++	e = vn_rdwr(UIO_WRITE, vp, (caddr_t)cam.buf, (int)len, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	(void)vnode_close(vp, FWRITE, ctx);
++	if (!e && resid) {
++		e = EIO;
++	}
++	say("save %s: %lu bytes: %d", path, (unsigned long)len, e);
++	return e;
++}
++
+ /* ---- commands ---- */
+ static bool
+ next_num(char **p, uint64_t *v)
+@@ -614,6 +708,51 @@ cam_command(char *c)
+ 		say("AppleH16CamIn: %d", sweet_camera_publish());
+ 		return;
+ 	}
++	if (!strncmp(c, "buf ", 4)) {
++		p = c + 4;
++		if (!next_num(&p, &a[0]) || a[0] < 1 || a[0] > CAM_BUF_MAX >> 20) {
++			say("usage: buf MB (1-32)");
++			return;
++		}
++		int e = cam_buf_alloc((unsigned)a[0]);
++		if (e && e != EEXIST) {
++			say("buf: error %d", e);
++		}
++		return;
++	}
++	if (!strncmp(c, "fill ", 5)) {
++		p = c + 5;
++		if (!cam.buf || !next_num(&p, &a[0])) {
++			say("usage: fill BYTE (after buf)");
++			return;
++		}
++		memset((void *)cam.buf, (int)(a[0] & 0xff), cam.buf_size);
++		sweet_dma_sync_va((const void *)cam.buf, cam.buf_size);
++		say("buffer filled with %#llx", a[0] & 0xff);
++		return;
++	}
++	if (!strncmp(c, "save ", 5)) {
++		p = c + 5;
++		while (*p == ' ') {
++			p++;
++		}
++		char path[96] = { 0 };
++		unsigned i = 0;
++		while (*p && *p != ' ' && i < sizeof(path) - 1) {
++			path[i++] = *p++;
++		}
++		(void)next_num(&p, &a[0]);
++		bool dots = false;
++		for (unsigned k = 0; path[k] && path[k + 1]; k++) {
++			dots |= path[k] == '.' && path[k + 1] == '.';
++		}
++		if (strncmp(path, "/private/var/tmp/", 17) || dots) {
++			say("usage: save /private/var/tmp/NAME [BYTES]");
++			return;
++		}
++		(void)cam_buf_save(path, (vm_size_t)a[0]);
++		return;
++	}
+ 	if (!cam.core_on) {
+ 		say("the camera core is off: power a sensor first (on N)");
+ 		return;
+@@ -764,7 +903,10 @@ sweet_cam_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(arg1, arg2)
+ 	char buf[sizeof(cam.out) + 96];
+-	snprintf(buf, sizeof(buf), "sweet_cam v1 core=%d powered=%#x\n%s", cam.core_on, cam.powered, cam.out);
++	uint64_t far = 0;
++	uint32_t fsynr = 0, fsr = cam.pt ? sweet_smmu_pt_fault(cam.pt, &far, &fsynr) : 0;
++	snprintf(buf, sizeof(buf), "sweet_cam v2 core=%d powered=%#x buf=%luK smmu_fsr=%#x far=%#llx fsynr0=%#x\n%s", cam.core_on,
++	    cam.powered, (unsigned long)(cam.buf_size >> 10), fsr, far, fsynr, cam.out);
+ 	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
+ 
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 2b94e58..4a83333 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -181,7 +181,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		    peripheral == 0x16 || peripheral == 0x40 || peripheral == 0x41 ||
+ 		    peripheral == 0x45)) ||
+ 		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
+-		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61));  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
++		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61 ||  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
++		    peripheral == 0xc8 || peripheral == 0xca));  /* PM8998 GPIO 9 / 11: front / rear camera DVDD enables (sweet_cam.c) */
+ 	} else {
+ 		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+@@ -274,8 +275,12 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 		}
+ 	}
+ 	if (sid == 0) {
+-		/* PON spare (reboot reason); RTC alarm data 0x6140-0x6143 (the RTC offset, sweet_rtc_set) */
+-		return (addr == 0x088fu && len == 1) || (addr >= 0x6140u && addr + len <= 0x6144u);
++		/* PON spare (reboot reason); RTC alarm data 0x6140-0x6143 (the RTC offset, sweet_rtc_set); PM8998 GPIO 9 and 11
++		 * (camera_dvdd_en, camera_rear_dvdd_en) MODE_CTL, DIG_VIN_CTL, DIG_OUT_SOURCE_CTL and EN_CTL (sweet_cam.c) */
++		unsigned reg = addr & 0xffu;
++		bool cam_gpio = ((addr >> 8) == 0xc8u || (addr >> 8) == 0xcau) && len == 1 &&
++		    (reg == 0x40u || reg == 0x41u || reg == 0x44u || reg == 0x46u);
++		return (addr == 0x088fu && len == 1) || (addr >= 0x6140u && addr + len <= 0x6144u) || cam_gpio;
+ 	}
+ 	if (sid != 3) {
+ 		return false;
+diff --git a/iokit/Kernel/arm/SweetCamera.cpp b/iokit/Kernel/arm/SweetCamera.cpp
+index 534e25b..3d0acba 100644
+--- a/iokit/Kernel/arm/SweetCamera.cpp
++++ b/iokit/Kernel/arm/SweetCamera.cpp
+@@ -23,6 +23,8 @@ OSDefineMetaClassAndStructors(AppleH16CamIn, IOService);
+ 
+ static AppleH16CamIn *gSweetCamera;
+ 
++extern "C" int sweet_camera_publish(void);
++
+ extern "C" int
+ sweet_camera_publish(void)
+ {
