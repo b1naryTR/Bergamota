@@ -1,0 +1,865 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5743017..ea585f4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,7 @@ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/sweet_venus.c			standard
+ bsd/dev/sweet_audio.c			standard
+ bsd/dev/sweet_tas2559.c			standard
++bsd/dev/sweet_cam.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/sweet_80211.c			standard
+ bsd/dev/sweet_wpa.c			standard
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+new file mode 100644
+index 0000000..1bc453d
+--- /dev/null
++++ b/bsd/dev/sweet_cam.c
+@@ -0,0 +1,773 @@
++/*
++ * Camera on the Poco F1 (SDM845 Titan 170), step C1: sensor power and the camera I2C (CCI).
++ *
++ * What exists after this step: kern.sweet_cam_ctl takes a command line, kern.sweet_cam returns what it printed.
++ *   on N / off N              power sensor N (0 rear, 1 rear2, 2 front, 3 front2/IR) with what the camera core needs
++ *   rd M ADDR REG RLEN N      CCI master M, 7-bit ADDR: write the RLEN-byte register number REG, read N bytes
++ *   wr M ADDR REG RLEN V VLEN CCI master M: write the VLEN-byte value V to register REG
++ *   scan M                    the 7-bit addresses on CCI master M that acknowledge a 2-byte register write
++ *   peek PA [N] / poke PA V   32-bit camera registers (Titan 0xac00000-0xacfffff, CAMCC 0xad00000-0xad0ffff), only
++ *                             while the camera core is on; a block whose own clocks are off can stall the bus
++ *   cc RCG|CBCR ...           CAMCC clock work for later steps: "cc branch OFF 1|0", "cc rcg OFF CFG"
++ *   publish                   register the AppleH16CamIn service CMCapture probes for (SweetCamera.cpp)
++ *
++ * Board (downstream device tree, dtb/beryllium): four qcom,cam-sensor nodes on qcom,cci@ac4a000 (CCI masters 0/1, pins
++ * 17/18 and 19/20, function cci_i2c, pull-up), each with a 24 MHz MCLK (pins 13-16, function cam_mclk), a reset pin, a
++ * VANA enable (an LDO fed from PMI8998 BOB) and a VDIG enable (TLMM or PM8998 GPIO); shared camera_iovdd_ldo (1.8 V,
++ * TLMM 50, from pm8998_s4) and camera_vdig_ldo (1.35 V, TLMM 99). Sensor 1 and 3 share CSIPHY1: sensor 1's state drives
++ * TLMM 8 and 36 low (the select of the switch between them). CAMCC, GDSC and CCI values: Linux camcc-sdm845.c, gdsc.c,
++ * i2c-qcom-cci.c. Clocks run from the 19.2 MHz XO here (every CAMCC RCG's reset source; the CCI has a 19.2 MHz timing
++ * table); the sensors' 24 MHz needs CAM_CC_PLL2 and comes with streaming.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <libkern/libkern.h>
++#include <stdarg.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++#include "sweet_spmi.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_log_sync(void);               /* sweet_ufs.c */
++extern int sweet_camera_publish(void);          /* SweetCamera.cpp */
++
++/* ---- addresses (live DT) ---- */
++#define GCC_PA          0x00100000u
++#define GCC_SIZE        0x00010000u
++#define CAMCC_PA        0x0ad00000u             /* qcom,camcc@ad00000 */
++#define CAMCC_SIZE      0x00010000u
++#define TITAN_PA        0x0ac00000u             /* CPAS 0xac40000, CCI 0xac4a000, CSIPHY 0xac65000.., CSID/VFE 0xacaf000.. */
++#define TITAN_SIZE      0x00100000u
++#define CCI_OFF         0x0004a000u
++#define TLMM_NORTH_PA   0x03900000u             /* TLMM 0x3400000 + tile; a pin's registers at + pin * 0x1000 */
++#define TLMM_SOUTH_PA   0x03d00000u
++#define TLMM_EAST_PA    0x03500000u
++#define PM8998_SID      0
++#define PM8998_GPIO(n)  (0xc000u + ((n) - 1u) * 0x100u)
++
++/* ---- GCC / CAMCC ---- */
++#define GCC_CAMERA_AHB  0xb008u                 /* clocks CAMCC's own registers: nothing in CAMCC before it is on */
++#define GCC_CAMERA_AXI  0xb020u
++#define GCC_CAMERA_XO   0xb02cu
++#define CC_TITAN_GDSC   0xb134u                 /* titan_top_gdsc, POLL_CFG_GDSCR */
++#define CC_SOC_AHB      0xb13cu
++#define CC_CPAS_AHB     0xb11cu
++#define CC_CAMNOC_AXI   0xb124u
++#define CC_CCI          0xb0f0u
++#define CC_CCI_RCG      0xb0d8u
++#define CC_SLOW_AHB_RCG 0x6054u
++#define CC_MCLK_RCG(n)  (0x4004u + 0x20u * (n))
++#define CC_MCLK(n)      (0x401cu + 0x20u * (n))
++#define CBCR_OFF        (1u << 31)
++#define CBCR_HWCG       (1u << 1)
++#define CBCR_RETAIN     (1u << 14 | 1u << 13)
++#define GDSC_SW_COLLAPSE (1u << 0)
++#define GDSC_HW_CONTROL (1u << 1)
++#define GDSC_SW_OVERRIDE (1u << 2)
++#define GDSC_WAIT_MASK  (0xfffu << 12)
++#define GDSC_WAIT_VAL   (2u << 20 | 8u << 16 | 2u << 12)
++#define GDSC_UP_COMPLETE (1u << 16)
++
++/* ---- CCI (i2c-qcom-cci.c) ---- */
++#define CCI_HW_VERSION          0x000u
++#define CCI_RESET_CMD           0x004u
++#define CCI_RESET_CMD_MASK      0x0f73f3f7u
++#define CCI_QUEUE_START         0x008u
++#define CCI_HALT_REQ            0x034u
++#define CCI_SCL_CTL(m)          (0x100u + 0x100u * (m))
++#define CCI_SDA_CTL_0(m)        (0x104u + 0x100u * (m))
++#define CCI_SDA_CTL_1(m)        (0x108u + 0x100u * (m))
++#define CCI_SDA_CTL_2(m)        (0x10cu + 0x100u * (m))
++#define CCI_MISC_CTL(m)         (0x110u + 0x100u * (m))
++#define CCI_READ_DATA(m)        (0x118u + 0x100u * (m))
++#define CCI_READ_BUF_LEVEL(m)   (0x11cu + 0x100u * (m))
++#define CCI_EXEC_WORD_CNT(m, q) (0x300u + 0x200u * (m) + 0x100u * (q))
++#define CCI_CUR_WORD_CNT(m, q)  (0x304u + 0x200u * (m) + 0x100u * (q))
++#define CCI_LOAD_DATA(m, q)     (0x310u + 0x200u * (m) + 0x100u * (q))
++#define CCI_IRQ_GLOBAL_CLEAR    0xc00u
++#define CCI_IRQ_MASK_0          0xc04u
++#define CCI_IRQ_CLEAR_0         0xc08u
++#define CCI_IRQ_STATUS_0        0xc0cu
++#define CCI_ST_RST_DONE         (1u << 24)
++#define CCI_ST_DONE(m)          ((m) ? (1u << 12 | 1u << 16 | 1u << 20) : (1u << 0 | 1u << 4 | 1u << 8))
++#define CCI_ST_HALT_ACK(m)      ((m) ? 1u << 26 : 1u << 25)
++#define CCI_ST_NACK(m)          ((m) ? (1u << 29 | 1u << 30) : (1u << 27 | 1u << 28))
++#define CCI_ST_ERROR(m)         ((m) ? 0x60ee6000u : 0x18000ee6u)
++#define CCI_SET_PARAM           1u
++#define CCI_REPORT              8u
++#define CCI_WRITE               9u
++#define CCI_READ                10u
++#define CCI_REPORT_IRQ_EN       (1u << 8)
++
++/* one sensor's pins (TLMM unless *_pmic); 0 = none */
++struct cam_sensor {
++	const char *name;
++	unsigned mclk, reset, vana, vdig;
++	bool vdig_pmic, vio;
++	unsigned master;
++};
++static const struct cam_sensor cam_sensors[4] = {
++	{ "rear", 13, 80, 40, 11, true, true, 0 },
++	{ "rear2", 14, 28, 79, 92, false, true, 1 },
++	{ "front", 15, 104, 29, 9, true, true, 0 },
++	{ "front2", 16, 25, 91, 7, false, false, 1 },
++};
++
++static struct {
++	vm_offset_t gcc, cc, titan, tn, ts, te;
++	bool core_on;
++	unsigned powered;               /* bit n: sensor n */
++	unsigned vio_users;
++	lck_mtx_t *lock;
++	char out[4096];
++	size_t outlen;
++} cam;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* everything printed goes to the kernel log and to kern.sweet_cam */
++static void
++say(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	printf("SWEET CAM: %s\n", line);
++	size_t n = strlen(line);
++	if (cam.outlen + n + 2 < sizeof(cam.out)) {
++		memcpy(cam.out + cam.outlen, line, n);
++		cam.outlen += n;
++		cam.out[cam.outlen++] = '\n';
++		cam.out[cam.outlen] = 0;
++	}
++}
++
++/* ---- pins ---- */
++static vm_offset_t
++tlmm_tile(unsigned pin)
++{
++	switch (pin) {
++	case 7: case 50: case 79: case 80: case 99: case 104:
++		return cam.tn;
++	case 8: case 28: case 29:
++		return cam.te;
++	default:                        /* 13-20, 25, 36, 40, 91, 92 */
++		return cam.ts;
++	}
++}
++
++/* ctl: [1:0] pull (0 none, 1 down, 3 up), [5:2] function, [8:6] drive (mA / 2 - 1), [9] output enable; io: [1] out */
++static void
++pin_cfg(unsigned pin, unsigned func, unsigned pull, bool oe, int out)
++{
++	vm_offset_t b = tlmm_tile(pin);
++	if (out >= 0) {
++		wr(b, pin * 0x1000u + 4, out ? 2u : 0u);
++	}
++	wr(b, pin * 0x1000u, (pull & 3u) | (func & 0xfu) << 2 | 0u << 6 /* 2 mA */ | (oe ? 1u << 9 : 0));
++}
++
++static void
++pin_out(unsigned pin, int level)
++{
++	pin_cfg(pin, 0, 0, true, level);
++}
++
++/* PM8998 GPIO n as a push-pull output from VIN0 (function normal), as the device tree's camera_*_en states */
++static int
++pmic_gpio_out(unsigned n, int level)
++{
++	uint8_t sub = 0, v;
++	unsigned base = PM8998_GPIO(n);
++	int e = sweet_spmi_read(PM8998_SID, base + 0x05, &sub);
++	if (e) {
++		return e;
++	}
++	v = 0;                                          /* DIG_VIN_CTL: VIN0 */
++	e |= sweet_spmi_write(PM8998_SID, base + 0x41, &v, 1);
++	if (sub >= 0x10 && sub <= 0x15) {               /* LV/MV: mode in MODE_CTL, value in DIG_OUT_SOURCE_CTL bit 7 */
++		v = 1;
++		e |= sweet_spmi_write(PM8998_SID, base + 0x40, &v, 1);
++		v = level ? 0x80 : 0;
++		e |= sweet_spmi_write(PM8998_SID, base + 0x44, &v, 1);
++	} else {                                        /* MODE_CTL: dir [6:4] = output, function [3:1] = 0, value [0] */
++		v = 1u << 4 | (level ? 1u : 0u);
++		e |= sweet_spmi_write(PM8998_SID, base + 0x40, &v, 1);
++	}
++	v = 0x80;                                       /* EN_CTL: MASTER_EN */
++	e |= sweet_spmi_write(PM8998_SID, base + 0x46, &v, 1);
++	return e;
++}
++
++/* ---- clocks ---- */
++static bool
++branch_on(vm_offset_t base, uint32_t cbcr, const char *name)
++{
++	wr(base, cbcr, rd(base, cbcr) | 1);
++	for (unsigned t = 0; t < 500; t++) {
++		if (!(rd(base, cbcr) & CBCR_OFF)) {
++			return true;
++		}
++		delay(1);
++	}
++	uint32_t v = rd(base, cbcr);
++	if ((v & 1) && (v & CBCR_HWCG)) {
++		return true;
++	}
++	say("%s did not turn on (cbcr %#x)", name, v);
++	return false;
++}
++
++static void
++branch_off(vm_offset_t base, uint32_t cbcr)
++{
++	wr(base, cbcr, rd(base, cbcr) & ~1u);
++}
++
++/* an RCG onto the XO undivided (CFG 0) if it is anywhere else, the way the shared RCG ops park a clock */
++static bool
++rcg_xo(uint32_t rcg, const char *name)
++{
++	uint32_t cfg = rd(cam.cc, rcg + 4);
++	if (!(cfg & 0x371fu)) {                 /* src [10:8], div [4:0], mode [13:12] all 0 */
++		return true;
++	}
++	wr(cam.cc, rcg, rd(cam.cc, rcg) | 2);   /* ROOT_EN */
++	wr(cam.cc, rcg + 4, cfg & ~0x371fu);
++	wr(cam.cc, rcg, rd(cam.cc, rcg) | 1);   /* UPDATE */
++	unsigned t;
++	for (t = 0; t < 500 && (rd(cam.cc, rcg) & 1); t++) {
++		delay(1);
++	}
++	wr(cam.cc, rcg, rd(cam.cc, rcg) & ~2u);
++	if (t >= 500) {
++		say("%s: UPDATE stuck (cmd %#x cfg %#x)", name, rd(cam.cc, rcg), rd(cam.cc, rcg + 4));
++		return false;
++	}
++	return true;
++}
++
++static bool
++gdsc_on(uint32_t gdscr, const char *name)
++{
++	uint32_t v = rd(cam.cc, gdscr);
++	v = (v & ~(GDSC_HW_CONTROL | GDSC_SW_OVERRIDE | GDSC_WAIT_MASK)) | GDSC_WAIT_VAL;
++	wr(cam.cc, gdscr, v);
++	if (rd(cam.cc, gdscr + 4) & GDSC_UP_COMPLETE) {
++		return true;
++	}
++	wr(cam.cc, gdscr, v & ~GDSC_SW_COLLAPSE);
++	for (unsigned t = 0; t < 1500; t++) {
++		if (rd(cam.cc, gdscr + 4) & GDSC_UP_COMPLETE) {
++			return true;
++		}
++		delay(1);
++	}
++	say("%s stuck off (gdscr %#x cfg %#x)", name, rd(cam.cc, gdscr), rd(cam.cc, gdscr + 4));
++	return false;
++}
++
++/* ---- CCI ---- */
++static uint32_t
++cci_rd(uint32_t off)
++{
++	return rd(cam.titan, CCI_OFF + off);
++}
++
++static void
++cci_wr(uint32_t off, uint32_t val)
++{
++	wr(cam.titan, CCI_OFF + off, val);
++}
++
++/* polled: the status bits latch whatever the mask; clear what was seen */
++static uint32_t
++cci_wait(uint32_t bits, unsigned ms)
++{
++	uint32_t st = 0;
++	for (unsigned t = 0; t < ms * 20; t++) {
++		st = cci_rd(CCI_IRQ_STATUS_0);
++		if (st & bits) {
++			break;
++		}
++		delay(50);
++	}
++	if (st) {
++		cci_wr(CCI_IRQ_CLEAR_0, st);
++		cci_wr(CCI_IRQ_GLOBAL_CLEAR, 1);
++	}
++	return st;
++}
++
++static int
++cci_init(void)
++{
++	cci_wr(CCI_IRQ_MASK_0, 0x7fffffffu);
++	cci_wr(CCI_IRQ_CLEAR_0, 0xffffffffu);
++	cci_wr(CCI_IRQ_GLOBAL_CLEAR, 1);
++	cci_wr(CCI_RESET_CMD, CCI_RESET_CMD_MASK);
++	uint32_t st = cci_wait(CCI_ST_RST_DONE, 100);
++	if (!(st & CCI_ST_RST_DONE)) {
++		say("CCI reset not acknowledged (status %#x, hw version %#x)", st, cci_rd(CCI_HW_VERSION));
++		return EIO;
++	}
++	for (unsigned m = 0; m < 2; m++) {               /* 19.2 MHz, standard mode (100 kHz) */
++		cci_wr(CCI_SCL_CTL(m), 78u << 16 | 114u);
++		cci_wr(CCI_SDA_CTL_0(m), 28u << 16 | 28u);
++		cci_wr(CCI_SDA_CTL_1(m), 10u << 16 | 77u);
++		cci_wr(CCI_SDA_CTL_2(m), 118u);
++		cci_wr(CCI_MISC_CTL(m), 1u << 8 | 6u << 4 | 1u);
++	}
++	return 0;
++}
++
++static int
++cci_run(unsigned m, unsigned q)
++{
++	cci_wr(CCI_EXEC_WORD_CNT(m, q), cci_rd(CCI_CUR_WORD_CNT(m, q)));
++	cci_wr(CCI_QUEUE_START, 1u << (m * 2 + q));
++	uint32_t st = cci_wait(CCI_ST_DONE(m) | CCI_ST_ERROR(m), 100);
++	if (st & CCI_ST_ERROR(m)) {
++		int e = (st & CCI_ST_NACK(m)) ? ENXIO : EIO;
++		cci_wr(CCI_HALT_REQ, 1u << m);
++		(void)cci_wait(CCI_ST_HALT_ACK(m), 20);
++		(void)cci_init();
++		return e;
++	}
++	if (!(st & CCI_ST_DONE(m))) {
++		say("CCI master %u queue %u timeout (status %#x)", m, q, st);
++		(void)cci_init();
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
++static int
++cci_write(unsigned m, unsigned addr, const uint8_t *buf, unsigned len)
++{
++	uint8_t load[16] = { 0 };
++	unsigned i = 0;
++	if (len > 11) {
++		return EINVAL;
++	}
++	cci_wr(CCI_LOAD_DATA(m, 0), CCI_SET_PARAM | (addr & 0x7fu) << 4);
++	load[i++] = (uint8_t)(CCI_WRITE | len << 4);
++	for (unsigned j = 0; j < len; j++) {
++		load[i++] = buf[j];
++	}
++	for (unsigned j = 0; j < i; j += 4) {
++		cci_wr(CCI_LOAD_DATA(m, 0), load[j] | load[j + 1] << 8 | load[j + 2] << 16 | (uint32_t)load[j + 3] << 24);
++	}
++	cci_wr(CCI_LOAD_DATA(m, 0), CCI_REPORT | CCI_REPORT_IRQ_EN);
++	return cci_run(m, 0);
++}
++
++static int
++cci_read(unsigned m, unsigned addr, uint8_t *buf, unsigned len)
++{
++	if (len == 0 || len > 12) {
++		return EINVAL;
++	}
++	cci_wr(CCI_LOAD_DATA(m, 1), CCI_SET_PARAM | (addr & 0x7fu) << 4);
++	cci_wr(CCI_LOAD_DATA(m, 1), CCI_READ | len << 4);
++	int e = cci_run(m, 1);
++	if (e) {
++		return e;
++	}
++	uint32_t words = cci_rd(CCI_READ_BUF_LEVEL(m)), want = len / 4 + 1;
++	if (words != want) {
++		say("CCI read: %u words, expected %u", words, want);
++		while (words--) {
++			(void)cci_rd(CCI_READ_DATA(m));
++		}
++		return EIO;
++	}
++	unsigned idx = 0;
++	bool first = true;
++	while (words--) {
++		uint32_t v = cci_rd(CCI_READ_DATA(m));
++		for (unsigned i = 0; i < 4 && idx < len; i++) {
++			if (first) {                    /* the first byte is not data */
++				first = false;
++				continue;
++			}
++			buf[idx++] = (uint8_t)(v >> (i * 8));
++		}
++	}
++	return 0;
++}
++
++/* register REG (rlen bytes, big-endian on the wire) then n bytes back */
++static int
++cci_reg_read(unsigned m, unsigned addr, uint32_t reg, unsigned rlen, uint8_t *buf, unsigned n)
++{
++	uint8_t r[4];
++	for (unsigned i = 0; i < rlen; i++) {
++		r[i] = (uint8_t)(reg >> (8 * (rlen - 1 - i)));
++	}
++	int e = cci_write(m, addr, r, rlen);
++	return e ? e : cci_read(m, addr, buf, n);
++}
++
++/* ---- power ---- */
++static int
++cam_map(void)
++{
++	if (!cam.gcc) {
++		cam.gcc = ml_io_map(GCC_PA, GCC_SIZE);
++		cam.cc = ml_io_map(CAMCC_PA, CAMCC_SIZE);
++		cam.titan = ml_io_map(TITAN_PA, TITAN_SIZE);
++		cam.tn = ml_io_map(TLMM_NORTH_PA, 0x70000);
++		cam.ts = ml_io_map(TLMM_SOUTH_PA, 0x60000);
++		cam.te = ml_io_map(TLMM_EAST_PA, 0x20000);
++	}
++	return cam.gcc && cam.cc && cam.titan && cam.tn && cam.ts && cam.te ? 0 : ENOMEM;
++}
++
++/* GCC's camera branches, titan_top_gdsc, the AHB/CPAS/CAMNOC/CCI clocks on the XO, the CCI pins and the CCI itself */
++static int
++cam_core_on(void)
++{
++	if (cam.core_on) {
++		return 0;
++	}
++	int e = cam_map();
++	if (e) {
++		return e;
++	}
++	say("GCC camera ahb %#x axi %#x xo %#x", rd(cam.gcc, GCC_CAMERA_AHB), rd(cam.gcc, GCC_CAMERA_AXI), rd(cam.gcc, GCC_CAMERA_XO));
++	if (!branch_on(cam.gcc, GCC_CAMERA_AHB, "gcc_camera_ahb_clk") || !branch_on(cam.gcc, GCC_CAMERA_XO, "gcc_camera_xo_clk")) {
++		return EIO;
++	}
++	(void)branch_on(cam.gcc, GCC_CAMERA_AXI, "gcc_camera_axi_clk");        /* voted: may report late */
++	say("titan_top_gdsc %#x cfg %#x; slow_ahb_src cfg %#x cci_src cfg %#x", rd(cam.cc, CC_TITAN_GDSC),
++	    rd(cam.cc, CC_TITAN_GDSC + 4), rd(cam.cc, CC_SLOW_AHB_RCG + 4), rd(cam.cc, CC_CCI_RCG + 4));
++	if (!gdsc_on(CC_TITAN_GDSC, "titan_top_gdsc")) {
++		return EIO;
++	}
++	if (!rcg_xo(CC_SLOW_AHB_RCG, "cam_cc_slow_ahb_clk_src") || !rcg_xo(CC_CCI_RCG, "cam_cc_cci_clk_src")) {
++		return EIO;
++	}
++	if (!branch_on(cam.cc, CC_SOC_AHB, "cam_cc_soc_ahb_clk") || !branch_on(cam.cc, CC_CPAS_AHB, "cam_cc_cpas_ahb_clk") ||
++	    !branch_on(cam.cc, CC_CAMNOC_AXI, "cam_cc_camnoc_axi_clk") || !branch_on(cam.cc, CC_CCI, "cam_cc_cci_clk")) {
++		return EIO;
++	}
++	for (unsigned p = 17; p <= 20; p++) {
++		pin_cfg(p, 1, 3, false, -1);            /* cci_i2c, pull-up */
++	}
++	say("CCI hw version %#x", cci_rd(CCI_HW_VERSION));
++	e = cci_init();
++	if (e) {
++		return e;
++	}
++	cam.core_on = true;
++	say("camera core on");
++	return 0;
++}
++
++static int
++cam_sensor_on(unsigned n)
++{
++	const struct cam_sensor *s = &cam_sensors[n];
++	int e = cam_core_on();
++	if (e) {
++		return e;
++	}
++	if (cam.powered & (1u << n)) {
++		return 0;
++	}
++	if (s->vio && cam.vio_users++ == 0) {
++		pin_out(50, 1);                         /* camera_iovdd_ldo */
++	}
++	delay(1000);
++	pin_out(s->vana, 1);
++	delay(1000);
++	pin_out(99, 1);                                 /* camera_vdig_ldo */
++	if (s->vdig_pmic) {
++		e = pmic_gpio_out(s->vdig, 1);
++		if (e) {
++			say("%s: PM8998 GPIO %u: SPMI error %d", s->name, s->vdig, e);
++		}
++	} else {
++		pin_out(s->vdig, 1);
++	}
++	delay(1000);
++	if (n == 1) {
++		pin_cfg(8, 0, 1, true, 0);              /* cam_sensor_rear2_oesel: low, pull-down */
++		pin_cfg(36, 0, 1, true, 0);
++	}
++	if (!rcg_xo(CC_MCLK_RCG(n), "mclk_src") || !branch_on(cam.cc, CC_MCLK(n), "mclk")) {
++		return EIO;
++	}
++	pin_cfg(s->mclk, 1, 0, false, -1);              /* cam_mclk */
++	delay(1000);
++	pin_out(s->reset, 1);
++	delay(20000);
++	cam.powered |= 1u << n;
++	say("sensor %u (%s) powered: MCLK %u from the XO, reset %u high", n, s->name, s->mclk, s->reset);
++	return 0;
++}
++
++static void
++cam_sensor_off(unsigned n)
++{
++	const struct cam_sensor *s = &cam_sensors[n];
++	if (!(cam.powered & (1u << n))) {
++		return;
++	}
++	pin_out(s->reset, 0);
++	delay(1000);
++	pin_cfg(s->mclk, 0, 1, false, -1);
++	branch_off(cam.cc, CC_MCLK(n));
++	if (s->vdig_pmic) {
++		(void)pmic_gpio_out(s->vdig, 0);
++	} else {
++		pin_out(s->vdig, 0);
++	}
++	pin_out(s->vana, 0);
++	cam.powered &= ~(1u << n);
++	if (!cam.powered) {
++		pin_out(99, 0);
++	}
++	if (s->vio && --cam.vio_users == 0) {
++		pin_out(50, 0);
++	}
++	say("sensor %u (%s) off", n, s->name);
++}
++
++/* ---- commands ---- */
++static bool
++next_num(char **p, uint64_t *v)
++{
++	while (**p == ' ') {
++		(*p)++;
++	}
++	if (!**p) {
++		return false;
++	}
++	char *end;
++	*v = strtouq(*p, &end, 0);
++	if (end == *p) {
++		return false;
++	}
++	*p = end;
++	return true;
++}
++
++static bool
++cam_window(uint64_t pa)
++{
++	return (pa >= TITAN_PA && pa < TITAN_PA + TITAN_SIZE) || (pa >= CAMCC_PA && pa < CAMCC_PA + CAMCC_SIZE);
++}
++
++static vm_offset_t
++cam_va(uint64_t pa)
++{
++	return pa >= CAMCC_PA ? cam.cc + (vm_offset_t)(pa - CAMCC_PA) : cam.titan + (vm_offset_t)(pa - TITAN_PA);
++}
++
++static void
++cam_command(char *c)
++{
++	uint64_t a[6] = { 0 };
++	char *p;
++	unsigned n = 0;
++	if (!strncmp(c, "on ", 3) || !strncmp(c, "off ", 4)) {
++		bool on = c[1] == 'n';
++		p = c + (on ? 3 : 4);
++		if (!next_num(&p, &a[0]) || a[0] > 3) {
++			say("usage: on|off 0-3");
++			return;
++		}
++		if (on) {
++			int e = cam_sensor_on((unsigned)a[0]);
++			if (e) {
++				say("power on failed: %d", e);
++			}
++		} else {
++			cam_sensor_off((unsigned)a[0]);
++		}
++		return;
++	}
++	if (!strncmp(c, "publish", 7)) {
++		say("AppleH16CamIn: %d", sweet_camera_publish());
++		return;
++	}
++	if (!cam.core_on) {
++		say("the camera core is off: power a sensor first (on N)");
++		return;
++	}
++	if (!strncmp(c, "rd ", 3) || !strncmp(c, "wr ", 3)) {
++		bool w = c[0] == 'w';
++		p = c + 3;
++		while (n < (w ? 6u : 5u) && next_num(&p, &a[n])) {
++			n++;
++		}
++		if (n != (w ? 6u : 5u) || a[0] > 1 || a[1] > 0x7f || a[3] < 1 || a[3] > 4 || (w ? (a[5] < 1 || a[5] > 4) : (a[4] < 1 || a[4] > 8))) {
++			say(w ? "usage: wr MASTER ADDR7 REG REGLEN VALUE VALLEN" : "usage: rd MASTER ADDR7 REG REGLEN COUNT");
++			return;
++		}
++		if (w) {
++			uint8_t b[8];
++			unsigned k = 0;
++			for (unsigned i = 0; i < a[3]; i++) {
++				b[k++] = (uint8_t)(a[2] >> (8 * (a[3] - 1 - i)));
++			}
++			for (unsigned i = 0; i < a[5]; i++) {
++				b[k++] = (uint8_t)(a[4] >> (8 * (a[5] - 1 - i)));
++			}
++			say("wr m%llu %#llx reg %#llx = %#llx: %d", a[0], a[1], a[2], a[4], cci_write((unsigned)a[0], (unsigned)a[1], b, k));
++		} else {
++			uint8_t b[8] = { 0 };
++			int e = cci_reg_read((unsigned)a[0], (unsigned)a[1], (uint32_t)a[2], (unsigned)a[3], b, (unsigned)a[4]);
++			char hex[40] = { 0 };
++			for (unsigned i = 0; !e && i < a[4]; i++) {
++				snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ", b[i]);
++			}
++			say("rd m%llu %#llx reg %#llx: %s%s", a[0], a[1], a[2], e ? "error " : hex, e ? (e == ENXIO ? "NACK" : "") : "");
++			if (e && e != ENXIO) {
++				say("(error %d)", e);
++			}
++		}
++		return;
++	}
++	if (!strncmp(c, "scan ", 5)) {
++		p = c + 5;
++		if (!next_num(&p, &a[0]) || a[0] > 1) {
++			say("usage: scan 0|1");
++			return;
++		}
++		char found[512] = { 0 };
++		size_t fl = 0;
++		for (unsigned ad = 0x08; ad < 0x78; ad++) {
++			uint8_t r[2] = { 0, 0 };
++			if (cci_write((unsigned)a[0], ad, r, 2) == 0) {
++				fl += snprintf(found + fl, sizeof(found) - fl, " %#x", ad);
++			}
++		}
++		say("master %llu answers at:%s", a[0], fl ? found : " nothing");
++		return;
++	}
++	if (!strncmp(c, "peek ", 5) || !strncmp(c, "poke ", 5)) {
++		bool w = c[1] == 'o';
++		p = c + 5;
++		if (!next_num(&p, &a[0]) || !cam_window(a[0]) || (a[0] & 3)) {
++			say("usage: peek|poke PA (in 0xac00000-0xad0ffff, 4-byte aligned)");
++			return;
++		}
++		if (w) {
++			if (!next_num(&p, &a[1])) {
++				say("usage: poke PA VALUE");
++				return;
++			}
++			wr(cam_va(a[0]), 0, (uint32_t)a[1]);
++			say("poke %#llx = %#llx -> %#x", a[0], a[1], rd(cam_va(a[0]), 0));
++		} else {
++			uint64_t cnt = 1;
++			(void)next_num(&p, &cnt);
++			for (uint64_t i = 0; i < cnt && i < 64 && cam_window(a[0] + 4 * i); i += 4) {
++				say("%#llx: %08x %08x %08x %08x", a[0] + 4 * i, rd(cam_va(a[0] + 4 * i), 0),
++				    i + 1 < cnt ? rd(cam_va(a[0] + 4 * i), 4) : 0, i + 2 < cnt ? rd(cam_va(a[0] + 4 * i), 8) : 0,
++				    i + 3 < cnt ? rd(cam_va(a[0] + 4 * i), 12) : 0);
++			}
++		}
++		return;
++	}
++	if (!strncmp(c, "cc ", 3)) {
++		p = c + 3;
++		while (*p == ' ') {
++			p++;
++		}
++		bool br = !strncmp(p, "branch ", 7), rcg = !strncmp(p, "rcg ", 4);
++		p += br ? 7 : rcg ? 4 : 0;
++		if (!(br || rcg) || !next_num(&p, &a[0]) || !next_num(&p, &a[1]) || a[0] >= CAMCC_SIZE || (a[0] & 3)) {
++			say("usage: cc branch CBCR 1|0 / cc rcg CMD_RCGR CFG");
++			return;
++		}
++		if (br) {
++			bool ok = true;
++			if (a[1]) {
++				ok = branch_on(cam.cc, (uint32_t)a[0], "branch");
++			} else {
++				branch_off(cam.cc, (uint32_t)a[0]);
++			}
++			say("cbcr %#llx -> %#x%s", a[0], rd(cam.cc, (uint32_t)a[0]), ok ? "" : " (did not turn on)");
++		} else {
++			wr(cam.cc, (uint32_t)a[0] + 4, (uint32_t)a[1]);
++			wr(cam.cc, (uint32_t)a[0], rd(cam.cc, (uint32_t)a[0]) | 1);
++			unsigned t;
++			for (t = 0; t < 500 && (rd(cam.cc, (uint32_t)a[0]) & 1); t++) {
++				delay(1);
++			}
++			say("rcg %#llx cfg %#x cmd %#x%s", a[0], rd(cam.cc, (uint32_t)a[0] + 4), rd(cam.cc, (uint32_t)a[0]),
++			    t < 500 ? "" : " (UPDATE stuck)");
++		}
++		return;
++	}
++	say("unknown command: %s", c);
++}
++
++static int
++sweet_cam_ctl_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char cmd[160] = { 0 };
++	int error = sysctl_handle_string(oidp, cmd, sizeof(cmd), req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (!sweet_board_beryllium()) {
++		return ENODEV;
++	}
++	if (!cam.lock) {
++		lck_grp_t *g = lck_grp_alloc_init("sweet_cam", LCK_GRP_ATTR_NULL);
++		lck_mtx_t *l = lck_mtx_alloc_init(g, LCK_ATTR_NULL);
++		if (!__atomic_compare_exchange_n(&cam.lock, &(lck_mtx_t *){ NULL }, l, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++			lck_mtx_free(l, g);
++		}
++	}
++	lck_mtx_lock(cam.lock);
++	cam.outlen = 0;
++	cam.out[0] = 0;
++	cam_command(cmd);
++	sweet_log_sync();
++	lck_mtx_unlock(cam.lock);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_ctl, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_cam_ctl_sysctl, "A",
++    "camera: on N, off N, rd M ADDR REG RLEN N, wr M ADDR REG RLEN V VLEN, scan M, peek PA [N], poke PA V, cc ..., publish");
++
++static int
++sweet_cam_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[sizeof(cam.out) + 96];
++	snprintf(buf, sizeof(buf), "sweet_cam v1 core=%d powered=%#x\n%s", cam.core_on, cam.powered, cam.out);
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_cam_sysctl, "A",
++    "camera state and the last command's output (bsd/dev/sweet_cam.c)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetCamera.cpp b/iokit/Kernel/arm/SweetCamera.cpp
+new file mode 100644
+index 0000000..534e25b
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetCamera.cpp
+@@ -0,0 +1,59 @@
++/*
++ * The camera driver service CMCapture looks for (Poco F1, bsd/dev/sweet_cam.c does the hardware).
++ *
++ * iOS 26 CMCapture's fcc_probeCameraDriverService waits for an IOService of class AppleH16CamIn, AppleH13CamIn,
++ * AppleH10CamIn, AppleH9CamIn or AppleH6CamIn (the first it finds wins), then dlopen()s the matching
++ * /System/Library/MediaCapture/HnnISP.mediacapture and takes HnnISPCaptureDeviceCreate from it. This iOS 26 shared
++ * cache carries only H10ISP.mediacapture (Apple's ISP firmware protocol), so publishing AppleH16CamIn makes CMCapture
++ * load H16ISP.mediacapture from disk instead: Bergamota's own capture plug-in. The service is published on command
++ * (kern.sweet_cam_ctl publish), not at boot, while that plug-in does not exist yet; cameracaptured's matching
++ * notification picks it up whenever it appears.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++
++class AppleH16CamIn : public IOService {
++	OSDeclareDefaultStructors(AppleH16CamIn);
++};
++
++OSDefineMetaClassAndStructors(AppleH16CamIn, IOService);
++
++static AppleH16CamIn *gSweetCamera;
++
++extern "C" int
++sweet_camera_publish(void)
++{
++	if (gSweetCamera) {
++		return 0;
++	}
++	IOService *provider = IOService::getResourceService();
++	AppleH16CamIn *s = OSTypeAlloc(AppleH16CamIn);
++	if (!s || !provider) {
++		OSSafeReleaseNULL(s);
++		return 12;      /* ENOMEM */
++	}
++	if (!s->init() || !s->attach(provider)) {
++		s->release();
++		return 5;       /* EIO */
++	}
++	if (!s->start(provider)) {
++		s->detach(provider);
++		s->release();
++		return 5;
++	}
++	s->setProperty("Bergamota", true);
++	s->registerService();
++	gSweetCamera = s;
++	IOLog("SWEET CAM: AppleH16CamIn published\n");
++	return 0;
++}
++#else
++extern "C" int
++sweet_camera_publish(void)
++{
++	return 45;      /* ENOTSUP */
++}
++#endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index ff4ebf9..5fbe94d 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -24,3 +24,4 @@ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
+ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
++iokit/Kernel/arm/SweetCamera.cpp                                 optional iokitcpp
