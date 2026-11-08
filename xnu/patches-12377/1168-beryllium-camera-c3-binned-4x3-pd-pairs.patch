@@ -1,0 +1,239 @@
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index c28ca048d83bc89969de74ceb0cef255971dd703..3d7a460ae74c49a8d65f2468302b801088007d0e 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -13,10 +13,10 @@
+  *                             0x07400000 (the DT's camera "io" region) in an SMMU context of the IFE stream IDs
+  *   fill BYTE / save PATH [N] fill the buffer (a write test), or write its first N bytes (all) to a file
+  *   publish                   register the AppleH16CamIn service CMCapture probes for (SweetCamera.cpp)
+- *   stream N | stop           step C3 (1167) without a client: N kernel frame slots, sensor 0 streaming into them
++ *   stream N [O [M]] | stop   step C3 (1167) without a client: N kernel frame slots, sensor 0 streaming into them
+  *   stream exp LINES AGAIN [DGAIN] / stream pattern P / stream save PATH: exposure, test pattern, the newest frame
+  *
+- * Step C3 (1167): continuous capture. Sensor 0 (IMX363, 1920x1080 RAW10 at 30 fps) -> CSIPHY0 -> CSID0 RDI0 -> IFE0
++ * Step C3 (1167): continuous capture. Sensor 0 (IMX363, RAW10 at 30 fps) -> CSIPHY0 -> CSID0 RDI0 -> IFE0
+  * write master 0 -> a ring of frame slots: the H16ISP plug-in's IOSurfaces (AppleH16CamInUserClient, SweetCamera.cpp,
+  * SweetCameraABI.h), mapped page by page into the IFE's SMMU context at CAM_SLOT_IOVA(i). The bring-up is
+  * tools/camera/camclk.sh + camcap.sh sensor + camregs.sh of the Bergamota repo moved into the kernel. The write
+@@ -25,6 +25,14 @@
+  * thread (2 ms) keeps two slots queued and pushes the next one at each buf-done. Each finished frame gets a sparse
+  * statistics sample (zone means, histogram) for the plug-in's exposure and white balance.
+  *
++ * 1168, measured on the phone with single frames: the Linux table's "1920x1080 30 fps" mode ran at 22.4 fps (8832 x 1296
++ * clocks at a 256.8 MHz pixel rate; IVT multiplier 107 -> 143 makes it 30.0) and shows only the top-left 1920x2160 of
++ * the array, each pixel as its two phase-detection photodiode values side by side (colour bars and the real scene: even
++ * rows R R G G, odd rows G G B B; the two values of a pair differ by a steady ratio, as PD halves do). Mode 1 bins 2x2
++ * (0x0901 = 0x22, no scaler) over the full array and outputs 4032 values a line (2016 pixels) x 1512 lines, 1592 lines
++ * a frame at a 422.4 MHz pixel rate (multiplier 176) = 30 fps; clean CSI. The IFE pads each line to 16 bytes (a
++ * 2016-value line of 2520 bytes arrived 2528 apart).
++ *
+  * Board (downstream device tree, dtb/beryllium): four qcom,cam-sensor nodes on qcom,cci@ac4a000 (CCI masters 0/1, pins
+  * 17/18 and 19/20, function cci_i2c, pull-up), each with a 24 MHz MCLK (pins 13-16, function cam_mclk), a reset pin, a
+  * VANA enable (an LDO fed from PMI8998 BOB) and a VDIG enable (TLMM or PM8998 GPIO); shared camera_iovdd_ldo (1.8 V,
+@@ -764,16 +772,33 @@ static const struct cam_reg imx363_1080p_regs[] = {
+ 	{ 0x0383, 1, 0x1 }, { 0x0385, 1, 0x1 }, { 0x0387, 1, 0x1 }, { 0x0408, 2, 0x0 }, { 0x040a, 2, 0x0 },
+ 	{ 0x040c, 2, 0x780 }, { 0x040e, 2, 0x438 }, { 0x034c, 2, 0x780 }, { 0x034e, 2, 0x438 }, { 0x0340, 2, 0x510 },
+ };
++/* written after the base table, in standby */
++static const struct cam_reg imx363_1080p_fix[] = {
++	{ 0x0306, 2, 0x8f },            /* IVT multiplier 107 -> 143: 22.4 -> 30.0 fps */
++};
++static const struct cam_reg imx363_binned_regs[] = {
++	{ 0x0306, 2, 0xb0 },            /* IVT multiplier 176: 422.4 MHz pixel rate */
++	{ 0x0900, 1, 0x01 }, { 0x0901, 1, 0x22 },       /* 2x2 binning */
++	{ 0x0401, 1, 0x00 }, { 0x0404, 2, 0x10 },       /* no scaler */
++	{ 0x0408, 2, 0 }, { 0x040a, 2, 0 }, { 0x040c, 2, 4032 }, { 0x040e, 2, 1512 },  /* digital crop: all (in PD values) */
++	{ 0x034c, 2, 4032 }, { 0x034e, 2, 1512 },       /* output size */
++	{ 0x0340, 2, 1592 },            /* frame length lines: 30 fps */
++};
++
+ struct cam_mode {
+-	uint32_t width, height, bpl, fll;
++	uint32_t width, height, bpl, fll;               /* width in pixels; bpl: the IFE's line pitch */
+ 	unsigned bayer;                 /* SWEET_CAM_BAYER_* without flips */
+-	const struct cam_reg *regs;
+-	unsigned nregs;
++	unsigned layout;                /* SWEET_CAM_LAYOUT_* */
++	const struct cam_reg *regs, *fix;
++	unsigned nregs, nfix;
+ };
+ 
++#define CAM_N(a) (sizeof(a) / sizeof((a)[0]))
+ static const struct cam_mode cam_modes[] = {
+-	[SWEET_CAM_MODE_1080P30] = { 1920, 1080, 2400, 1296, SWEET_CAM_BAYER_RGGB, imx363_1080p_regs,
+-		                     sizeof(imx363_1080p_regs) / sizeof(imx363_1080p_regs[0]) },
++	[SWEET_CAM_MODE_1080P30] = { 960, 1080, 2400, 1296, SWEET_CAM_BAYER_RGGB, SWEET_CAM_LAYOUT_PD_PAIRS,
++		                     imx363_1080p_regs, imx363_1080p_fix, CAM_N(imx363_1080p_regs), CAM_N(imx363_1080p_fix) },
++	[SWEET_CAM_MODE_BINNED_4X3] = { 2016, 1512, 5040, 1592, SWEET_CAM_BAYER_RGGB, SWEET_CAM_LAYOUT_PD_PAIRS,
++		                        imx363_1080p_regs, imx363_binned_regs, CAM_N(imx363_1080p_regs), CAM_N(imx363_binned_regs) },
+ };
+ 
+ struct cam_slot {
+@@ -1115,8 +1140,8 @@ cam_exposure_record(uint64_t from, uint32_t lines, uint32_t again, uint32_t dgai
+ static int
+ cam_sensor_program(const struct cam_mode *md)
+ {
+-	for (unsigned i = 0; i < md->nregs; i++) {
+-		const struct cam_reg *r = &md->regs[i];
++	for (unsigned i = 0; i < md->nregs + md->nfix; i++) {
++		const struct cam_reg *r = i < md->nregs ? &md->regs[i] : &md->fix[i - md->nregs];
+ 		if (r->reg == 0xffff) {
+ 			delay(r->val * 1000u);
+ 			continue;
+@@ -1223,7 +1248,10 @@ cam_refill(void)
+ 	}
+ }
+ 
+-/* sparse statistics of a finished frame: per zone a 3x3 grid of 2x2 quads, each line invalidated before it is read */
++/*
++ * sparse statistics of a finished frame: per zone a 3x3 grid of 2x2 quads, each line invalidated before it is read.
++ * PD_PAIRS: a quad at an even pixel x is the 4 values of one 5-byte group per line, a pair averaged into a pixel.
++ */
+ static void
+ cam_stats(unsigned i, struct sweet_cam_frame *f)
+ {
+@@ -1237,15 +1265,23 @@ cam_stats(unsigned i, struct sweet_cam_frame *f)
+ 			uint32_t sum[4] = { 0, 0, 0, 0 };
+ 			for (unsigned sy = 0; sy < 3; sy++) {
+ 				for (unsigned sx = 0; sx < 3; sx++) {
+-					uint32_t x = (zx * zw + (2 * sx + 1) * zw / 6) & ~3u;
++					bool pd = md->layout == SWEET_CAM_LAYOUT_PD_PAIRS;
++					uint32_t x = (zx * zw + (2 * sx + 1) * zw / 6) & (pd ? ~1u : ~3u);     /* pixels */
+ 					uint32_t y = (zy * zh + (2 * sy + 1) * zh / 6) & ~1u;
+-					const uint8_t *p0 = base + y * md->bpl + x / 4 * 5, *p1 = p0 + md->bpl;
++					uint32_t vx = pd ? 2 * x : x;                                           /* values */
++					const uint8_t *p0 = base + y * md->bpl + vx / 4 * 5, *p1 = p0 + md->bpl;
+ 					sweet_dma_sync_va(p0, 5);
+ 					sweet_dma_sync_va(p1, 5);
+-					uint32_t v[4] = {
+-						(uint32_t)p0[0] << 2 | (p0[4] & 3u), (uint32_t)p0[1] << 2 | (p0[4] >> 2 & 3u),
+-						(uint32_t)p1[0] << 2 | (p1[4] & 3u), (uint32_t)p1[1] << 2 | (p1[4] >> 2 & 3u),
+-					};
++					uint32_t a[8];
++					for (unsigned k = 0; k < 4; k++) {
++						a[k] = (uint32_t)p0[k] << 2 | (p0[4] >> (2 * k) & 3u);
++						a[4 + k] = (uint32_t)p1[k] << 2 | (p1[4] >> (2 * k) & 3u);
++					}
++					uint32_t v[4] = { a[0], a[1], a[4], a[5] };
++					if (pd) {
++						v[0] = (a[0] + a[1]) / 2, v[1] = (a[2] + a[3]) / 2;
++						v[2] = (a[4] + a[5]) / 2, v[3] = (a[6] + a[7]) / 2;
++					}
+ 					uint32_t mx = 0;
+ 					for (unsigned k = 0; k < 4; k++) {
+ 						sum[k] += v[k];
+@@ -1305,6 +1341,7 @@ cam_frame_done(uint64_t now)
+ 	f->digital_gain = cs.exp[k].dgain;
+ 	f->frame_length_lines = md->fll;
+ 	f->frame_time_ns = cs.frame_ns;
++	f->layout = md->layout;
+ 	f->line_time_ns = cs.frame_ns / md->fll;
+ 	f->dropped = cs.dropped;
+ 	f->errors = cs.errors;
+@@ -1381,10 +1418,16 @@ cam_stream_stop(void)
+ 	if (!cs.streaming) {
+ 		return;
+ 	}
+-	(void)cam_sensor_write(0x0100, 1, 0);           /* standby */
++	cs.streaming = false;
++	(void)cam_sensor_write(0x0100, 1, 0);           /* standby (at the end of the frame being sent) */
+ 	csid_wr(CSID_RDI0_CTRL, 0);                     /* halt at the frame boundary */
++	/*
++	 * The frame in flight still lands in its slot: wait it out (cam.lock stays held, the poll thread waits too), so no
++	 * write can follow the slot's unmapping. 1167 unmapped at once and the IFE's SMMU context logged a write fault in
++	 * slot 0 when a client took the camera over from "stream".
++	 */
++	delay((cs.frame_ns ? cs.frame_ns : 33333333u) / 1000u + 20000u);
+ 	vfe_wr(VFE_WM_CFG, 0);
+-	cs.streaming = false;
+ 	cs.qn = 0;
+ 	cs.held = -1;
+ 	cs.ready = -1;
+@@ -1504,9 +1547,8 @@ cam_stream_start(uint32_t mode, uint32_t orientation)
+ 
+ /* "stream N": N kernel slots for a test without the plug-in */
+ static int
+-cam_stream_kernel_slots(unsigned n)
++cam_stream_kernel_slots(unsigned n, const struct cam_mode *md)
+ {
+-	const struct cam_mode *md = &cam_modes[SWEET_CAM_MODE_1080P30];
+ 	vm_size_t size = round_page((vm_size_t)md->bpl * md->height);
+ 	int e = cam_smmu();
+ 	if (e) {
+@@ -1771,16 +1813,22 @@ cam_stream_command(char *p)
+ 		return;
+ 	}
+ 	if (!next_num(&p, &a[0]) || a[0] < 3 || a[0] > SWEET_CAM_MAX_SLOTS) {
+-		say("usage: stream N (3-8 kernel slots) | stop | exp LINES AGAIN [DGAIN] | pattern N | save PATH");
++		say("usage: stream N [ORIENTATION [MODE]] (3-8 kernel slots) | stop | exp LINES AGAIN [DGAIN] | pattern N | save PATH");
+ 		return;
+ 	}
+ 	(void)next_num(&p, &a[1]);
++	uint64_t mode = SWEET_CAM_MODE_BINNED_4X3;
++	(void)next_num(&p, &mode);
++	if (mode >= CAM_N(cam_modes)) {
++		say("stream N ORIENTATION MODE: mode 0 or 1");
++		return;
++	}
+ 	int e = sweet_cam_slots_reset(CAM_SYSCTL_OWNER);
+ 	if (!e) {
+-		e = cam_stream_kernel_slots((unsigned)a[0]);
++		e = cam_stream_kernel_slots((unsigned)a[0], &cam_modes[mode]);
+ 	}
+ 	if (!e) {
+-		e = cam_stream_start(SWEET_CAM_MODE_1080P30, (uint32_t)a[1]);
++		e = cam_stream_start((uint32_t)mode, (uint32_t)a[1]);
+ 	}
+ 	if (e) {
+ 		say("stream: error %d", e);
+diff --git a/iokit/Kernel/arm/SweetCameraABI.h b/iokit/Kernel/arm/SweetCameraABI.h
+index 5b62d1bda44f95c0e3165d7c13df42cbda9d64e8..f1deb8361eec8b777c0f6a4c0c711435124b1841 100644
+--- a/iokit/Kernel/arm/SweetCameraABI.h
++++ b/iokit/Kernel/arm/SweetCameraABI.h
+@@ -11,6 +11,7 @@
+  *             first byte of the surface (RAW10 MIPI-packed, bytes_per_row of the mode, no padding), so a surface needs
+  *             at least width * 5 / 4 * height bytes, whatever its own geometry. Only while stopped.
+  *   START     scalar in: mode (SWEET_CAM_MODE_*), orientation (sensor register 0x0101: bit 0 mirror, bit 1 flip).
++ *             A frame is bytes_per_row * height bytes (lines padded to 16 bytes by the IFE).
+  *             Powers sensor 0 (IMX363) and the capture path, programs the sensor and streams.
+  *   STOP      the sensor leaves streaming, the write master is disabled; the slots stay mapped.
+  *   WAIT      scalar in: the last seq the client has seen, timeout in ms (<= 1000). Struct out: struct
+@@ -41,7 +42,18 @@ enum {
+ };
+ 
+ enum {
+-	SWEET_CAM_MODE_1080P30 = 0,     /* 1920x1080 RAW10, 30 fps (IMX363 binned + digital crop) */
++	SWEET_CAM_MODE_1080P30 = 0,     /* the Linux driver's "1920x1080": a top-left crop, dual-PD pairs (see layout); 30 fps */
++	SWEET_CAM_MODE_BINNED_4X3 = 1,  /* 2x2 binned full field: 2016x1512 pixels as 4032x1512 dual-PD values, 30 fps (1168) */
++};
++
++/*
++ * layout: how the RAW10 values make the Bayer image. PD_PAIRS: the IMX363 reads each pixel's two phase-detection
++ * photodiodes out as two values side by side (left, right), so a line holds 2 * width values and pixel x is values
++ * 2x and 2x + 1 (their sum is the pixel; each carries the black level). Even rows R R G G ..., odd rows G G B B ...
++ */
++enum {
++	SWEET_CAM_LAYOUT_BAYER = 0,
++	SWEET_CAM_LAYOUT_PD_PAIRS = 1,
+ };
+ 
+ enum {
+@@ -57,7 +69,8 @@ enum {
+ #define SWEET_CAM_HIST_BINS             64
+ 
+ /*
+- * One frame. Statistics come from a sparse sample of the frame (a 3x3 grid of 2x2 Bayer quads in each zone): zone
++ * One frame. width and height are in pixels (PD_PAIRS: a pair of values each). Statistics come from a sparse sample of
++ * the frame (a 3x3 grid of 2x2 Bayer quads in each zone, a PD pair averaged into one 10-bit value): zone
+  * holds the mean of each quad position, [0] top-left, [1] top-right, [2] bottom-left, [3] bottom-right, 10-bit with
+  * the black level included; bayer names the colours of those positions. hist counts the sampled quads by their
+  * largest value (bin = value / 16).
+@@ -74,7 +87,7 @@ struct sweet_cam_frame {
+ 	uint32_t dropped;               /* frames the IFE could not write since START (no free slot) */
+ 	uint32_t errors;                /* CSI receiver / write master errors since START */
+ 	uint32_t zones_x, zones_y, samples;
+-	uint32_t reserved0;
++	uint32_t layout;                /* SWEET_CAM_LAYOUT_* (0 before 1168) */
+ 	uint16_t zone[SWEET_CAM_ZONES_Y][SWEET_CAM_ZONES_X][4];
+ 	uint32_t hist[SWEET_CAM_HIST_BINS];
+ 	uint32_t reserved[8];
