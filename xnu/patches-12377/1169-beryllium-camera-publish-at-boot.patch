@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
+index 3d7a460ae74c49a8d65f2468302b801088007d0e..183e819a7101eda3bb9c663df878a984c00c7634 100644
+--- a/bsd/dev/sweet_cam.c
++++ b/bsd/dev/sweet_cam.c
+@@ -1762,6 +1762,36 @@ sweet_cam_release_slot(void *owner)
+ 	return 0;
+ }
+ 
++/*
++ * 1169: AppleH16CamIn is published at boot (beryllium, boot-arg sweetcam=0 keeps it away), a second after this runs, so
++ * that cameracaptured finds the service when it first starts: published later by hand ("publish"), cameracaptured had
++ * already given up on a capture device and had to be restarted. Nothing is powered before a client's START.
++ */
++static void
++cam_publish_thread(void *arg, wait_result_t wres)
++{
++#pragma unused(arg, wres)
++	delay(1000 * 1000);
++	printf("SWEET CAM: AppleH16CamIn at boot: %d\n", sweet_camera_publish());
++	(void)thread_terminate(current_thread());
++}
++
++void sweet_cam_init(void);
++
++void
++sweet_cam_init(void)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetcam", &on, sizeof(on));
++	if (!on || !sweet_board_beryllium()) {
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start((thread_continue_t)cam_publish_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
++
+ /* "stream ..." of kern.sweet_cam_ctl */
+ static void
+ cam_stream_command(char *p)
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6c113692b420fa6c770f29051b458d04d87de43a..542b5adf7731ef704b9c657dee6581d6771d2c5a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -77,6 +77,7 @@ extern void beryllium_wlan_init(void);
+ extern void sweet80211_init(void);
+ extern void sweet_venus_init(void);   /* bsd/dev/sweet_venus.c */
+ extern void sweet_audio_init(void);   /* bsd/dev/sweet_audio.c */
++extern void sweet_cam_init(void);     /* bsd/dev/sweet_cam.c */
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+ extern void sweet_charger_start(void);
+@@ -1168,6 +1169,7 @@ sweet_ufs_init(void)
+ 	sweet80211_init();          /* boot-arg sweet80211=N (iOS 26 Wi-Fi stand-in), off by default */
+ 	sweet_venus_init();         /* Venus video codec: IOKit service at boot, hardware on first use; sweetvenus=0 off */
+ 	sweet_audio_init();         /* ADSP audio + amplifiers: IOKit service at boot, hardware on first use; sweetaudio=0 off */
++	sweet_cam_init();           /* camera: AppleH16CamIn at boot, hardware on first use; sweetcam=0 off */
+ 	return 0;
+ }
+ 
