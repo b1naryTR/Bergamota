@@ -1,8 +1,16 @@
 diff --git a/bsd/dev/sweet_cam.c b/bsd/dev/sweet_cam.c
-index 3d7a460ae74c49a8d65f2468302b801088007d0e..183e819a7101eda3bb9c663df878a984c00c7634 100644
+index 3d7a460ae74c49a8d65f2468302b801088007d0e..cb423a861fcc6ffb1a91dee8a1c57d5bd54d233b 100644
 --- a/bsd/dev/sweet_cam.c
 +++ b/bsd/dev/sweet_cam.c
-@@ -1762,6 +1762,36 @@ sweet_cam_release_slot(void *owner)
+@@ -75,6 +75,7 @@ extern int sweet_smmu_pt_map(struct sweet_smmu_pt *pt, uint32_t iova, uint64_t p
+ extern uint32_t sweet_smmu_pt_fault(struct sweet_smmu_pt *pt, uint64_t *far, uint32_t *fsynr0);
+ extern void sweet_smmu_pt_unmap(struct sweet_smmu_pt *pt, uint32_t iova, uint32_t len);
+ extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, int, thread_t *);
++extern kern_return_t thread_terminate(thread_t); /* not in the BSD view of kern/thread.h */
+ 
+ /* ---- addresses (live DT) ---- */
+ #define GCC_PA          0x00100000u
+@@ -1762,6 +1763,36 @@ sweet_cam_release_slot(void *owner)
  	return 0;
  }
  
