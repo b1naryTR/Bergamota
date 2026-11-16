@@ -1,0 +1,243 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 4a83333..d30e369 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -18,6 +18,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <kern/clock.h>
+ #include "sweet_spmi.h"
+ #include "sweet_board.h"
+ 
+@@ -499,44 +500,119 @@ sr_offset(uint32_t *off)
+ 	return sr_read32(SR_ALARM_DATA, off);
+ }
+ 
++static bool
++sr_valid(uint64_t t)
++{
++	return t >= SR_T_MIN && t < SR_T_MAX;
++}
++
++/*
++ * 1172: the second copy of the offset, on UFS (bsd/dev/sweet_ufs.c). Another system on the phone arms the RTC alarm and
++ * overwrites its data registers; the raw counter keeps running under both, so raw + this copy is still the time.
++ */
++extern int sweet_ufs_clock_load(uint32_t *off);
++extern int sweet_ufs_clock_store(uint32_t off);
++static uint32_t sr_copy;        /* what the UFS copy holds, once read or written */
++static bool sr_copy_known;
++
++static int
++sr_copy_get(uint32_t *off)
++{
++	if (!sr_copy_known) {
++		int error = sweet_ufs_clock_load(&sr_copy);
++		if (error) {
++			return error;
++		}
++		sr_copy_known = true;
++	}
++	*off = sr_copy;
++	return 0;
++}
++
+ /* Thread context. Unix seconds from the RTC (raw + stored offset, or raw when that is already wall time); 0 none. */
+ uint64_t
+ sweet_rtc_get(void)
+ {
+ 	static bool told;
+-	uint32_t raw, off = 0;
++	uint32_t raw, off = 0, copy = 0;
++	const char *src = "";
+ 	if (sr_raw(&raw) != 0) {
+ 		return 0;
+ 	}
+ 	bool have = sr_offset(&off) == 0;
+ 	uint64_t t = (uint64_t)raw + off;
+-	if (!have || t < SR_T_MIN || t >= SR_T_MAX) {
+-		t = (raw >= SR_T_MIN && raw < SR_T_MAX) ? raw : 0;
++	if (!have || !sr_valid(t)) {
++		if (sr_copy_get(&copy) == 0 && sr_valid((uint64_t)raw + copy)) {
++			t = (uint64_t)raw + copy;
++			src = ", offset copy on UFS used";
++		} else {
++			t = sr_valid(raw) ? raw : 0;
++		}
+ 	}
+ 	if (!told) {
+ 		told = true;
+-		printf("SWEET RTC: raw %u offset %u%s -> %llu\n", raw, off, have ? "" : " (alarm armed or unreadable)", t);
++		printf("SWEET RTC: raw %u offset %u%s%s -> %llu\n", raw, off, have ? "" : " (alarm armed or unreadable)", src, t);
+ 	}
+ 	return t;
+ }
+ 
+-/* Thread context: keep the offset so the next boot starts at this time. Writes only when it moved by over 2 s. */
++/*
++ * Thread context: keep the offset so the next boot starts at this time. Each copy is written only when it moved by
++ * over 2 s; the PMIC one only while the alarm is not armed (an armed alarm is another system's, not ours to touch).
++ */
+ void
+ sweet_rtc_set(uint64_t unix_secs)
+ {
+-	uint32_t raw, off;
+-	if (unix_secs < SR_T_MIN || unix_secs >= SR_T_MAX || sr_raw(&raw) != 0 || unix_secs < raw ||
+-	    sr_offset(&off) != 0) {
++	uint32_t raw, off = 0, copy = 0;
++	if (!sr_valid(unix_secs) || sr_raw(&raw) != 0 || unix_secs < raw) {
+ 		return;
+ 	}
+ 	uint32_t want = (uint32_t)(unix_secs - raw);
+-	if ((off > want ? off - want : want - off) <= 2) {
++	if (sr_offset(&off) == 0 && (off > want ? off - want : want - off) > 2) {
++		uint8_t d[4] = { (uint8_t)want, (uint8_t)(want >> 8), (uint8_t)(want >> 16), (uint8_t)(want >> 24) };
++		uint32_t back = 0;
++		bool ok = sweet_spmi_write(0, SR_ALARM_DATA, &d[0], 2) == 0 && sweet_spmi_write(0, SR_ALARM_DATA + 2, &d[2], 2) == 0 &&
++		    sr_read32(SR_ALARM_DATA, &back) == 0 && back == want;
++		printf("SWEET RTC: offset %u -> %u (raw %u, time %llu)%s\n", off, want, raw, unix_secs, ok ? "" : " FAILED");
++	}
++	int have = sr_copy_get(&copy);
++	if (have == ENXIO) {
++		return;         /* storage not up yet: sweet_rtc_storage_ready brings the copy in step */
++	}
++	if (have != 0 || (copy > want ? copy - want : want - copy) > 2) {
++		int error = sweet_ufs_clock_store(want);
++		if (!error) {
++			sr_copy = want;
++			sr_copy_known = true;
++		}
++		printf("SWEET RTC: offset copy on UFS -> %u (raw %u, time %llu)%s\n", want, raw, unix_secs, error ? " FAILED" : "");
++	}
++}
++
++/*
++ * Thread context, from sweet_ufs_init (IOFindBSDRoot: after IOKitInitializeTime, before the root is mounted and long
++ * before launchd). If the calendar could not be set from the PMIC, set it from the UFS copy now, so userland never
++ * sees 1970; if it could, bring the copy in step.
++ */
++void
++sweet_rtc_storage_ready(void)
++{
++	clock_sec_t secs = 0;
++	clock_usec_t usecs = 0;
++	uint32_t raw, copy = 0;
++	if (sr_raw(&raw) != 0) {
+ 		return;
+ 	}
+-	uint8_t d[4] = { (uint8_t)want, (uint8_t)(want >> 8), (uint8_t)(want >> 16), (uint8_t)(want >> 24) };
+-	uint32_t back = 0;
+-	bool ok = sweet_spmi_write(0, SR_ALARM_DATA, &d[0], 2) == 0 && sweet_spmi_write(0, SR_ALARM_DATA + 2, &d[2], 2) == 0 &&
+-	    sr_read32(SR_ALARM_DATA, &back) == 0 && back == want;
+-	printf("SWEET RTC: offset %u -> %u (raw %u, time %llu)%s\n", off, want, raw, unix_secs, ok ? "" : " FAILED");
++	clock_get_calendar_microtime(&secs, &usecs);
++	if (sr_valid((uint64_t)secs)) {
++		sweet_rtc_set((uint64_t)secs);
++		return;
++	}
++	if (sr_copy_get(&copy) == 0 && sr_valid((uint64_t)raw + copy)) {
++		printf("SWEET RTC: no usable offset in the PMIC; wall clock from the copy on UFS (raw %u + %u)\n", raw, copy);
++		clock_set_calendar_microtime((clock_sec_t)((uint64_t)raw + copy), 0);
++	} else {
++		printf("SWEET RTC: no usable offset in the PMIC or on UFS: the clock is not set until userland sets it\n");
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index c075f65..78e264d 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -30,6 +30,8 @@ int sweet_spmi_wled_module(int on);
+ /* Poco F1 wall clock from the PM8998 RTC (patch 0245). Thread context. get: Unix seconds, 0 none. */
+ uint64_t sweet_rtc_get(void);
+ void sweet_rtc_set(uint64_t unix_secs);
++/* 1172: UFS is up (sweet_ufs_init): take the wall clock from the offset copy kept there when the PMIC had none. */
++void sweet_rtc_storage_ready(void);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 47f9dbd..7efdd1f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1052,6 +1052,8 @@ sweet_ufs_read_part(const char *name, uint64_t off, void *dst, uint64_t len)
+ 	return error;
+ }
+ 
++extern void sweet_rtc_storage_ready(void);    /* bsd/dev/sweet_spmi.c (1172) */
++
+ static int
+ sweet_ufs_init(void)
+ {
+@@ -1182,6 +1184,7 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_storage_info_publish(ufs_lun_blocks * UFS_BLOCK);
+ 	sweet_log_start();
++	sweet_rtc_storage_ready();      /* 1172: the wall clock's second home is readable now */
+ 	sweet_ufs_syncer_start();
+ 	sweet_ufs_selftest_start();
+ 	sweet_sample_start();
+@@ -1369,6 +1372,62 @@ sweet_log_start(void)
+ 	}
+ }
+ 
++/*
++ * Wall clock offset, second copy (patch 1172). The offset of patch 0245 lives in the PM8998 RTC alarm's data
++ * registers; a second system on the phone (LineageOS, dual boot since 2026-11-16) uses that alarm, overwrites them
++ * and leaves it armed, and iOS then started in 1970 on every boot and could not store a new offset either. The copy
++ * is one block right before the persistent log ring (inside the gap the self-test keeps clear), in the root
++ * partition's reserved tail that only this driver writes:
++ *   "SWEETRTC" | u32 version 1 | u32 offset | u32 ~offset
++ * Thread context (they take the transfer mutex). load: ENXIO before the partition is known, ENOENT no valid record.
++ */
++#define SWEET_CLK_LBA()         (su.first_block + su.nblocks - SWEET_LOG_BLOCKS - 1)
++
++int sweet_ufs_clock_load(uint32_t *off);
++int sweet_ufs_clock_store(uint32_t off);
++
++int
++sweet_ufs_clock_load(uint32_t *off)
++{
++	uint32_t v[3] = { 0, 0, 0 };
++	if (!su.ready || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return ENXIO;
++	}
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = ufs_read_blocks(SWEET_CLK_LBA(), 1);
++	bool magic = !error && memcmp(b, "SWEETRTC", 8) == 0;
++	if (magic) {
++		memcpy(v, b + 8, sizeof(v));
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		return error;
++	}
++	if (!magic || v[0] != 1 || v[2] != ~v[1]) {
++		return ENOENT;
++	}
++	*off = v[1];
++	return 0;
++}
++
++int
++sweet_ufs_clock_store(uint32_t off)
++{
++	uint32_t v[3] = { 1, off, ~off };
++	if (!su.ready || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return ENXIO;
++	}
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	lck_mtx_lock(&sweet_ufs_lock);
++	memset(b, 0, UFS_BLOCK);
++	memcpy(b, "SWEETRTC", 8);
++	memcpy(b + 8, v, sizeof(v));
++	int error = ufs_write_blocks_ex(SWEET_CLK_LBA(), 1, true);
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ /*
+  * Boot-arg ufsselftest=N (MiB, 1..16, needs ufsrw=1 and a log area): write, read back and compare
+  * N MiB of a pseudo-random pattern in the reserved area right BEFORE the persistent log ring at
