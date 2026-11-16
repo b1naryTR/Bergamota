@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 542b5adf7731ef704b9c657dee6581d6771d2c5a..47f9dbd764b13b3db07339b8e9d009594787e852 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -6,7 +6,7 @@
+  * state: it points the transfer request list at its own memory (verifying the
+  * host took it before ringing any doorbell) and issues polled SCSI commands,
+  * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
+- * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
++ * ufsroot=; without it "iosroot", else "userdata": 1171) and exposes it as the BSD disk ufsroot0
+  * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
+  * Root on it with rd=ufsroot0.
+  *
+@@ -632,6 +632,26 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++/*
++ * 1171: the root partition must hold an HFS+/HFSX volume (signature at byte 1024) before it is exposed: this driver
++ * writes in its last GiB (sweetlog ring, ufsselftest), and since the userdata partition was split for a second OS a
++ * partition of that name may be the other system's data.
++ */
++static int
++ufs_check_hfs(const char *name)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(su.first_block, 1);
++	if (error) {
++		return error;
++	}
++	if (b[1024] == 'H' && (b[1025] == '+' || b[1025] == 'X')) {
++		return 0;
++	}
++	printf("SWEET UFS: \"%s\" holds no HFS+ volume (0x%02x%02x at byte 1024): not used as the root\n", name, b[1024], b[1025]);
++	return ENXIO;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -1038,7 +1058,7 @@ sweet_ufs_init(void)
+ 	DTEntry node;
+ 	uintptr_t const *reg = NULL;
+ 	unsigned int size = 0;
+-	char want[64] = "userdata";
++	char want[64] = "iosroot";
+ 	int error;
+ 
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+@@ -1047,7 +1067,7 @@ sweet_ufs_init(void)
+ 		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
+ 		return ENXIO;
+ 	}
+-	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	bool named = PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 	uint32_t cache = 0, wait = 0;
+@@ -1129,6 +1149,14 @@ sweet_ufs_init(void)
+ 	}
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
++		if (error == ENOENT && !named) {
++			/* not split yet: the whole userdata partition is the iOS root (before 1171) */
++			strlcpy(want, "userdata", sizeof(want));
++			error = ufs_find_partition(want);
++		}
++	}
++	if (!error) {
++		error = ufs_check_hfs(want);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
