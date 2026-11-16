@@ -1,0 +1,38 @@
+diff --git a/bsd/sweet_hfs/core/hfs_resize.c b/bsd/sweet_hfs/core/hfs_resize.c
+index be0a2600d845ab9797cf3bdf21069568f4b1943f..b3035bff5f59459000911c9e631b50daa3e165d7 100644
+--- a/bsd/sweet_hfs/core/hfs_resize.c
++++ b/bsd/sweet_hfs/core/hfs_resize.c
+@@ -559,8 +559,17 @@ hfs_truncatefs(struct hfsmount *hfsmp, u_int64_t newsize, vfs_context_t context)
+ 	/*
+ 	 * - Journaled HFS Plus volumes only.
+ 	 * - No embedded volumes.
++	 *
++	 * Sweet: an unjournaled volume may shrink too, but only when no allocated block lies in the part cut away (checked
++	 * below, before anything is relocated): then the shrink is the same metadata update as an unjournaled grow
++	 * (1144: bitmap bits for the old and new alternate volume header, the volume header and its alternates), and
++	 * nothing is moved. Relocating extents without a journal is refused. The Poco F1's iOS root is an unjournaled
++	 * volume on a partition split in two for a second OS (1170); everything it stores lies in its first 25 GiB.
+ 	 */
+-	if ((hfsmp->jnl == NULL) ||
++	if (
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
++	    (hfsmp->jnl == NULL) ||
++#endif
+ 	    (hfsmp->hfsPlusIOPosOffset != 0)) {
+ 		error = EPERM;
+ 		goto out;
+@@ -717,6 +726,14 @@ hfs_truncatefs(struct hfsmount *hfsmp, u_int64_t newsize, vfs_context_t context)
+ 	 * ignoring the blocks allocated for old alternate volume header.
+ 	 */
+ 	if (hfs_isallocated(hfsmp, hfsmp->allocLimit, reclaimblks)) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (hfsmp->jnl == NULL) {
++			printf("hfs_truncatefs: \"%s\" has allocated blocks beyond the new end and no journal: not relocating\n",
++			    hfsmp->vcbVN);
++			error = EPERM;
++			goto out;
++		}
++#endif
+ 		/*
+ 		 * hfs_reclaimspace will use separate transactions when
+ 		 * relocating files (so we don't overwhelm the journal).
